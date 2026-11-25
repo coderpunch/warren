@@ -550,14 +550,26 @@ These are conclusions from the facts above. They are inputs to the design. They 
 4. Helper calls have a limit of 60 seconds, and browser HTTP requests have a limit of 300 seconds. These calls can wait for a sandbox start.
 5. `GET /api/config` and `GET /openapi.json` arrive with no user on a plain connection (path E). Warren must answer them without a sandbox.
 
-### 9.5 Decisions that are necessary before implementation
+### 9.5 Decisions
 
-| No. | Question | Options |
+The owner of the project made these decisions on 2026-11-25. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
+
+| No. | Subject | Decision |
 |---|---|---|
-| 1 | Which integration mode is the primary mode? | (a) Orchestrator connection: all scopes, key and headers. (b) Plain connection with `session`: credential check on HTTP, no model scope, no credential on six WebSockets. (c) Plain connection with `bearer`: key and `X-User-Id`, no model scope, no management API. (d) More than one mode. One URL can have only one server type (section 3.1). |
-| 2 | How does warren authorize the six first-message WebSockets in `session` mode? | (a) A secret path prefix in the connection URL. It authenticates Open WebUI on all paths. (b) Network-level authentication of Open WebUI: NetworkPolicy or mutual TLS. (c) Accept a WebSocket for a terminal or process ID only if a verified HTTP request made that ID. (d) Do not offer `session` mode. Option (c) does not help for `/events`, `/execute`, and the desktop routes. |
-| 3 | How does warren verify a credential in `session` mode? | (a) Local HS256: fast, needs `WEBUI_SECRET_KEY`, no revocation, no API keys. (b) A call to an Open WebUI endpoint (section 7): no secret, has revocation, adds latency. (c) Option (b) with a short cache. |
-| 4 | Does `session` mode accept automation tokens, subagent tokens, and API keys? | If not, automations, subagents, and API clients cannot use a terminal in this mode. |
-| 5 | In `session` mode, which identity selects the sandbox when the caller and `X-User-Id` are different? | (a) The caller. Shared agent sessions then use the sandbox of the caller. (b) `X-User-Id`. The credential then proves only that the caller is a valid user. |
-| 6 | Where do the groups for policy selection come from? | (a) No groups in warren. Open WebUI gives a template to users and groups with its own access grants. (b) `GET /api/v1/users/groups` with the credential of the user (`session` mode only). (c) An API key of an Open WebUI administrator, for `GET /api/v1/users/{user_id}/groups`. |
-| 7 | How much of the management API does warren implement? | (a) The two template read calls and the status call only. An administrator defines templates in the warren configuration. (b) Option (a) and the instance calls. (c) The full API. Note: the API paths contain the word `terminals`. The paths are part of the wire protocol and are not a brand name. |
+| 1 | Integration mode | Warren accepts only an orchestrator connection from Open WebUI 0.13.4 or later. It does not accept a plain connection. |
+| 2 | Authentication of Open WebUI | The connection key, as section 5 shows for `bearer`. Each request and each WebSocket must have the key. |
+| 3 | Identity of the user | The headers that Open WebUI sets on its server: `X-User-Id` and the `X-Terminal-*` headers (section 6.1). |
+| 4 | Verification of a user token | Not in warren. The current protocol sends no user token on an orchestrator connection (section 9.1, item 9). |
+| 5 | Groups | Warren has no group data. An administrator gives a template to users and groups with the access grants of Open WebUI. |
+| 6 | Management API | Warren implements the template read calls, the status call, and the instance calls. Templates are read-only. An administrator defines them in the warren configuration. |
+
+Because the identity is in headers, warren must have these protections:
+
+1. Warren does not start without a connection key. The key must have a minimum of 32 characters.
+2. Warren compares the key in constant time.
+3. Warren can serve TLS 1.3, so that the key does not go through the cluster network as clear text.
+4. A NetworkPolicy permits connections to warren only from Open WebUI.
+5. Warren never sends the connection key to a sandbox. Each sandbox has its own random key.
+6. Warren logs a warning at start-up. The warning says that warren trusts the identity headers of each client that has the key.
+
+Note: the management API paths contain the word `terminals`. The paths are part of the wire protocol and are not a brand name.

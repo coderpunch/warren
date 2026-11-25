@@ -41,7 +41,6 @@ The warren word for an instance is "sandbox".
 | Later | Not in the first release. Possible in a subsequent release. |
 | Won't do | Not planned. The note gives the reason. |
 | Not applicable | Open WebUI or Open Terminal supplies the feature. Warren has no work to do. |
-| Decision | The plan depends on a decision in `protocol.md`, section 9.5. |
 
 ## 4. Architecture
 
@@ -89,10 +88,10 @@ The warren word for an instance is "sandbox".
 | Idle timeout for each template. | v1 | Field in a policy. |
 | Maximum lifetime, for the orchestrator and for each template. The orchestrator stops the instance, also during use. | Later | |
 | Scheduled reset. The orchestrator clears the files at a set time, each week, each month, or on a cron schedule. An administrator sets it in the orchestrator interface. | Later | |
-| Instance operations: start, stop, restart, delete. | Decision | Question 7. The operations are simple if warren implements the instance calls. |
-| Restart stops an instance and starts it again with the current template settings. | Decision | Question 7. |
+| Instance operations: start, stop, restart, delete. | v1 | Warren implements the instance calls. Refer to `protocol.md`, section 9.5. |
+| Restart stops an instance and starts it again with the current template settings. | v1 | |
 | Instance operation: reset (clear the files and start again). | Later | |
-| A deleted instance keeps its volume on the operator backend. A deleted terminal removes its instances and files. | Decision | Question 7. Warren proposal: the delete operation for an instance removes the pod and keeps the PVC. |
+| A deleted instance keeps its volume on the operator backend. A deleted terminal removes its instances and files. | v1 | The delete operation for an instance removes the pod and keeps the PVC. A template is part of the warren configuration, thus Open WebUI cannot delete it. |
 | A template change applies only to instances that start after the change. | v1 | |
 | Setup script that runs at each start of an instance. Open Terminal reads it from an environment variable. | v1 | Warren passes the variable. A setup script that needs root or a network download can fail in a restricted sandbox. |
 | A setting for the image pull policy. | v1 | |
@@ -125,7 +124,7 @@ The warren word for an instance is "sandbox".
 | Runtime class (gVisor or Kata). The documentation describes none. | v1 | Addition in warren. |
 | Changes to the security context and the pod template of an instance. | Won't do | Warren has a fixed restricted security context. Only the runtime class, node selector, and tolerations can change. |
 | Node selector and tolerations. In the documentation these are orchestrator settings, not template fields. | v1 | Warren settings, with an optional value in each policy. |
-| Users make and change templates in the Open WebUI user interface. | Decision | Question 7. Warren proposal for v1: an administrator defines policies in a YAML file or a ConfigMap. Warren shows each policy to Open WebUI as a read-only template. |
+| Users make and change templates in the Open WebUI user interface. | Later | In v1, an administrator defines policies in a YAML file or a ConfigMap. Warren shows each policy to Open WebUI as a read-only template. |
 
 The Open WebUI user interface accepts a decimal number for CPU, for example `0.5`. It accepts a size such as `512Mi` or `2Gi` for memory and storage (`protocol.md`, section 4.6).
 Warren must show values in these forms.
@@ -156,21 +155,21 @@ Warren must show values in these forms.
 |---|---|---|
 | Open WebUI sends one static API key to the orchestrator as a bearer token. | v1 | The warren specification calls this the static API key mode. |
 | The orchestrator trusts all requests that have the key. Open WebUI gives the identity in headers. | v1 | Warren logs a warning in this mode. Refer to `protocol.md`, section 9.3. |
-| Terminals from an orchestrator connection always use the static key. The documentation describes no token verification in the current version. | Decision | Questions 1 to 5. Verification of an Open WebUI session token is possible only on a plain connection with `session` mode. It is not possible together with an orchestrator connection. |
+| Terminals from an orchestrator connection always use the static key. The documentation describes no token verification in the current version. | v1 | Warren uses the same model. The current protocol sends no user token to an orchestrator. Thus warren does not verify user tokens. Refer to `protocol.md`, section 9.5. |
 | If no key is set, the orchestrator makes one at each start and prints it. | Won't do | Warren does not start without a key from a Secret. |
 | The same key opens the administrator interface and the template API. | v1 | The paths that Open WebUI calls must accept the connection key. A second key is possible only for direct administrator calls. |
 | Connection access grants in Open WebUI: read and write, for users and groups. | Not applicable | Open WebUI applies them before it calls warren. |
 | A user can share one terminal with users and groups in Open WebUI. | Not applicable | Open WebUI keeps the grants. This is the primary method to give a policy to users or groups. |
 | A person with write access to the connection can open the files and the system data of each instance on it. | Not applicable | Open WebUI applies it. Warren gets only the ID of the instance owner, and not the ID of the manager. Refer to `protocol.md`, section 6.1. |
-| Selection of a policy by user or group in the orchestrator. The documentation describes none. | Decision | Question 6. Addition in warren. |
+| Selection of a policy by user or group in the orchestrator. The documentation describes none. | v1 | Open WebUI selects by user and group with its access grants. Addition in warren: an optional list of permitted user IDs in a policy. |
 
 ## 13. Administrator interface and API
 
 | Feature in the documentation | Plan | Note |
 |---|---|---|
 | Web interface at `/` with template and instance views, and a setting to turn it off. | Later | The warren specification puts the administrator interface in a subsequent release. |
-| Template API. The documentation does not list its paths. | Decision | Question 7. The two template read calls are necessary for an orchestrator connection. Warren uses only the client behaviour in `protocol.md`, section 4.6. |
-| Instance list with state, and system information for each instance. | Decision | Question 7 for the instance list. Open Terminal supplies the system information through the proxy. |
+| Template API. The documentation does not list its paths. | v1 | Read calls, status call, and instance calls. Templates are read-only. Warren uses only the client behaviour in `protocol.md`, section 4.6. |
+| Instance list with state, and system information for each instance. | v1 | Open Terminal supplies the system information through the proxy. |
 
 ## 14. Network and isolation
 
