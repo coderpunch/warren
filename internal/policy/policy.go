@@ -5,13 +5,17 @@
 package policy
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
+	"strings"
 
-	"sigs.k8s.io/yaml"
+	yamlv3 "go.yaml.in/yaml/v3"
 
 	"github.com/h3xcat/warren/internal/scope"
 )
@@ -52,13 +56,80 @@ func Load(path string) (*Set, error) {
 	return set, nil
 }
 
-// Parse examines the content of a policy file. It rejects unknown fields.
+// Parse examines the content of a policy file. It rejects unknown fields,
+// more than one YAML document, and values that are not strings.
 func Parse(data []byte) (*Set, error) {
+	if err := checkShape(data); err != nil {
+		return nil, err
+	}
+	// Convert with the same YAML parser that examined the structure, then
+	// read the result as strict JSON. Thus the two steps always agree on
+	// the type of a value.
+	var generic any
+	if err := yamlv3.Unmarshal(data, &generic); err != nil {
+		return nil, err
+	}
+	asJSON, err := json.Marshal(generic)
+	if err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(asJSON))
+	dec.DisallowUnknownFields()
 	var f File
-	if err := yaml.UnmarshalStrict(data, &f); err != nil {
+	if err := dec.Decode(&f); err != nil {
 		return nil, err
 	}
 	return NewSet(f.Policies)
+}
+
+// policyKeys are the permitted keys of one policy.
+var policyKeys = map[string]bool{"id": true, "name": true, "scope": true}
+
+// checkShape examines the YAML structure before the conversion to Go
+// values. The conversion alone is not strict: it ignores a second document,
+// it accepts a key in a different letter case, and it can change a value
+// that is not a string, for example the number 007.
+func checkShape(data []byte) error {
+	dec := yamlv3.NewDecoder(bytes.NewReader(data))
+	var doc yamlv3.Node
+	if err := dec.Decode(&doc); err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("the file is empty")
+		}
+		return err
+	}
+	var second yamlv3.Node
+	if err := dec.Decode(&second); !errors.Is(err, io.EOF) {
+		return errors.New("the file has more than one YAML document")
+	}
+	if doc.Kind != yamlv3.DocumentNode || len(doc.Content) != 1 || doc.Content[0].Kind != yamlv3.MappingNode {
+		return errors.New("the file must be a mapping with the key \"policies\"")
+	}
+	root := doc.Content[0]
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key, value := root.Content[i], root.Content[i+1]
+		if key.Value != "policies" {
+			return fmt.Errorf("line %d: unknown key %q", key.Line, key.Value)
+		}
+		if value.Kind != yamlv3.SequenceNode {
+			return fmt.Errorf("line %d: \"policies\" must be a list", value.Line)
+		}
+		for _, item := range value.Content {
+			if item.Kind != yamlv3.MappingNode {
+				return fmt.Errorf("line %d: a policy must be a mapping", item.Line)
+			}
+			for j := 0; j+1 < len(item.Content); j += 2 {
+				k, v := item.Content[j], item.Content[j+1]
+				if !policyKeys[k.Value] {
+					return fmt.Errorf("line %d: unknown key %q", k.Line, k.Value)
+				}
+				if v.Kind != yamlv3.ScalarNode || v.Tag != "!!str" {
+					return fmt.Errorf("line %d: %q must be a string. Put the value in quotation marks.", v.Line, k.Value)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // NewSet makes a set from a list of policies.
@@ -91,6 +162,14 @@ func (p Policy) Validate() error {
 	}
 	if len(p.Name) > 128 {
 		return errors.New("name has more than 128 bytes")
+	}
+	if p.Name != strings.TrimSpace(p.Name) {
+		return errors.New("name starts or ends with white space")
+	}
+	for _, r := range p.Name {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("name contains a control character")
+		}
 	}
 	if !scope.ValidKind(p.Scope) {
 		return fmt.Errorf("scope must be user, chat, model, or shared, not %q", p.Scope)

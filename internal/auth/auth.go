@@ -6,7 +6,6 @@
 package auth
 
 import (
-	"bufio"
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
@@ -14,54 +13,93 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 )
 
 // MinKeyLength is the minimum number of characters in a connection key.
 const MinKeyLength = 32
 
 // Keys is a set of accepted connection keys. More than one key lets an
-// administrator replace a key with no downtime.
+// administrator replace a key with no downtime: add the new key, change the
+// key in Open WebUI, then remove the old key. Replace changes the set while
+// warren operates.
 type Keys struct {
-	digests [][sha256.Size]byte
+	digests atomic.Pointer[[][sha256.Size]byte]
 }
 
-// NewKeys makes a key set. It rejects an empty set and a short key.
-func NewKeys(keys []string) (*Keys, error) {
+func digestsOf(keys []string) ([][sha256.Size]byte, error) {
 	if len(keys) == 0 {
 		return nil, errors.New("no connection key")
 	}
-	k := &Keys{}
+	out := make([][sha256.Size]byte, 0, len(keys))
 	for i, key := range keys {
 		if len(key) < MinKeyLength {
 			return nil, fmt.Errorf("connection key %d has fewer than %d characters", i+1, MinKeyLength)
 		}
-		if strings.ContainsAny(key, " \t\r\n") {
-			return nil, fmt.Errorf("connection key %d contains white space", i+1)
+		for _, r := range key {
+			// Only visible ASCII. A different character is usually a
+			// mistake in the file, for example a byte order mark.
+			if r <= 0x20 || r >= 0x7f {
+				return nil, fmt.Errorf("connection key %d contains a character that is not visible ASCII", i+1)
+			}
 		}
-		k.digests = append(k.digests, sha256.Sum256([]byte(key)))
+		out = append(out, sha256.Sum256([]byte(key)))
 	}
+	return out, nil
+}
+
+// NewKeys makes a key set. It rejects an empty set and a short key.
+func NewKeys(keys []string) (*Keys, error) {
+	d, err := digestsOf(keys)
+	if err != nil {
+		return nil, err
+	}
+	k := &Keys{}
+	k.digests.Store(&d)
 	return k, nil
 }
 
-// LoadKeyFile reads a key set from a file. Each line that is not empty and
-// does not start with '#' is one key.
-func LoadKeyFile(path string) (*Keys, error) {
-	f, err := os.Open(path)
+// Replace puts a new list of keys in place of the current list. If the new
+// list is not valid, the current list stays.
+func (k *Keys) Replace(keys []string) error {
+	d, err := digestsOf(keys)
 	if err != nil {
-		return nil, fmt.Errorf("open key file: %w", err)
+		return err
 	}
-	defer f.Close()
+	k.digests.Store(&d)
+	return nil
+}
+
+// Len returns the number of keys in the set.
+func (k *Keys) Len() int {
+	return len(*k.digests.Load())
+}
+
+// ReadKeyFile reads a list of keys from a file. Each line that is not empty
+// and does not start with '#' is one key.
+func ReadKeyFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read key file: %w", err)
+	}
+	// Some editors put a byte order mark at the start of a file.
+	text := strings.TrimPrefix(string(data), "\uFEFF")
 	var keys []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		keys = append(keys, line)
 	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("read key file: %w", err)
+	return keys, nil
+}
+
+// LoadKeyFile reads a key set from a file.
+func LoadKeyFile(path string) (*Keys, error) {
+	keys, err := ReadKeyFile(path)
+	if err != nil {
+		return nil, err
 	}
 	k, err := NewKeys(keys)
 	if err != nil {
@@ -79,8 +117,8 @@ func (k *Keys) Match(candidate string) bool {
 	}
 	d := sha256.Sum256([]byte(candidate))
 	ok := 0
-	for i := range k.digests {
-		ok |= subtle.ConstantTimeCompare(d[:], k.digests[i][:])
+	for _, digest := range *k.digests.Load() {
+		ok |= subtle.ConstantTimeCompare(d[:], digest[:])
 	}
 	return ok == 1
 }

@@ -19,6 +19,8 @@ func TestNewKeysRejectsBadSets(t *testing.T) {
 		"short key":   {"short"},
 		"31 chars":    {strings.Repeat("x", MinKeyLength-1)},
 		"white space": {keyA[:20] + " " + keyA[:20]},
+		"not ASCII":   {keyA + "\u00e9"},
+		"BOM":         {"\ufeff" + keyA},
 		"one bad key": {keyA, "short"},
 	}
 	for name, keys := range cases {
@@ -49,10 +51,33 @@ func TestMatch(t *testing.T) {
 	}
 }
 
+func TestReplace(t *testing.T) {
+	k, _ := NewKeys([]string{keyA})
+	if err := k.Replace([]string{keyA, keyB}); err != nil || k.Len() != 2 {
+		t.Fatalf("Replace = %v, Len = %d", err, k.Len())
+	}
+	if err := k.Replace([]string{keyB}); err != nil {
+		t.Fatal(err)
+	}
+	if k.Match(keyA) || !k.Match(keyB) {
+		t.Error("the old key is accepted, or the new key is not accepted")
+	}
+	// A bad list must not remove the keys that operate.
+	for _, bad := range [][]string{nil, {"short"}} {
+		if err := k.Replace(bad); err == nil {
+			t.Errorf("Replace(%q) gave no error", bad)
+		}
+	}
+	if !k.Match(keyB) {
+		t.Error("a refused replacement removed the current key")
+	}
+}
+
 func TestLoadKeyFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "keys")
-	content := "# current key\n" + keyA + "\n\n  " + keyB + "  \n"
+	// A byte order mark at the start and Windows line ends are permitted.
+	content := "\ufeff# current key\r\n" + keyA + "\r\n\n  " + keyB + "  \n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
