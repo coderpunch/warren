@@ -21,6 +21,10 @@ Storage, policies with resource limits, network isolation, and the Helm chart ar
 go test -race ./...
 ```
 
+## Contributions
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request.
+
 ## Clean-room rule
 
 Contributors must not read source code from `github.com/open-webui/terminals` or its forks.
