@@ -263,6 +263,17 @@ func TestAuditLogContent(t *testing.T) {
 	waitFor(t, "audit record for the open WebSocket", func() bool {
 		return strings.Contains(e.logs.String(), `"msg":"websocket open"`)
 	})
+	// Warren writes "websocket open" before it connects to the sandbox. A
+	// close message in that interval stops the connection, and the audit
+	// record then says "dial sandbox". Wait for an echo: it shows that the
+	// relay to the sandbox operates.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, data, err := conn.ReadMessage(); err != nil || string(data) != "echo:ping" {
+		t.Fatalf("echo through the relay = %q, %v", data, err)
+	}
 	conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(1000, ""), time.Now().Add(time.Second))
 	closeCode(t, conn)
 	conn.Close()

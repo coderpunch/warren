@@ -365,6 +365,13 @@ func (m *Manager) start(req backend.Request) error {
 		m.mu.Unlock()
 		return nil
 	}
+	// The caller read the cache before this lock. If the pod came into the
+	// cache after that, the caller must wait for it. Without this check,
+	// the pod of this sandbox counts for the limit of its own start.
+	if pod := m.pod(name); pod != nil && pod.DeletionTimestamp == nil && !podTerminal(pod) {
+		m.mu.Unlock()
+		return nil
+	}
 	ownerCount, total := m.countLocked(owner)
 	if (m.cfg.MaxPerUser > 0 && ownerCount >= m.cfg.MaxPerUser) || (m.cfg.MaxTotal > 0 && total >= m.cfg.MaxTotal) {
 		m.mu.Unlock()

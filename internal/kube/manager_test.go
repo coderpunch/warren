@@ -419,6 +419,20 @@ func TestLimitCountsStartsInProgress(t *testing.T) {
 	}
 }
 
+// The pod of a sandbox must not count for the limit of its own start. The
+// cache can show the pod after the caller looked and before the start.
+func TestLimitDoesNotCountTheSandboxItself(t *testing.T) {
+	e := newTestEnv(t, func(c *Config) { c.MaxPerUser = 1 })
+	req := userRef("alice")
+	e.acquire(req).Release()
+	if err := e.m.start(req); err != nil {
+		t.Errorf("start of a sandbox that exists = %v, want no error", err)
+	}
+	if len(e.pods()) != 1 {
+		t.Errorf("pods = %d, want 1", len(e.pods()))
+	}
+}
+
 func TestTotalLimit(t *testing.T) {
 	e := newTestEnv(t, func(c *Config) { c.MaxTotal = 1 })
 	e.acquire(userRef("alice")).Release()
