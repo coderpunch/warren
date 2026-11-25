@@ -73,7 +73,7 @@ The warren word for an instance is "sandbox".
 | User scope: one instance for each user. | v1 | |
 | Chat scope: one instance for each saved chat. A temporary chat cannot use it. | v1 | |
 | Model scope: one instance for each model. All users of the model share it. | v1 | Only possible with an orchestrator connection. Refer to `protocol.md`, section 9.2. |
-| The scope cannot change while instances exist. | v1 | A policy change applies only to new instances. |
+| The scope cannot change while instances exist. | v1 | Warren does not prevent the change. After a change, warren stops the pods of the previous scope and keeps their volumes. Refer to `policies.md`, section 11. |
 | Per-automation scope. The documentation describes none. | Later | The warren specification puts it in a subsequent release. |
 
 ## 7. Lifecycle
@@ -85,14 +85,14 @@ The warren word for an instance is "sandbox".
 | A slow start shows in Open WebUI as a timeout message. The remedy is a larger Open WebUI timeout (default 60 seconds). | v1 | Warren holds the first request until the pod is ready or a deadline occurs. Open WebUI has shorter limits for some calls. Refer to `protocol.md`, section 9.4. |
 | Idle timeout. The orchestrator stops the instance and keeps the files. The environment default is "off". The Helm chart default is 30 minutes. | v1 | Warren has an idle timeout that an administrator can set. The default is "on". |
 | The activity time of an instance is the time of the last proxied request. | v1 | Warren also counts an open WebSocket as activity. The documentation does not define this case. |
-| Idle timeout for each template. | v1 | Field in a policy. |
+| Idle timeout for each template. | v1 | Field in a policy. A change applies also to the pods that operate. |
 | Maximum lifetime, for the orchestrator and for each template. The orchestrator stops the instance, also during use. | Later | |
 | Scheduled reset. The orchestrator clears the files at a set time, each week, each month, or on a cron schedule. An administrator sets it in the orchestrator interface. | Later | |
 | Instance operations: start, stop, restart, delete. | v1 | Warren implements the instance calls. Refer to `protocol.md`, section 9.5. |
 | Restart stops an instance and starts it again with the current template settings. | v1 | |
-| Instance operation: reset (clear the files and start again). | Later | |
-| A deleted instance keeps its volume on the operator backend. A deleted terminal removes its instances and files. | v1 | The delete operation for an instance removes the pod and keeps the PVC. A template is part of the warren configuration, thus Open WebUI cannot delete it. |
-| A template change applies only to instances that start after the change. | v1 | |
+| Instance operation: reset (clear the files and start again). | v1 | Warren deletes the pod and the volume. It does not start the instance again: the next request of a user does that. Open WebUI 0.13.4 has no control for this operation. |
+| A deleted instance keeps its volume on the operator backend. A deleted terminal removes its instances and files. | v1 | Different in warren: the delete operation for an instance removes the pod and the volume. The Open WebUI user interface tells the person that the delete removes the instance and its files. The stop operation keeps the volume. A template is part of the warren configuration, thus Open WebUI cannot delete it. |
+| A template change applies only to instances that start after the change. | v1 | Warren reads the policy file again with no restart. The idle time, the retention time, and the user list apply immediately. Refer to `policies.md`, section 11. |
 | Setup script that runs at each start of an instance. Open Terminal reads it from an environment variable. | v1 | Warren passes the variable. A setup script that needs root or a network download can fail in a restricted sandbox. |
 | A setting for the image pull policy. | v1 | |
 | Docker backend: when the orchestrator stops, open sessions stop and the containers continue. The orchestrator finds the containers again when it starts. | v1 | Warren reads its state from Kubernetes at start-up. Open WebSockets stop when warren stops. |
@@ -102,8 +102,10 @@ The warren word for an instance is "sandbox".
 | Feature in the documentation | Plan | Note |
 |---|---|---|
 | Only the home directory stays after a restart. | v1 | The PVC is the home directory. |
-| An optional PVC for each instance, with a storage class and a size (default `1Gi`). The default is "on". | v1 | One PVC for each scope key. The warren specification requires a PVC for each user and, as an option, for each chat. |
+| An optional PVC for each instance, with a storage class and a size (default `1Gi`). The default is "on". | v1 | One PVC for each scope key. The default is "on" for the scopes `user` and `shared`, and "off" for the scopes `chat` and `model`. Refer to `policies.md`, section 7. |
 | The PVC stays when the pod stops because of the idle timeout. | v1 | |
+| A retention time for a volume that no instance uses. The documentation describes none. | v1 | Addition in warren. It is necessary for a policy with the scope `chat` or `model` and persistent storage. |
+| Limits on the number of volumes, for each user and in total. The documentation describes none. | v1 | Addition in warren. |
 | The Secret with the instance key also stays when the pod stops. | Won't do | Warren makes a new key at each pod start. A key then has a shorter life. |
 | Storage modes with the names `per-user`, `shared`, and `shared-rwo`. The documentation does not define them. | Later | |
 | Orchestrator state in SQLite or PostgreSQL. | Won't do | Warren keeps its state in Kubernetes objects. |
@@ -119,11 +121,11 @@ The warren word for an instance is "sandbox".
 | CPU and memory. The documentation says that the orchestrator sets limits only, not requests. | v1 | Warren sets requests and limits. |
 | Storage size. | v1 | |
 | Network profile: a name that selects one network configuration that an administrator defined. | v1 | In warren, the egress rules are part of the policy. |
-| Environment variables as raw strings. | v1 | |
+| Environment variables as raw strings. | v1 | Warren does not show the variables of a policy to Open WebUI. |
 | Start directory. Open Terminal reads it from an environment variable. | v1 | Warren passes the variable. |
 | Runtime class (gVisor or Kata). The documentation describes none. | v1 | Addition in warren. |
 | Changes to the security context and the pod template of an instance. | Won't do | Warren has a fixed restricted security context. Only the runtime class, node selector, and tolerations can change. |
-| Node selector and tolerations. In the documentation these are orchestrator settings, not template fields. | v1 | Warren settings, with an optional value in each policy. |
+| Node selector and tolerations. In the documentation these are orchestrator settings, not template fields. | v1 | Keys of a policy, and of the `defaults` of the policy file. |
 | Users make and change templates in the Open WebUI user interface. | Later | In v1, an administrator defines policies in a YAML file or a ConfigMap. Warren shows each policy to Open WebUI as a read-only template. |
 
 The Open WebUI user interface accepts a decimal number for CPU, for example `0.5`. It accepts a size such as `512Mi` or `2Gi` for memory and storage (`protocol.md`, section 4.6).
