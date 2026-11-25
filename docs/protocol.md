@@ -78,7 +78,7 @@ It sends `Authorization: Bearer <key>` only when `auth_type` is `bearer` or `ses
 
 ## 4. Call paths
 
-Open WebUI calls a terminal server on five paths. The browser never calls the terminal server directly. The browser base URL is always `{WEBUI_API_BASE_URL}/terminals/{selector}` (`src/lib/apis/terminal/index.ts:186-188`).
+Open WebUI calls a terminal server on seven paths (A to G). The browser never calls the terminal server directly. The browser base URL is always `{WEBUI_API_BASE_URL}/terminals/{selector}` (`src/lib/apis/terminal/index.ts:186-188`).
 
 ### 4.1 Path A: HTTP proxy for the browser
 
@@ -148,7 +148,7 @@ Sequence for all routes except the browser view route:
 9. Open WebUI then copies text and binary messages in the two directions (`routers/terminals.py:700-732`).
 10. Each 10 seconds, Open WebUI makes sure that the user continues to have access. If not, it closes the WebSocket (`routers/terminals.py:734-744`).
 
-Important: the session token of the user does not go to the terminal server on a WebSocket. This is true for all auth types.
+Important: on path B the session token of the user does not go to the terminal server. This is true for all auth types.
 
 Close codes that Open WebUI sends to the browser:
 
@@ -251,11 +251,23 @@ Fields of template `data` that the Open WebUI user interface sends (`UserTermina
 Open WebUI keeps the access grants for a template in its own database (`routers/templates.py:87-89`, `routers/templates.py:131-145`). The orchestrator does not get them.
 A user cannot call the management API through path A, because Open WebUI blocks the `api/v1/...` prefixes (section 4.1, step 5).
 
+### 4.7 Path G: agent sessions from the Open WebUI backend
+
+The Open WebUI backend starts coding agents on the terminal server and connects to them directly (`utils/agents/transport.py`). The browser has no route for this WebSocket.
+
+- `GET {url}/agents` finds the installed agents (`utils/agents/discovery.py:47`).
+- `POST {url}/agents/{provider}/sessions` starts a session, and `DELETE {url}/agents/sessions/{id}` stops it (`utils/agents/transport.py:60`, `:184`). The timeout is 30 seconds (`utils/agents/transport.py:42`).
+- A WebSocket to `{url}/agents/sessions/{id}/connect` carries the agent data (`utils/agents/transport.py:86-92`). The maximum message size is 20 MiB. The backend sends a heartbeat each 20 seconds.
+
+The headers are the headers of path D (`utils/agents/transport.py:34-38`). On this path the WebSocket upgrade request has the `Authorization` header.
+The first WebSocket message has `type: "auth"`, `cursor`, and `token`. The `token` value is the bearer value of the `Authorization` header (`utils/agents/transport.py:95-96`).
+Thus in `session` mode, the token of the user goes to the terminal server on this WebSocket. This is different from path B.
+
 ## 5. Auth modes
 
 `auth_type` controls the `Authorization` header that Open WebUI sends (`routers/terminals.py:359-382`, `utils/tools.py:1654-1662`).
 
-| `auth_type` | HTTP paths A, C, D | WebSocket path B | Paths E and F |
+| `auth_type` | HTTP paths A, C, D, G | WebSocket path B | Paths E and F |
 |---|---|---|---|
 | `bearer` | `Bearer <connection key>` | First message contains the connection key | `Bearer <connection key>` |
 | `session` | `Bearer <token of the user>` | First message contains an empty token | `Bearer <connection key>` (path E only) |
@@ -264,6 +276,7 @@ A user cannot call the management API through path A, because Open WebUI blocks 
 
 Notes:
 
+- The WebSocket of path G is different from path B. Its first message contains the same bearer value as the HTTP paths (section 4.7).
 - An orchestrator connection always uses `bearer` (section 3.2).
 - With `session`, the token is the credential that the caller gave to Open WebUI (`routers/terminals.py:368`). It can be a session token, an automation token, a subagent token, or an API key that starts with `sk-` (`utils/auth.py:421`, `utils/automations.py:382`, `utils/subagents.py:83`).
 - Open WebUI has no JWKS endpoint for these tokens. Refer to section 7.
@@ -393,8 +406,8 @@ These are conclusions from the facts above. They are inputs to the design. They 
 
 1. Open WebUI has no JWKS. The only possible local check is HS256 with `WEBUI_SECRET_KEY`.
 2. A component that has `WEBUI_SECRET_KEY` can make a valid token for each Open WebUI user. This increases the damage if warren is compromised.
-3. A token gets to a terminal server only when `auth_type` is `session`, and only on HTTP paths A, C, and D.
-4. On a WebSocket (path B), `session` mode gives no credential. The upstream sees only `X-User-Id`, `X-Session-Id`, and `user_id`.
+3. A token gets to a terminal server only when `auth_type` is `session`, and only on paths A, C, D, and G.
+4. On a browser WebSocket (path B), `session` mode gives no credential. The upstream sees only `X-User-Id`, `X-Session-Id`, and `user_id`. The agent WebSocket (path G) has the token.
 5. On path E, `session` mode uses the connection key and has no user.
 6. In `session` mode the bearer value can be an API key (`sk-...`). A local check cannot verify an API key. Only a call to Open WebUI can.
 
