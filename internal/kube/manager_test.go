@@ -36,6 +36,8 @@ type testEnv struct {
 	// badKeys is the number of key checks that must fail.
 	badKeys int
 	uid     atomic.Int64
+	// watchers is the number of managers that started a pod watch.
+	watchers int
 }
 
 type fakeClock struct {
@@ -108,6 +110,20 @@ func (e *testEnv) newManager(cfg Config) *Manager {
 	// Run the pod cache, but not the reaper timer. The tests call Reap.
 	m.factory.Start(ctx.Done())
 	waitFor(e.t, "start of the pod cache", m.Ready)
+	// The simulated cluster does not keep events for a watch that starts
+	// later. Wait until the watch of this manager operates. A real API
+	// server sends all events from the version of the first list.
+	e.watchers++
+	waitFor(e.t, "start of the pod watch", func() bool {
+		n := 0
+		for _, a := range e.client.Actions() {
+			if a.Matches("watch", "pods") {
+				n++
+			}
+		}
+		return n >= e.watchers
+	})
+	time.Sleep(20 * time.Millisecond)
 	return m
 }
 

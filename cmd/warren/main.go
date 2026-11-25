@@ -182,11 +182,11 @@ func kubeBackend(c config, logger *slog.Logger, m *metrics.Metrics) (*kube.Manag
 		restConfig, err = rest.InClusterConfig()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("Kubernetes configuration: %w", err)
+		return nil, fmt.Errorf("configuration for Kubernetes: %w", err)
 	}
 	client, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		return nil, fmt.Errorf("Kubernetes client: %w", err)
+		return nil, fmt.Errorf("client for Kubernetes: %w", err)
 	}
 	return kube.New(kube.Config{
 		Client:       client,

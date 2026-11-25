@@ -124,7 +124,7 @@ func checkShape(data []byte) error {
 					return fmt.Errorf("line %d: unknown key %q", k.Line, k.Value)
 				}
 				if v.Kind != yamlv3.ScalarNode || v.Tag != "!!str" {
-					return fmt.Errorf("line %d: %q must be a string. Put the value in quotation marks.", v.Line, k.Value)
+					return fmt.Errorf("line %d: %q must be a string (put the value in quotation marks)", v.Line, k.Value)
 				}
 			}
 		}

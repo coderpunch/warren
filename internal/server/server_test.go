@@ -175,7 +175,7 @@ func (f *fakeTerminal) handle(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "second\n")
 	case "/files/upload":
 		body, _ := io.ReadAll(r.Body)
-		io.WriteString(w, string(body))
+		w.Write(body)
 	default:
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"ok":true}`)
