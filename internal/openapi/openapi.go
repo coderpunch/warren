@@ -9,7 +9,8 @@
 // The file open-terminal.json is the OpenAPI document of Open Terminal
 // 0.18.1 (MIT license, https://github.com/open-webui/open-terminal). It is
 // the output of GET /openapi.json of that version with the default
-// settings.
+// settings. The file LICENSE.open-terminal is the license notice of Open
+// Terminal.
 package openapi
 
 import (

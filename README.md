@@ -29,4 +29,4 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request.
 
 Contributors must not read source code from `github.com/open-webui/terminals` or its forks.
 Contributors must not copy that source code.
-Contributors must not change that source code for use in warren.
+Contributors must not use that source code as a model for warren, in the same or a different programming language.
