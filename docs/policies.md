@@ -62,8 +62,8 @@ Warren reads the file with strict rules:
 - An unknown key is an error.
 - A key that occurs two times is an error.
 - Anchors, aliases, and merge keys are not permitted.
-- A text value must be a YAML string. Put a value such as `yes`, `007`, or `true` in quotation marks.
-- Each error message gives the line number.
+- A text value must be a YAML string. Put a value such as `007`, `true`, or `null` in quotation marks.
+- An error in a key or in a policy gives the line number.
 
 If the file is not valid, warren does not start.
 
@@ -86,8 +86,8 @@ If the file is not valid, warren does not start.
 | `nodeSelector` | No | None | Node labels that the pod of the sandbox requires. |
 | `tolerations` | No | None | A list of tolerations with the keys `key`, `operator`, `value`, `effect`, and `tolerationSeconds`. |
 
-A time is a number with a unit: `s`, `m`, `h`, or `d`. Examples are `30m`, `12h`, and `90d`.
-The unit `d` is one day of 24 hours.
+A time is a number with a unit: `s`, `m`, `h`, or `d`. Examples are `30m`, `12h`, and `90d`. The value `0` needs no unit.
+The unit `d` is one day of 24 hours. Do not use the unit `d` together with a different unit. Write `36h`, not `1d12h`.
 
 ### 4.1 Defaults
 
@@ -125,7 +125,7 @@ The values in this example are the defaults of warren.
 A sandbox always has a limit for each of the three resources. A sandbox with no limit could use all memory or all disk space of its node.
 
 - A CPU value is a number of processors, for example `500m`, `0.5`, or `2`.
-- A size is a whole number of bytes with a unit, for example `512Mi` or `2Gi`. The minimum for memory is `16Mi`.
+- A size is a whole number of bytes with a unit, for example `512Mi` or `2Gi`. The minimum for memory is `16Mi`. The maximum for each size is `1Ei`.
 - A request must not be more than its limit. If a policy sets a limit that is less than the default request, warren uses the limit as the request.
 - The limit for `ephemeral-storage` is for the temporary directory, the changes to the container file system, and the logs.
 
@@ -164,6 +164,8 @@ Warren deletes a volume in these conditions only:
 
 - A person deletes the instance in Open WebUI, or a client sends the reset operation. Refer to section 10.
 - No sandbox used the volume for the retention time of its policy.
+- A start made the volume, and the same start did not make the pod. That volume is empty.
+- The volume never got storage, and its storage class or size is different from the policy. That volume is empty. Warren deletes it at the next start, and makes a new volume with the settings of the policy.
 
 The retention time starts when warren finds that the volume has no pod. Warren writes that time to the annotation `warren.h3xcat.github.io/unused-since` of the volume. A start of the sandbox removes the annotation.
 
@@ -187,7 +189,7 @@ A volume has the access mode `ReadWriteOnce`. Warren does not change the size of
 
 The home directory is in the pod. Kubernetes deletes it when the pod stops, also after the idle time.
 The size of the home directory adds to the `ephemeral-storage` limit of the pod.
-If the sandbox writes more than the size, Kubernetes stops the pod, and the files are lost.
+If the sandbox writes more than the size, Kubernetes stops the pod and deletes the files.
 
 ### 7.4 Limits for volumes
 
@@ -206,7 +208,11 @@ Set `--max-volumes`, or a ResourceQuota for the sandbox namespace, to limit the 
 
 If a pod with a volume stays in deletion, warren does not remove it. The node can still write to the volume, and a second pod on the same volume could break the files.
 The sandbox is not available in that time. Warren writes a log record with the name of the node.
-The sandbox becomes available when the node operates again, when an administrator deletes the Node object, or when an administrator sets the taint `node.kubernetes.io/out-of-service` on the node.
+The sandbox becomes available in one of these conditions:
+
+- The node operates again.
+- An administrator deletes the Node object.
+- An administrator sets the taint `node.kubernetes.io/out-of-service` on the node.
 
 ## 8. Environment variables
 
@@ -250,7 +256,10 @@ The key `users` is a second control in warren. It is the list of the users who c
 - A person who manages the connection in Open WebUI can open the sandbox of a user of the list. Open WebUI then sends the ID of that user.
 - Warren has no data about groups. Use the access grants of Open WebUI for groups.
 
-When you remove a user from the list, the pod of that user stops after its idle time, and the volume stays. Delete the instance in Open WebUI to delete the files.
+When you remove a user from the list, warren refuses the next request of that user. The volume stays.
+A terminal that the user has open continues to operate, and the pod does not become idle. Send the stop operation for the instance to close the terminal. Refer to section 10.
+When the pod has no open connection, it stops after its idle time.
+Delete the instance in Open WebUI to delete the files.
 
 ## 10. Instance operations
 
@@ -269,6 +278,8 @@ Open WebUI 0.13.4 has no control for the reset operation. Warren gives it the sa
 
 The instance list shows a sandbox that has a volume and no pod as stopped.
 A sandbox stays on the account of the user that started it first, also when a different person starts it again.
+If a manager starts a new sandbox of the scope `chat`, `model`, or `shared`, the sandbox is on the account of no user. It does not count for the limits of a user.
+A start or restart operation waits while warren deletes the volume of the sandbox.
 
 ## 11. Changes of the policy file
 
@@ -281,10 +292,10 @@ If the new file is not valid, warren writes an error to its log and continues wi
 | Image, resources, storage, environment, runtime class, node selector, tolerations | Applies to pods that start after the change. A pod that operates keeps its settings. Send a restart operation to apply the change. |
 | Idle time | Applies immediately, also to the pods that operate. |
 | Retention time | Applies immediately, also to the volumes that exist. Refer to section 7.1. |
-| User list | Applies to the next request. |
+| User list | Applies to the next request. A terminal that is open stays open. Refer to section 9. |
 | Storage type from persistent to ephemeral | New pods do not use the volume. The volume stays until its retention time, or until a person deletes the instance. |
-| A policy is removed | Each chat that has the terminal selected gets an error. Warren stops the pods of the policy when their connections are closed. Warren keeps the volumes. |
-| The scope of a policy changes | The same as for a removed policy, for the pods and volumes of the previous scope. |
+| You remove a policy | Each chat that uses the terminal gets an error. Warren stops each pod of the policy when the pod has no open connection. Warren keeps the volumes. |
+| The scope of a policy changes | Warren does the same as for a removed policy, for the pods and volumes of the previous scope. The retention time of the policy does not apply to the volumes of the previous scope. |
 
 Warren keeps the volumes that have no policy, and writes their number to its log after each change of the file.
 If you put the policy back, its sandboxes find their volumes again.
@@ -320,8 +331,9 @@ The service account of warren needs these permissions in the sandbox namespace:
 | Metric | Meaning |
 |---|---|
 | `warren_volumes` | The number of volumes at this time. |
-| `warren_volume_deletes_total{reason}` | Volumes that warren deleted. The reason is `api` or `retention`. |
+| `warren_volume_deletes_total{reason}` | Volumes that warren deleted. The reason is `api`, `retention`, `start_failed`, or `unbound`. |
 | `warren_sandbox_creates_total{result="volume_limit"}` | Starts that warren refused because of a volume limit. |
 | `warren_sandbox_reaps_total{reason}` | Pods that warren stopped. New reasons are `volume_gone` and `no_policy`. |
 
-Warren writes an audit record (`"log":"audit"`) when it makes a volume and when it deletes a volume. The record has the sandbox name, the policy, the context, and the reason.
+Warren writes an audit record (`"log":"audit"`) when it makes a volume and when it deletes a volume. The record has the sandbox name, the policy, and the context.
+The record of a new volume also has the user and the size. The record of a deleted volume also has the reason.
