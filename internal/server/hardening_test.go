@@ -33,8 +33,9 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timeout: %s", what)
 }
 
-// A sandbox must not select the address of the tool calls of Open WebUI.
-func TestOpenAPIDocumentIsExamined(t *testing.T) {
+// A sandbox must not select the address of the tool calls of Open WebUI,
+// and it must not put text into the tool list.
+func TestToolListComesFromWarren(t *testing.T) {
 	e := newEnv(t)
 	resp := e.request("GET", "/openapi.json", "alice", nil)
 	if resp.StatusCode != 200 {
@@ -52,6 +53,8 @@ func TestOpenAPIDocumentIsExamined(t *testing.T) {
 	if doc.Servers != nil || strings.Contains(text, "evil.example") {
 		t.Errorf("the document has an address of the sandbox: %s", text)
 	}
+	// The sandbox has three tools that warren knows. All other path keys
+	// of the sandbox are not in the result.
 	want := map[string]bool{"/execute": true, "/files/list": true, "/execute/{process_id}/status": true}
 	for key := range doc.Paths {
 		if !want[key] {
@@ -63,14 +66,62 @@ func TestOpenAPIDocumentIsExamined(t *testing.T) {
 			t.Errorf("the document lost the path key %q", key)
 		}
 	}
-	if op, _ := doc.Paths["/execute"]["post"].(map[string]any); op["operationId"] != "run_command" {
-		t.Errorf("the operation of /execute changed: %v", doc.Paths["/execute"])
+	// The sandbox has only POST on /execute. The text of the operation
+	// comes from warren.
+	if doc.Paths["/execute"]["get"] != nil {
+		t.Error("the document has an operation that the sandbox does not have")
 	}
-	if doc.Info["title"] != "t" {
-		t.Error("the document lost its info object")
+	if op, _ := doc.Paths["/execute"]["post"].(map[string]any); op["operationId"] == "run_command" && op["description"] == nil {
+		t.Errorf("the operation of /execute comes from the sandbox: %v", op)
+	}
+	if doc.Info["title"] != "Open Terminal" {
+		t.Errorf("the info object comes from the sandbox: %v", doc.Info)
 	}
 	if got := e.alice.last().Header.Get("Authorization"); got != "Bearer pod-key-alice" {
 		t.Errorf("the request for the document had the key %q", got)
+	}
+
+	// A sandbox that is not ready: warren sends its complete tool list
+	// immediately. Open WebUI stops the chat turn after 10 seconds.
+	start := time.Now()
+	resp = e.request("GET", "/openapi.json", "carol", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("sandbox not ready: status = %d", resp.StatusCode)
+	}
+	if err := json.Unmarshal([]byte(body(t, resp)), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Paths) < 10 || doc.Paths["/files/read"] == nil {
+		t.Errorf("sandbox not ready: the tool list has %d paths", len(doc.Paths))
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("sandbox not ready: the tool list came after %v", d)
+	}
+}
+
+// A sandbox must not remove all tools, and its document must not make
+// warren use much memory.
+func TestToolListWithAHostileSandboxDocument(t *testing.T) {
+	e := newEnv(t)
+	docs := map[string]string{
+		"no paths":          `{"paths":{}}`,
+		"unknown paths":     `{"paths":{"/x":{"get":{}}}}`,
+		"upper-case method": `{"paths":{"/EXECUTE":{"POST":{}}}}`,
+		"not JSON":          `x`,
+		"too large":         `{"paths":{"/execute":{"post":{}}},"x":"` + strings.Repeat("A", 300<<10) + `"}`,
+	}
+	for name, doc := range docs {
+		e.alice.setOpenAPI(doc)
+		resp := e.request("GET", "/openapi.json", "alice", nil)
+		var out struct {
+			Paths map[string]any `json:"paths"`
+		}
+		if err := json.Unmarshal([]byte(body(t, resp)), &out); err != nil || resp.StatusCode != 200 {
+			t.Fatalf("%s: status %d, %v", name, resp.StatusCode, err)
+		}
+		if len(out.Paths) < 10 {
+			t.Errorf("%s: the tool list has %d paths, want the complete list", name, len(out.Paths))
+		}
 	}
 }
 
@@ -238,6 +289,17 @@ func TestAuditLogContent(t *testing.T) {
 	waitFor(t, "audit record for the open WebSocket", func() bool {
 		return strings.Contains(e.logs.String(), `"msg":"websocket open"`)
 	})
+	// Warren writes "websocket open" before it connects to the sandbox. A
+	// close message in that interval stops the connection, and the audit
+	// record then says "dial sandbox". Wait for an echo: it shows that the
+	// relay to the sandbox operates.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, data, err := conn.ReadMessage(); err != nil || string(data) != "echo:ping" {
+		t.Fatalf("echo through the relay = %q, %v", data, err)
+	}
 	conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(1000, ""), time.Now().Add(time.Second))
 	closeCode(t, conn)
 	conn.Close()

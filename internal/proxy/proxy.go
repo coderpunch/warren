@@ -23,6 +23,8 @@ import (
 	"github.com/h3xcat/warren/internal/auth"
 	"github.com/h3xcat/warren/internal/backend"
 	"github.com/h3xcat/warren/internal/httpx"
+	"github.com/h3xcat/warren/internal/metrics"
+	"github.com/h3xcat/warren/internal/openapi"
 	"github.com/h3xcat/warren/internal/policy"
 	"github.com/h3xcat/warren/internal/scope"
 )
@@ -38,6 +40,11 @@ type Options struct {
 	Policies Policies
 	Backend  backend.Backend
 	Logger   *slog.Logger
+	// OpenAPI is the tool list that warren sends. The default is the
+	// document that is part of warren.
+	OpenAPI *openapi.Document
+	// Metrics can be nil.
+	Metrics *metrics.Metrics
 
 	// AllowSetCookie lets a sandbox set cookies in the browser of the user.
 	// The default is false, because the cookies would belong to the origin
@@ -98,6 +105,9 @@ func New(opts Options) *Proxy {
 	}
 	if opts.WriteTimeout <= 0 {
 		opts.WriteTimeout = 60 * time.Second
+	}
+	if opts.OpenAPI == nil {
+		opts.OpenAPI = openapi.Default()
 	}
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 	p := &Proxy{
@@ -237,20 +247,13 @@ func fillInfo(ctx context.Context, rt route) {
 	info.Sandbox = rt.ref.Name()
 }
 
-// startTimeout gives the maximum time that a request can wait for its
-// sandbox. Open WebUI has a different time limit for each call
-// (docs/protocol.md, section 9.4). A reply after that limit has no use.
-func startTimeout(path string) time.Duration {
-	switch path {
-	case "/openapi.json":
-		return 8 * time.Second // limit of Open WebUI: 10 seconds
-	case "/files/cwd":
-		return 4 * time.Second // 5 seconds
-	case "/api/config", "/system":
-		return 2 * time.Second // 3 seconds for the two calls
-	}
-	return 50 * time.Second // 60 seconds for helper calls
-}
+// startTimeout is the maximum time that a request waits for its sandbox.
+// Helper calls of Open WebUI have a limit of 60 seconds, and browser
+// requests have 300 seconds (docs/protocol.md, section 9.4). The tool path
+// has shorter limits for /files/cwd, /api/config, and /system, but the
+// helper path and the browser use the same paths. When a client stops
+// earlier, the context of its request ends, and the start continues.
+const startTimeout = 50 * time.Second
 
 type proxyCtxKey struct{}
 
@@ -290,8 +293,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, rt route) {
 	fillInfo(r.Context(), rt)
+	if r.URL.Path == "/openapi.json" {
+		p.serveOpenAPI(w, r, rt)
+		return
+	}
 
-	startCtx, cancel := context.WithTimeout(r.Context(), startTimeout(r.URL.Path))
+	startCtx, cancel := context.WithTimeout(r.Context(), startTimeout)
 	lease, err := p.opts.Backend.Acquire(startCtx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID})
 	cancel()
 	if err != nil {
@@ -301,10 +308,6 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, rt route) {
 	defer lease.Release()
 
 	pc := &proxyCtx{target: lease.Target(), route: rt}
-	if r.URL.Path == "/openapi.json" {
-		p.serveOpenAPI(w, r, pc)
-		return
-	}
 	ctx := context.WithValue(r.Context(), proxyCtxKey{}, pc)
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
 }
@@ -318,13 +321,23 @@ func (p *Proxy) acquireFailed(w http.ResponseWriter, r *http.Request, err error)
 		w.WriteHeader(499)
 	case errors.Is(err, backend.ErrNotReady), errors.Is(err, context.DeadlineExceeded):
 		info.Detail = "sandbox not ready"
+		p.opts.Metrics.ProxyError("not_ready")
 		w.Header().Set("Retry-After", "5")
 		httpx.Error(w, http.StatusServiceUnavailable, "The terminal is not ready. Try again in a short time.")
+	case errors.Is(err, backend.ErrCapacity):
+		info.Detail = "sandbox capacity"
+		p.opts.Metrics.ProxyError("limit")
+		w.Header().Set("Retry-After", "30")
+		httpx.Error(w, http.StatusServiceUnavailable, "The server has no capacity for a new terminal. Try again later.")
 	case errors.Is(err, backend.ErrLimit):
 		info.Detail = "sandbox limit"
+		p.opts.Metrics.ProxyError("limit")
 		httpx.Error(w, http.StatusTooManyRequests, "You have too many terminals. Stop one, then try again.")
 	default:
 		info.Detail = "acquire: " + truncate(err.Error(), maxErrorText)
+		p.opts.Metrics.ProxyError("backend")
+		p.opts.Logger.Warn("cannot get a sandbox", "request_id", info.RequestID, "sandbox", info.Sandbox,
+			"error", truncate(err.Error(), maxErrorText))
 		httpx.Error(w, http.StatusBadGateway, "The terminal is not available")
 	}
 }
@@ -435,6 +448,7 @@ func (p *Proxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) 
 	}
 	text := truncate(err.Error(), maxErrorText)
 	info.Detail = "upstream: " + text
+	p.opts.Metrics.ProxyError("upstream")
 	p.opts.Logger.Warn("proxy error", "request_id", info.RequestID, "sandbox", info.Sandbox, "error", text)
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {

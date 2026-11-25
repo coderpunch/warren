@@ -14,6 +14,7 @@ import (
 	"github.com/h3xcat/warren/internal/api"
 	"github.com/h3xcat/warren/internal/auth"
 	"github.com/h3xcat/warren/internal/httpx"
+	"github.com/h3xcat/warren/internal/metrics"
 	"github.com/h3xcat/warren/internal/proxy"
 )
 
@@ -24,6 +25,8 @@ type Server struct {
 	API    http.Handler
 	Proxy  *proxy.Proxy
 	Logger *slog.Logger
+	// Metrics can be nil.
+	Metrics *metrics.Metrics
 }
 
 // refusalWriteTimeout is the maximum time to send a refusal to a client
@@ -84,6 +87,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // The record has the path but not the query string, because a query string
 // can contain secrets.
 func (s *Server) log(r *http.Request, info *httpx.Info, rec *statusRecorder, start time.Time) {
+	s.Metrics.Request(rec.status)
 	attrs := []any{
 		"log", "audit",
 		"request_id", info.RequestID,

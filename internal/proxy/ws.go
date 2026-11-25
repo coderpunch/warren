@@ -204,6 +204,8 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 		return
 	}
 	fillInfo(r.Context(), rt)
+	p.opts.Metrics.WebSocketOpened()
+	defer p.opts.Metrics.WebSocketClosed()
 	p.opts.Logger.Info("websocket open", "log", "audit", "request_id", info.RequestID,
 		"path", httpx.RedactPath(r.URL.Path), "user", info.UserID, "template", info.Template,
 		"context", info.Context, "sandbox", info.Sandbox)
@@ -241,12 +243,18 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 	lease, err := p.opts.Backend.Acquire(ctx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID, WebSocket: true})
 	if err != nil {
 		switch {
+		case errors.Is(err, backend.ErrCapacity):
+			p.opts.Metrics.ProxyError("limit")
+			refuse(websocket.CloseTryAgainLater, "The server has no capacity for a new terminal", "sandbox capacity")
 		case errors.Is(err, backend.ErrLimit):
+			p.opts.Metrics.ProxyError("limit")
 			refuse(closeForbidden, "You have too many terminals", "sandbox limit")
 		case errors.Is(err, backend.ErrNotReady), errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 			// The browser client tries again after code 1013.
+			p.opts.Metrics.ProxyError("not_ready")
 			refuse(websocket.CloseTryAgainLater, "The terminal is not ready", "sandbox not ready")
 		default:
+			p.opts.Metrics.ProxyError("backend")
 			refuse(websocket.CloseInternalServerErr, "The terminal is not available",
 				"acquire: "+truncate(err.Error(), maxErrorText))
 		}
@@ -257,6 +265,7 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 
 	up, code, err := p.dialSandbox(ctx, r, rt, target)
 	if err != nil {
+		p.opts.Metrics.ProxyError("upstream")
 		refuse(code, "The terminal refused the connection", "dial sandbox: "+truncate(err.Error(), maxErrorText))
 		return
 	}

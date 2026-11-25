@@ -38,6 +38,15 @@ type fakeTerminal struct {
 	requests []*http.Request
 	wsFirst  []string
 	wsClosed []int
+	// openAPI is the document that the terminal sends. The default is
+	// hostileOpenAPI.
+	openAPI string
+}
+
+func (f *fakeTerminal) setOpenAPI(doc string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.openAPI = doc
 }
 
 func newFakeTerminal(t *testing.T, key string) *fakeTerminal {
@@ -132,7 +141,13 @@ func (f *fakeTerminal) handle(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/openapi.json":
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, hostileOpenAPI)
+		f.mu.Lock()
+		doc := f.openAPI
+		f.mu.Unlock()
+		if doc == "" {
+			doc = hostileOpenAPI
+		}
+		io.WriteString(w, doc)
 	case "/early":
 		w.Header().Set("Set-Cookie", "token=early")
 		w.Header().Set("Location", "http://evil.example/")
@@ -175,7 +190,7 @@ func (f *fakeTerminal) handle(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "second\n")
 	case "/files/upload":
 		body, _ := io.ReadAll(r.Body)
-		io.WriteString(w, string(body))
+		w.Write(body)
 	default:
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"ok":true}`)
@@ -724,7 +739,8 @@ func TestManagementAPI(t *testing.T) {
 		{"POST", "/api/v1/terminals/templates", 403},
 		{"PATCH", "/api/v1/terminals/templates/personal", 403},
 		{"DELETE", "/api/v1/terminals/templates/personal", 403},
-		{"GET", "/api/v1/terminals/templates/personal/instance", 200},
+		{"GET", "/api/v1/terminals/templates/personal/instance?user_id=alice", 200},
+		{"GET", "/api/v1/terminals/templates/personal/instance", 409},
 		{"GET", "/api/v1/terminals/templates/personal/instances", 200},
 		{"POST", "/api/v1/terminals/templates/personal/restart", 501},
 		{"DELETE", "/api/v1/terminals/templates/personal/instance", 501},
