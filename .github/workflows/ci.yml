@@ -11,7 +11,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A new commit in a pull request replaces the run of the old commit.
+  # Each commit on main keeps its run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -41,7 +43,8 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+        # v0.8.2 is Staticcheck 2026.2.2. A module version cannot change.
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
       - name: Test
         run: go test -race -count=1 ./...
       - name: Build
