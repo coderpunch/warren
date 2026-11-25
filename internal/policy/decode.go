@@ -211,25 +211,26 @@ func textMap(v *yaml.Node, key string) (map[string]string, error) {
 }
 
 // decodeFile reads the file into the defaults and the policies. It does not
-// merge them.
-func decodeFile(data []byte) (Spec, []Policy, error) {
+// merge them. It also returns the line of each policy.
+func decodeFile(data []byte) (Spec, []Policy, []int, error) {
 	var defaults Spec
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var doc yaml.Node
 	if err := dec.Decode(&doc); err != nil {
 		if errors.Is(err, io.EOF) {
-			return defaults, nil, errors.New("the file is empty")
+			return defaults, nil, nil, errors.New("the file is empty")
 		}
-		return defaults, nil, err
+		return defaults, nil, nil, err
 	}
 	var second yaml.Node
 	if err := dec.Decode(&second); !errors.Is(err, io.EOF) {
-		return defaults, nil, errors.New("the file has more than one YAML document")
+		return defaults, nil, nil, errors.New("the file has more than one YAML document")
 	}
 	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
-		return defaults, nil, errors.New("the file must be a mapping with the key \"policies\"")
+		return defaults, nil, nil, errors.New("the file must be a mapping with the key \"policies\"")
 	}
 	var policies []Policy
+	var lines []int
 	err := mapping(doc.Content[0], "the file", map[string]field{
 		"defaults": func(v *yaml.Node) error {
 			if err := mapping(v, "\"defaults\"", specFields(&defaults)); err != nil {
@@ -239,6 +240,9 @@ func decodeFile(data []byte) (Spec, []Policy, error) {
 			// type in the defaults would change all scopes with no message.
 			if defaults.Storage.Type != "" {
 				return lineError(v, "\"storage.type\" is not permitted in the defaults. Set it in each policy.")
+			}
+			if err := defaults.validate(); err != nil {
+				return lineError(v, "defaults: %v", err)
 			}
 			return nil
 		},
@@ -269,17 +273,15 @@ func decodeFile(data []byte) (Spec, []Policy, error) {
 					return lineError(item, "policy %q: %v", p.ID, err)
 				}
 				policies = append(policies, p)
+				lines = append(lines, item.Line)
 			}
 			return nil
 		},
 	})
 	if err != nil {
-		return defaults, nil, err
+		return defaults, nil, nil, err
 	}
-	if err := defaults.validate(); err != nil {
-		return defaults, nil, fmt.Errorf("defaults: %w", err)
-	}
-	return defaults, policies, nil
+	return defaults, policies, lines, nil
 }
 
 // specFields returns the readers for the keys that a policy and the

@@ -116,7 +116,7 @@ func Load(path string) (*Set, error) {
 // unknown key, a duplicate key, a second YAML document, or a value of the
 // wrong type is an error.
 func Parse(data []byte) (*Set, error) {
-	defaults, policies, err := decodeFile(data)
+	defaults, policies, lines, err := decodeFile(data)
 	if err != nil {
 		return nil, err
 	}
@@ -125,24 +125,34 @@ func Parse(data []byte) (*Set, error) {
 		spec.overlay(policies[i].Spec)
 		policies[i].Spec = spec
 	}
-	return NewSet(policies)
+	return newSet(policies, lines)
 }
 
 // NewSet makes a set from a list of policies. It gives the built-in default
 // to each setting that has no value.
-func NewSet(policies []Policy) (*Set, error) {
+func NewSet(policies []Policy) (*Set, error) { return newSet(policies, nil) }
+
+// newSet makes a set. lines has the line of each policy in the file. It is
+// nil for policies that do not come from a file.
+func newSet(policies []Policy, lines []int) (*Set, error) {
 	if len(policies) == 0 {
 		return nil, errors.New("no policies")
+	}
+	where := func(i int) string {
+		if lines == nil {
+			return fmt.Sprintf("policy %d", i+1)
+		}
+		return fmt.Sprintf("line %d: policy %d", lines[i], i+1)
 	}
 	s := &Set{byID: make(map[string]Policy, len(policies))}
 	for i, p := range policies {
 		p.Spec = p.Spec.clone()
 		p.complete()
 		if err := p.Validate(); err != nil {
-			return nil, fmt.Errorf("policy %d (%q): %w", i+1, p.ID, err)
+			return nil, fmt.Errorf("%s (%q): %w", where(i), p.ID, err)
 		}
 		if _, dup := s.byID[p.ID]; dup {
-			return nil, fmt.Errorf("policy %d: duplicate ID %q", i+1, p.ID)
+			return nil, fmt.Errorf("%s: duplicate ID %q", where(i), p.ID)
 		}
 		s.byID[p.ID] = p
 		s.order = append(s.order, p.ID)
@@ -409,6 +419,9 @@ var (
 	minCPU     = resource.MustParse("1m")
 	minMemory  = resource.MustParse("16Mi")
 	minStorage = resource.MustParse("1Mi")
+	// maxSize is the maximum of each size. The parser of Kubernetes changes
+	// a larger value to 2^63-1 with no error.
+	maxSize = resource.MustParse("1Ei")
 )
 
 // MinRetention is the minimum retention time of a volume. The reaper needs
@@ -484,6 +497,9 @@ func validateResources(r corev1.ResourceRequirements) error {
 			if q.Cmp(minimum) < 0 {
 				return fmt.Errorf("resources.%s.%s is %s, and the minimum is %s", kind, name, q.String(), minimum.String())
 			}
+			if name != corev1.ResourceCPU && q.Cmp(maxSize) > 0 {
+				return fmt.Errorf("resources.%s.%s is %s, and the maximum is %s", kind, name, q.String(), maxSize.String())
+			}
 			if name != corev1.ResourceCPU && !wholeBytes(q) {
 				return fmt.Errorf("resources.%s.%s is %s, which is not a whole number of bytes", kind, name, q.String())
 			}
@@ -502,8 +518,13 @@ func validateResources(r corev1.ResourceRequirements) error {
 
 // wholeBytes reports whether a size is a whole number of bytes. A size such
 // as 1500m is a mistake for 1500M or 1500Mi.
+//
+// Value rounds up to a whole number, thus an equal value is a whole number.
+// MilliValue is not usable here: it overflows an int64 for sizes from
+// approximately 8Pi. The caller must refuse a size above maxSize first,
+// because Value overflows above 8Ei.
 func wholeBytes(q resource.Quantity) bool {
-	return q.MilliValue()%1000 == 0
+	return q.Cmp(*resource.NewQuantity(q.Value(), q.Format)) == 0
 }
 
 func (s Storage) validate() error {
@@ -511,6 +532,9 @@ func (s Storage) validate() error {
 	case "", StoragePersistent, StorageEphemeral:
 	default:
 		return fmt.Errorf("storage.type must be persistent or ephemeral, not %q", s.Type)
+	}
+	if s.Size != nil && s.Size.Cmp(maxSize) > 0 {
+		return fmt.Errorf("storage.size is %s, and the maximum is %s", s.Size.String(), maxSize.String())
 	}
 	if s.Size != nil && (s.Size.Cmp(minStorage) < 0 || !wholeBytes(*s.Size)) {
 		return fmt.Errorf("storage.size is %s. It must be a whole number of bytes, and the minimum is %s", s.Size.String(), minStorage.String())
@@ -617,8 +641,10 @@ func NewStore(set *Set) *Store {
 // Replace puts a new set into the store.
 func (s *Store) Replace(set *Set) {
 	now := time.Now()
-	s.set.Store(set)
+	// Write the time first. A reader that sees the new set then also sees
+	// the new time.
 	s.changed.Store(&now)
+	s.set.Store(set)
 }
 
 // ChangedAt returns the time of the last Replace. It is the zero time if

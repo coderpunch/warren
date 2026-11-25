@@ -575,22 +575,24 @@ func TestStartWaitsForAVolumeInDeletion(t *testing.T) {
 	if n := len(e.pods()); n != 0 {
 		t.Fatalf("pods = %d, want 0", n)
 	}
-	// The wait must not send requests to the API server again and again.
+	// The cache shows the deletion, thus the wait must send no request to
+	// the API server. One attempt to start sends two read requests.
 	gets := 0
 	for _, a := range e.client.Actions() {
 		if a.Matches("get", "persistentvolumeclaims") || a.Matches("get", "pods") {
 			gets++
 		}
 	}
-	if gets > 2 {
-		t.Errorf("read requests during the wait = %d, want a maximum of 2", gets)
+	if gets != 0 {
+		t.Errorf("read requests during the wait = %d, want 0", gets)
 	}
 
 	// The volume goes away. The waiting request then starts the sandbox
 	// with a new volume.
 	res := e.acquireAsync(context.Background(), e.m, req)
 	time.Sleep(50 * time.Millisecond)
-	if err := pvcs.Delete(context.Background(), name, metav1.DeleteOptions{}); err != nil {
+	// Kubernetes removes the volume when no pod uses it.
+	if err := e.client.Tracker().Delete(volumeResource, testNamespace, name); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
@@ -918,7 +920,7 @@ func TestObjectsWithNoPolicy(t *testing.T) {
 	e.usePolicies(`
 policies:
   - {id: kept, name: Kept, scope: user, storage: {retention: 24h}}
-  - {id: chat-kept, name: Was for each chat, scope: user}
+  - {id: chat-kept, name: Was for each chat, scope: user, storage: {retention: 24h}}
 `)
 	// The instance list does not show the volume and the pod of the
 	// previous scope. Open WebUI would send an operation for that row to a
@@ -1013,13 +1015,26 @@ func TestPodWhoseVolumeIsInDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "volume gone from the cache", func() bool { return e.m.volume(other.Ref.Name()) == nil })
+	// The watch of the volumes can be broken. The cache then has no volume
+	// for a pod whose volume exists. The reaper must not stop that pod.
+	third := templateRef("kept", "carol")
+	e.acquire(third).Release()
+	e.waitVolume(third.Ref.Name())
+	if err := e.m.volumes.GetStore().Delete(e.m.volume(third.Ref.Name())); err != nil {
+		t.Fatal(err)
+	}
 	e.m.Reap(context.Background())
-	if e.m.pod(other.Ref.Name()) == nil {
+	// The delete request is a part of the reaper run. The cache is not a
+	// correct source here: it shows the stop of a pod some time later.
+	if n := e.podDeletes(other.Ref.Name()); n != 0 {
 		t.Fatal("the reaper stopped a new pod before the cache of the volumes can show its volume")
 	}
 	e.clock.Advance(time.Minute)
 	e.m.Reap(context.Background())
 	waitFor(t, "stop of the pod with no volume", func() bool { return e.m.pod(other.Ref.Name()) == nil })
+	if n := e.podDeletes(third.Ref.Name()); n != 0 {
+		t.Error("the reaper stopped a pod whose volume is in the API server and not in the cache")
+	}
 }
 
 // If a different process changes the volume between the read and the write

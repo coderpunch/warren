@@ -87,6 +87,10 @@ type Policies interface {
 	Get(id string) (policy.Policy, bool)
 }
 
+// errWait means that a sandbox cannot start at this time. The caller must
+// wait and try again.
+var errWait = errors.New("the sandbox cannot start at this time")
+
 // errBadKey means that a sandbox refused the key that warren has for it.
 var errBadKey = errors.New("the sandbox refused its key")
 
@@ -459,7 +463,10 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 			// make warren start and delete pods with no end.
 			return nil, fmt.Errorf("the sandbox refused its key %d times; warren waits before the next start", bad.count)
 		}
-		return nil, m.start(ctx, req, false)
+		if err := m.start(ctx, req, false); !errors.Is(err, errWait) {
+			return nil, err
+		}
+		return nil, nil
 	case pod.Labels[LabelManagedBy] != ManagedByValue:
 		// The cache has only the pods of warren. This check is a second
 		// protection.
@@ -566,14 +573,14 @@ func (m *Manager) start(ctx context.Context, req backend.Request, exempt bool) e
 	// A reset or the reaper works on the volume. The caller must wait.
 	if st.resetting || st.volumeBusy {
 		m.mu.Unlock()
-		return nil
+		return errWait
 	}
 	// The volume is in deletion. The event of its end wakes the caller.
 	old := m.volume(name)
 	if pol.Persistent() && old != nil && old.DeletionTimestamp != nil {
 		m.dropLocked(name)
 		m.mu.Unlock()
-		return nil
+		return errWait
 	}
 	// The caller read the cache before this lock. If the pod came into the
 	// cache after that, the caller must wait for it. Without this check,
@@ -742,8 +749,10 @@ func (m *Manager) ensureVolume(ctx context.Context, name string, req backend.Req
 		var made *corev1.PersistentVolumeClaim
 		made, err = pvcs.Create(ctx, m.buildVolume(name, req, pol), metav1.CreateOptions{})
 		if err == nil {
+			// All requests share this quantity, and String writes to it.
+			size := pol.Storage.Size.DeepCopy()
 			m.cfg.Logger.Info("volume created", "log", "audit", "user", req.UserID, "template", req.Ref.TemplateID,
-				"context", req.Ref.ContextID(), "sandbox", name, "size", pol.Storage.Size.String())
+				"context", req.Ref.ContextID(), "sandbox", name, "size", size.String())
 			return true, made.UID, nil
 		}
 		if !apierrors.IsAlreadyExists(err) {
@@ -758,6 +767,26 @@ func (m *Manager) ensureVolume(ctx context.Context, name string, req backend.Req
 		return false, "", fmt.Errorf("a volume with the name %s exists, and warren did not make it", name)
 	}
 	if cur.DeletionTimestamp != nil {
+		return false, "", nil
+	}
+	if cur.Spec.VolumeName == "" && !volumeMatches(cur, pol) {
+		// The volume never got storage, thus it has no data, and Kubernetes
+		// does not let a claim change its class. Without this delete, a
+		// corrected policy does not repair a sandbox whose first volume
+		// could not bind. The conditions keep a volume that got storage, or
+		// that a different process replaced, after the read.
+		err := pvcs.Delete(ctx, name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{
+			UID: &cur.UID, ResourceVersion: &cur.ResourceVersion,
+		}})
+		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			return false, "", fmt.Errorf("delete the volume that never got storage: %w", err)
+		}
+		if err == nil {
+			m.cfg.Metrics.VolumeDelete("unbound")
+			m.cfg.Logger.Info("volume deleted", "log", "audit", "sandbox", name, "reason", "unbound",
+				"template", cur.Labels[LabelTemplate], "context", cur.Annotations[AnnotationContext])
+		}
+		// The caller tries again and makes the volume of the current policy.
 		return false, "", nil
 	}
 	if _, marked := cur.Annotations[AnnotationUnusedSince]; marked {
@@ -780,6 +809,18 @@ func (m *Manager) ensureVolume(ctx context.Context, name string, req backend.Req
 		}
 	}
 	return true, "", nil
+}
+
+// volumeMatches reports whether a volume has the storage class and the size
+// of a policy. A policy with no class uses the default class of the cluster,
+// and Kubernetes writes that class to the volume. Thus a policy with no class
+// matches each class.
+func volumeMatches(pvc *corev1.PersistentVolumeClaim, pol policy.Policy) bool {
+	if want := pol.Storage.StorageClassName; want != "" && (pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != want) {
+		return false
+	}
+	have, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	return pol.Storage.Size == nil || (ok && have.Cmp(*pol.Storage.Size) == 0)
 }
 
 // createObjects makes the volume, the Secret, and the pod. It reports
@@ -814,8 +855,18 @@ func (m *Manager) createObjects(ctx context.Context, name string, req backend.Re
 		if newVolume == "" {
 			return
 		}
+		// The context of the start can be at its end. That is a usual cause
+		// of the failure.
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
 		pvcs := m.cfg.Client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace)
-		if err := pvcs.Delete(ctx, name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &newVolume}}); err != nil && !apierrors.IsNotFound(err) {
+		err := pvcs.Delete(c, name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &newVolume}})
+		switch {
+		case err == nil:
+			m.cfg.Metrics.VolumeDelete("start_failed")
+			m.cfg.Logger.Info("volume deleted", "log", "audit", "sandbox", name, "reason", "start_failed",
+				"user", req.UserID, "template", req.Ref.TemplateID, "context", req.Ref.ContextID())
+		case !apierrors.IsNotFound(err):
 			m.cfg.Logger.Warn("cannot delete the empty volume of a start that failed", "sandbox", name, "error", err.Error())
 		}
 	}
@@ -1087,6 +1138,12 @@ func (m *Manager) Instances(templateID string) []Instance {
 // does not wait until the sandbox is ready. If the previous pod is failed
 // or in deletion, it waits until that pod is gone.
 func (m *Manager) Start(ctx context.Context, req backend.Request) error {
+	return m.startBy(ctx, req, "")
+}
+
+// startBy is Start for a caller that knows the user that started the
+// sandbox before. An empty value means that the caller does not know it.
+func (m *Manager) startBy(ctx context.Context, req backend.Request, by string) error {
 	if !m.Ready() {
 		return backend.ErrNotReady
 	}
@@ -1098,13 +1155,26 @@ func (m *Manager) Start(ctx context.Context, req backend.Request) error {
 	// The sandbox stays on the account of the user that started it first.
 	// The previous pod has that user. If there is no pod, the volume has it.
 	if pod != nil {
-		if by := pod.Annotations[AnnotationCreatedBy]; by != "" {
-			req.UserID = by
+		if v := pod.Annotations[AnnotationCreatedBy]; v != "" {
+			by = v
 		}
 	} else if v := m.volume(name); v != nil {
-		if by := v.Annotations[AnnotationCreatedBy]; by != "" {
-			req.UserID = by
+		if v := v.Annotations[AnnotationCreatedBy]; v != "" {
+			by = v
 		}
+	}
+	switch {
+	case by != "":
+		req.UserID = by
+	case req.Ref.Kind != scope.KindUser:
+		// No user started this sandbox. For a chat, a model, or a shared
+		// sandbox, Open WebUI does not examine the user ID of the body: a
+		// manager can send the ID of each user (docs/protocol.md, section
+		// 4.6). The sandbox goes on the account of no user. Without this,
+		// the pods and the volumes that a manager makes use up the limits
+		// of that user. A request of a user always has a user ID, thus the
+		// empty ID is the account of no user.
+		req.UserID = ""
 	}
 	if pod != nil {
 		if pod.DeletionTimestamp == nil {
@@ -1122,7 +1192,24 @@ func (m *Manager) Start(ctx context.Context, req backend.Request) error {
 	// A person who can call the management API manages the template. The
 	// sandbox of a chat or a model is for other users, thus the limit for
 	// each user does not apply to this start.
-	return m.start(ctx, req, true)
+	for {
+		wake := m.waiter()
+		err := m.start(ctx, req, true)
+		if !errors.Is(err, errWait) {
+			return err
+		}
+		// The reaper or a reset works on the volume, or the volume is in
+		// deletion. Wait for the end of that work.
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-wake:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
 }
 
 // Stop deletes the pod of a sandbox. The data of the sandbox stays.
@@ -1162,12 +1249,11 @@ func (m *Manager) Restart(ctx context.Context, req backend.Request) error {
 		return backend.ErrNotReady
 	}
 	name := req.Ref.Name()
+	by := ""
 	if pod := m.pod(name); pod != nil {
 		// For the sandbox of a chat, a model, or a template, Open WebUI
 		// sends the ID of the manager (docs/protocol.md, section 4.6).
-		if by := pod.Annotations[AnnotationCreatedBy]; by != "" {
-			req.UserID = by
-		}
+		by = pod.Annotations[AnnotationCreatedBy]
 		if pod.DeletionTimestamp == nil {
 			if err := m.deletePod(ctx, pod, "api", false); err != nil {
 				return fmt.Errorf("stop sandbox: %w", err)
@@ -1177,7 +1263,7 @@ func (m *Manager) Restart(ctx context.Context, req backend.Request) error {
 			return err
 		}
 	}
-	return m.Start(ctx, req)
+	return m.startBy(ctx, req, by)
 }
 
 // Delete stops a sandbox and deletes its volume. The next request starts
@@ -1289,9 +1375,11 @@ func (m *Manager) remove(ctx context.Context, name string) error {
 			if err != nil && !apierrors.IsNotFound(err) {
 				return fmt.Errorf("delete the volume: %w", err)
 			}
-			m.cfg.Metrics.VolumeDelete("api")
-			m.cfg.Logger.Info("volume deleted", "log", "audit", "sandbox", name, "reason", "api",
-				"template", cur.Labels[LabelTemplate], "context", cur.Annotations[AnnotationContext])
+			if err == nil {
+				m.cfg.Metrics.VolumeDelete("api")
+				m.cfg.Logger.Info("volume deleted", "log", "audit", "sandbox", name, "reason", "api",
+					"template", cur.Labels[LabelTemplate], "context", cur.Annotations[AnnotationContext])
+			}
 		}
 		gone = cur.UID
 		// Kubernetes removes the volume when no pod uses it.

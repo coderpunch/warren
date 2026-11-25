@@ -133,13 +133,17 @@ func (h *Handler) toTemplate(p policy.Policy) template {
 	if cpu, ok := p.Resources.Limits[corev1.ResourceCPU]; ok {
 		// The user interface of Open WebUI reads a decimal number of
 		// processors (docs/protocol.md, section 4.6).
-		t.Data.CPULimit = text(strconv.FormatFloat(cpu.AsApproximateFloat64(), 'f', -1, 64))
+		// A division gives the nearest number. AsApproximateFloat64
+		// multiplies, and it gives 0.7000000000000001 for 700m.
+		t.Data.CPULimit = text(strconv.FormatFloat(float64(cpu.MilliValue())/1000, 'f', -1, 64))
 	}
 	if memory, ok := p.Resources.Limits[corev1.ResourceMemory]; ok {
 		t.Data.MemoryLimit = text(memory.String())
 	}
 	if p.Storage.Size != nil {
-		t.Data.Storage = text(p.Storage.Size.String())
+		// All requests share this quantity, and String writes to it.
+		size := p.Storage.Size.DeepCopy()
+		t.Data.Storage = text(size.String())
 	}
 	return t
 }

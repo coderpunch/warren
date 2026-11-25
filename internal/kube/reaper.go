@@ -302,27 +302,36 @@ func (m *Manager) reapVolumes(ctx context.Context, now time.Time) {
 		// no start begin while this function works on the volume.
 		m.mu.Lock()
 		st := m.sandboxes[name]
-		busy := m.pod(name) != nil || (st != nil && (st.starting || st.creating || st.resetting || st.volumeBusy))
+		// After a change of the storage type to ephemeral, the pod of the
+		// sandbox does not use the volume.
+		pod := m.pod(name)
+		inUse := pod != nil && usesVolume(pod)
+		busy := inUse || (st != nil && (st.starting || st.creating || st.resetting || st.volumeBusy))
 		if !busy {
 			m.stateLocked(name).volumeBusy = true
 		}
 		m.mu.Unlock()
 		if busy {
-			if marked && m.pod(name) != nil {
+			if marked && inUse {
 				// A pod uses the volume, thus the mark is wrong.
 				m.markVolume(ctx, pvc, "")
 			}
 			continue
 		}
 
-		since, err := time.Parse(timeFormat, mark)
+		unused, err := time.Parse(timeFormat, mark)
 		switch {
-		case !marked || err != nil || since.After(now):
+		case !marked || err != nil || unused.After(now):
 			m.markVolume(ctx, pvc, now.UTC().Format(timeFormat))
 		default:
 			// Use the policy of this time. Warren keeps the volumes of a
 			// policy that is not in the file.
-			if hold || !m.expired(pvc, since, now) {
+			if hold || !m.expired(pvc, unused, now) {
+				break
+			}
+			// The policies changed after the start of this run. The delete
+			// delay starts again, and the next run writes the log record.
+			if !m.policiesSince().Equal(since) {
 				break
 			}
 			// Delete only the volume that this function examined, in the
@@ -353,11 +362,21 @@ func (m *Manager) reapVolumes(ctx context.Context, now time.Time) {
 }
 
 // expired reports whether a volume with no pod is older than the retention
-// time of its policy. Warren keeps the volumes of a policy that is not in
-// the file.
+// time of its policy. Warren keeps the volumes that have no policy: the
+// policy is not in the file, or it has a different scope. The retention
+// time of a policy is not for the volumes of its previous scope.
 func (m *Manager) expired(pvc *corev1.PersistentVolumeClaim, since, now time.Time) bool {
 	pol, ok := m.cfg.Policies.Get(pvc.Labels[LabelTemplate])
-	return ok && pol.Storage.Retention != nil && *pol.Storage.Retention > 0 && now.Sub(since) > *pol.Storage.Retention
+	if !ok || string(pol.Scope) != pvc.Labels[LabelScope] {
+		return false
+	}
+	return pol.Storage.Retention != nil && *pol.Storage.Retention > 0 && now.Sub(since) > *pol.Storage.Retention
+}
+
+// volumeInUse reports whether a pod uses the volume of a sandbox.
+func (m *Manager) volumeInUse(name string) bool {
+	pod := m.pod(name)
+	return pod != nil && usesVolume(pod)
 }
 
 // reportVolumes writes one log record after the start of warren and after
@@ -377,7 +396,7 @@ func (m *Manager) reportVolumes(now, since time.Time, hold bool) {
 		if m.orphan(pvc.Labels) {
 			orphans++
 		}
-		if since, err := time.Parse(timeFormat, pvc.Annotations[AnnotationUnusedSince]); err == nil && m.pod(pvc.Name) == nil && m.expired(pvc, since, now) {
+		if since, err := time.Parse(timeFormat, pvc.Annotations[AnnotationUnusedSince]); err == nil && !m.volumeInUse(pvc.Name) && m.expired(pvc, since, now) {
 			expired++
 		}
 	}
