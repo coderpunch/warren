@@ -143,6 +143,10 @@ type state struct {
 	// volumeBusy is true while the reaper changes or deletes the volume.
 	// No start is possible in that time.
 	volumeBusy bool
+	// kept has the labels of the volume that a reset replaces. It is not nil
+	// from the delete request of a reset until the reset ends. The sandbox
+	// keeps its place in the volume limits in that time.
+	kept map[string]string
 }
 
 // Manager implements backend.Backend with Kubernetes pods.
@@ -714,19 +718,28 @@ func (m *Manager) orphan(labels map[string]string) bool {
 // for the total: its user cannot use it and cannot give it back. It includes the start requests whose
 // volume the cache does not show at this time.
 func (m *Manager) volumeCountLocked(owner string) (ownerCount, total int) {
-	seen := map[string]bool{}
+	seen, live := map[string]bool{}, map[string]bool{}
 	for _, obj := range m.volumes.GetStore().List() {
 		pvc := obj.(*corev1.PersistentVolumeClaim)
 		seen[pvc.Name] = true
 		if pvc.DeletionTimestamp != nil {
 			continue
 		}
+		live[pvc.Name] = true
 		total++
 		if pvc.Labels[LabelOwner] == owner && unbounded(scope.Kind(pvc.Labels[LabelScope])) && !m.orphan(pvc.Labels) {
 			ownerCount++
 		}
 	}
 	for name, st := range m.sandboxes {
+		// A reset replaces the volume of this sandbox. The old volume is in
+		// deletion or gone, and the cache does not show the new volume.
+		if st.kept != nil && !live[name] {
+			total++
+			if st.kept[LabelOwner] == owner && unbounded(scope.Kind(st.kept[LabelScope])) && !m.orphan(st.kept) {
+				ownerCount++
+			}
+		}
 		if st.volumePending && !seen[name] {
 			total++
 			if st.owner == owner && unbounded(st.volumeScope) {
@@ -785,6 +798,7 @@ func (m *Manager) ensureVolume(ctx context.Context, name string, req backend.Req
 			m.cfg.Metrics.VolumeDelete("unbound")
 			m.cfg.Logger.Info("volume deleted", "log", "audit", "sandbox", name, "reason", "unbound",
 				"template", cur.Labels[LabelTemplate], "context", cur.Annotations[AnnotationContext])
+			return m.replaceVolume(ctx, name, req, pol, cur)
 		}
 		// The caller tries again and makes the volume of the current policy.
 		return false, "", nil
@@ -809,6 +823,43 @@ func (m *Manager) ensureVolume(ctx context.Context, name string, req backend.Req
 		}
 	}
 	return true, "", nil
+}
+
+// replaceVolume makes the volume of the current policy in place of a volume
+// that never got storage, after the delete request for that volume. The new
+// volume stays on the account of the same user: the old volume can be the
+// record of a sandbox after a reset. The function returns no UID, thus a
+// start that fails does not remove the new volume.
+func (m *Manager) replaceVolume(ctx context.Context, name string, req backend.Request, pol policy.Policy, old *corev1.PersistentVolumeClaim) (bool, types.UID, error) {
+	pvcs := m.cfg.Client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace)
+	req.UserID = old.Annotations[AnnotationCreatedBy]
+	for {
+		wake := m.waiter()
+		_, err := pvcs.Create(ctx, m.buildVolume(name, req, pol), metav1.CreateOptions{})
+		if err == nil {
+			size := pol.Storage.Size.DeepCopy()
+			m.cfg.Logger.Info("volume created", "log", "audit", "user", req.UserID, "template", req.Ref.TemplateID,
+				"context", req.Ref.ContextID(), "sandbox", name, "size", size.String(), "reason", "unbound")
+			return true, "", nil
+		}
+		if !apierrors.IsAlreadyExists(err) {
+			return false, "", fmt.Errorf("make the volume: %w", err)
+		}
+		// The old volume has the name until Kubernetes removes it.
+		if cur, err := pvcs.Get(ctx, name, metav1.GetOptions{}); err == nil && cur.UID != old.UID {
+			// A different process made a volume. The caller tries again.
+			return false, "", nil
+		}
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, "", nil
+		case <-wake:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
 }
 
 // volumeMatches reports whether a volume has the storage class and the size
@@ -1299,48 +1350,88 @@ func (m *Manager) clear(ctx context.Context, ref scope.Ref, keep bool) error {
 	st.resetting = true
 	m.mu.Unlock()
 
-	old, err := m.remove(ctx, name)
+	old, err := m.remove(ctx, name, keep)
 	if err == nil && keep && old != nil {
 		err = m.emptyVolume(ctx, ref, old)
 	}
 
 	m.mu.Lock()
 	st.resetting = false
+	st.kept = nil
 	m.dropLocked(name)
 	m.wakeLocked()
 	m.mu.Unlock()
 	return err
 }
 
+// resetWait is the time for which a reset continues to wait for the end of
+// the old volume after the end of its request. It is also the maximum time
+// in which the reset makes the new volume.
+const resetWait = 30 * time.Second
+
 // emptyVolume makes a new volume in place of the volume that a reset
-// deleted. The new volume stays on the account of the same user. If the
-// policy of the sandbox keeps no files at this time, there is nothing to
-// make.
+// deleted, and waits until the cache shows it. The new volume stays on the
+// account of the same user. If the policy of the sandbox keeps no files at
+// this time, there is nothing to make.
 func (m *Manager) emptyVolume(ctx context.Context, ref scope.Ref, old *corev1.PersistentVolumeClaim) error {
 	pol, ok := m.cfg.Policies.Get(ref.TemplateID)
 	if !ok || !pol.Persistent() || pol.Scope != ref.Kind {
 		return nil
 	}
+	// Do not use the context of the request. The old volume is gone. If the
+	// client goes away now, the sandbox must not stay with no volume: it
+	// would not be in the instance list.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resetWait)
+	defer cancel()
+	wait := func(wake <-chan struct{}) bool {
+		timer := time.NewTimer(pollInterval)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-wake:
+		case <-timer.C:
+		}
+		return true
+	}
+	name := ref.Name()
 	req := backend.Request{Ref: ref, UserID: old.Annotations[AnnotationCreatedBy]}
 	pvcs := m.cfg.Client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace)
-	_, err := pvcs.Create(ctx, m.buildVolume(ref.Name(), req, pol), metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		// A different process made the volume. It is empty.
-		return nil
+	for {
+		_, err := pvcs.Create(ctx, m.buildVolume(name, req, pol), metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			// A different process made the volume. It is empty.
+			break
+		}
+		if err == nil {
+			size := pol.Storage.Size.DeepCopy()
+			m.cfg.Logger.Info("volume created", "log", "audit", "user", req.UserID, "template", ref.TemplateID,
+				"context", ref.ContextID(), "sandbox", name, "size", size.String(), "reason", "reset")
+			break
+		}
+		// A ResourceQuota can count the deleted volume for a short time.
+		if !wait(nil) {
+			return fmt.Errorf("the reset deleted the files, but warren cannot make the empty volume. "+
+				"The sandbox is not in the instance list: %w", err)
+		}
 	}
-	if err != nil {
-		return fmt.Errorf("make the empty volume: %w", err)
+	// A start reads the account of the sandbox and the volume limits from
+	// the cache. Keep the mark of the reset until the cache has the volume.
+	for {
+		wake := m.waiter()
+		if v := m.volume(name); (v != nil && v.UID != old.UID && v.DeletionTimestamp == nil) || !wait(wake) {
+			return nil
+		}
 	}
-	size := pol.Storage.Size.DeepCopy()
-	m.cfg.Logger.Info("volume created", "log", "audit", "user", req.UserID, "template", ref.TemplateID,
-		"context", ref.ContextID(), "sandbox", ref.Name(), "size", size.String(), "reason", "reset")
-	return nil
 }
 
 // remove deletes the pod and the volume of a sandbox. It returns the volume
 // that it deleted or found in deletion, or nil if the sandbox had none. The
-// caller must set the resetting mark first.
-func (m *Manager) remove(ctx context.Context, name string) (*corev1.PersistentVolumeClaim, error) {
+// caller must set the resetting mark first. With keep, the caller makes a
+// new volume: the function then does not stop at the end of ctx after the
+// delete request of the volume, and the sandbox keeps its place in the
+// volume limits.
+func (m *Manager) remove(ctx context.Context, name string, keep bool) (*corev1.PersistentVolumeClaim, error) {
 	wait := func(wake <-chan struct{}) error {
 		timer := time.NewTimer(pollInterval)
 		defer timer.Stop()
@@ -1414,6 +1505,18 @@ func (m *Manager) remove(ctx context.Context, name string) (*corev1.PersistentVo
 		}
 		if gone != "" && cur.UID != gone {
 			return nil, nil
+		}
+		if keep && old == nil {
+			m.mu.Lock()
+			m.stateLocked(name).kept = cur.Labels
+			m.mu.Unlock()
+			// From here the files go away. If the client goes away, the reset
+			// must still make the new volume. If not, the result is a delete.
+			request := ctx
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithCancel(context.WithoutCancel(request))
+			defer cancel()
+			defer context.AfterFunc(request, func() { time.AfterFunc(resetWait, cancel) })()
 		}
 		if cur.DeletionTimestamp == nil {
 			err := pvcs.Delete(ctx, name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &cur.UID}})

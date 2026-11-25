@@ -277,8 +277,12 @@ After a delete or a reset, the next request of a user starts the sandbox again w
 The two operations do not start the sandbox.
 
 - After a reset, the sandbox stays in the instance list as a stopped instance. Its empty volume counts for the limits. Warren has no database, thus the volume is the record of an instance that has no pod.
+- The retention time of the policy applies to the empty volume, as to each volume that no sandbox uses (section 7.1). When warren deletes the volume, the sandbox is not in the instance list.
 - After a delete, the sandbox is not in the instance list, and its volume does not count for the limits.
-- A sandbox with ephemeral storage has no volume. After a stop, a reset, or a delete, it is not in the instance list.
+- A sandbox that has no volume is not in the instance list after a stop, a reset, or a delete. A sandbox with ephemeral storage usually has no volume.
+- If the storage type of a policy changed from persistent to ephemeral, a sandbox can have a volume from the time before the change (section 11). That sandbox stays in the instance list as a stopped instance until a reset or a delete removes the volume. A reset makes no new volume for it.
+- A reset first deletes the old volume, then makes the new volume. If the warren process stops between the two steps, the result is that of a delete: the sandbox is not in the instance list. Warren has no second record to repair this.
+- The result is also that of a delete, and the operation gets an error, in two conditions. Kubernetes refuses the new volume for 30 seconds. Or the client goes away, and Kubernetes does not remove the old volume in 30 seconds.
 
 Open WebUI 0.13.4 has no control for the reset operation. A client of the management API can send it.
 

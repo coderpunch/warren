@@ -1087,8 +1087,8 @@ func TestResetKeepsTheInstance(t *testing.T) {
 	if v == nil || v.UID == old {
 		t.Fatalf("volume after the reset = %+v, want a new volume", v)
 	}
-	// The new volume stays on the account of the same user, also when a
-	// manager sent the reset.
+	// The new volume stays on the account of the same user. A reset has no
+	// user ID, thus the user of the caller cannot change the account.
 	if v.Annotations[AnnotationCreatedBy] != "alice" || v.Labels[LabelOwner] != ownerDigest("alice") ||
 		v.Annotations[AnnotationContext] != "chat:c1" || v.Labels[LabelTemplate] != "chat-kept" {
 		t.Errorf("metadata of the new volume = %+v", v.ObjectMeta)
@@ -1098,8 +1098,12 @@ func TestResetKeepsTheInstance(t *testing.T) {
 	if len(list) != 1 || list[0].Status != StatusStopped || list[0].ContextID != "chat:c1" {
 		t.Errorf("instances after the reset = %+v, want one stopped instance", list)
 	}
-	// The instance keeps its place in the limit of the user.
-	if _, err := e.m.Acquire(context.Background(), chatKeptRef("alice", "c2")); !errors.Is(err, backend.ErrVolumeLimit) {
+	// The instance keeps its place in the limit of the user. If the limit
+	// does not refuse the start, the request must not wait for a pod that
+	// no test makes ready.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := e.m.Acquire(ctx, chatKeptRef("alice", "c2")); !errors.Is(err, backend.ErrVolumeLimit) {
 		t.Errorf("second chat volume after a reset: %v, want ErrVolumeLimit", err)
 	}
 	// The next request uses the empty volume.
