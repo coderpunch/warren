@@ -307,13 +307,22 @@ If the new file is not valid, warren writes an error to its log and continues wi
 | You remove a policy | Each chat that uses the terminal gets an error. Warren stops each pod of the policy when the pod has no open connection. Warren keeps the volumes. |
 | The scope of a policy changes | Warren does the same as for a removed policy, for the pods and volumes of the previous scope. The retention time of the policy does not apply to the volumes of the previous scope. |
 
+### 11.1 Volumes of a removed policy
+
+Rule: the removal of a policy from the file never deletes data. Only an explicit cleanup operation deletes the volumes of that policy.
+
 Warren keeps the volumes that have no policy, and writes their number to its log after each change of the file.
+The retention time does not apply to these volumes. Open WebUI does not show them, because the template does not exist.
 If you put the policy back, its sandboxes find their volumes again.
-To delete the volumes of a removed policy:
+
+The cleanup operation is a command of the administrator. It deletes all volumes of one policy:
 
 ```bash
 kubectl -n <sandbox namespace> delete pvc -l warren.h3xcat.github.io/template=<policy id>
 ```
+
+To see the volumes first, use `get` in place of `delete` in the command.
+If a pod of the policy still operates, Kubernetes keeps its volume until the pod stops. Warren stops such a pod.
 
 ## 12. Kubernetes objects
 
