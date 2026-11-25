@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -234,7 +235,7 @@ func TestAcquireStartsASandbox(t *testing.T) {
 	defer lease.Release()
 
 	secrets := e.secrets()
-	if len(secrets) != 1 || secrets[0].Name != name {
+	if len(secrets) != 1 || !strings.HasPrefix(secrets[0].Name, name+"-") || secrets[0].Labels[LabelSandbox] != name {
 		t.Fatalf("secrets = %v", secrets)
 	}
 	key := string(secrets[0].Data[secretKeyName])
@@ -394,7 +395,7 @@ func TestLimitForEachUser(t *testing.T) {
 		t.Errorf("pods = %d, want 3", len(e.pods()))
 	}
 	// A sandbox that stopped does not count.
-	e.m.Stop(context.Background(), chatRef("alice", "c2").Ref)
+	_ = e.m.Stop(context.Background(), chatRef("alice", "c2").Ref)
 	waitFor(t, "stop of c2", func() bool { return e.m.pod(chatRef("alice", "c2").Ref.Name()) == nil })
 	e.acquire(chatRef("alice", "c3")).Release()
 }
@@ -425,7 +426,7 @@ func TestLimitDoesNotCountTheSandboxItself(t *testing.T) {
 	e := newTestEnv(t, func(c *Config) { c.MaxPerUser = 1 })
 	req := userRef("alice")
 	e.acquire(req).Release()
-	if err := e.m.start(req); err != nil {
+	if err := e.m.start(context.Background(), req, false); err != nil {
 		t.Errorf("start of a sandbox that exists = %v, want no error", err)
 	}
 	if len(e.pods()) != 1 {
@@ -436,8 +437,9 @@ func TestLimitDoesNotCountTheSandboxItself(t *testing.T) {
 func TestTotalLimit(t *testing.T) {
 	e := newTestEnv(t, func(c *Config) { c.MaxTotal = 1 })
 	e.acquire(userRef("alice")).Release()
-	if _, err := e.m.Acquire(context.Background(), userRef("bob")); !errors.Is(err, backend.ErrLimit) {
-		t.Errorf("second sandbox: %v, want ErrLimit", err)
+	// The user cannot correct this limit, thus the error is different.
+	if _, err := e.m.Acquire(context.Background(), userRef("bob")); !errors.Is(err, backend.ErrCapacity) {
+		t.Errorf("second sandbox: %v, want ErrCapacity", err)
 	}
 }
 
@@ -572,9 +574,9 @@ func TestPodWithWrongKeyIsReplaced(t *testing.T) {
 		t.Fatal(r.err)
 	}
 	r.lease.Release()
-	secrets := e.secrets()
-	if len(secrets) != 1 || string(secrets[0].Data[secretKeyName]) != r.lease.Target().APIKey {
-		t.Error("the lease does not have the key of the new pod")
+	current, err := e.client.CoreV1().Secrets(testNamespace).Get(context.Background(), podSecretName(e.m.pod(name)), metav1.GetOptions{})
+	if err != nil || string(current.Data[secretKeyName]) != r.lease.Target().APIKey {
+		t.Errorf("the lease does not have the key of the new pod (%v)", err)
 	}
 }
 
@@ -584,7 +586,7 @@ func TestSandboxWithNoSecretIsReplaced(t *testing.T) {
 	name := req.Ref.Name()
 	e.acquire(req).Release()
 	// A new manager has no key in memory, and the Secret is gone.
-	if err := e.client.CoreV1().Secrets(testNamespace).Delete(context.Background(), name, metav1.DeleteOptions{}); err != nil {
+	if err := e.client.CoreV1().Secrets(testNamespace).Delete(context.Background(), e.secrets()[0].Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	second := e.newManager(e.m.cfg)
@@ -623,7 +625,7 @@ func TestInstanceOperations(t *testing.T) {
 	if s := e.m.InstanceStatus(req.Ref); s != StatusStopped {
 		t.Errorf("status with no pod = %s", s)
 	}
-	if err := e.m.Start(req); err != nil {
+	if err := e.m.Start(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
@@ -635,7 +637,7 @@ func TestInstanceOperations(t *testing.T) {
 		t.Errorf("status after ready = %s", s)
 	}
 	// A second start request has no effect.
-	if err := e.m.Start(req); err != nil || len(e.pods()) != 1 {
+	if err := e.m.Start(context.Background(), req); err != nil || len(e.pods()) != 1 {
 		t.Errorf("second Start: %v, pods = %d", err, len(e.pods()))
 	}
 	e.acquire(chatRef("bob", "c1")).Release()
@@ -650,7 +652,9 @@ func TestInstanceOperations(t *testing.T) {
 	}
 	waitFor(t, "new pod after restart", func() bool { p := e.m.pod(name); return p != nil && p.UID != firstUID })
 
-	e.m.Stop(context.Background(), req.Ref)
+	if err := e.m.Stop(context.Background(), req.Ref); err != nil {
+		t.Fatal(err)
+	}
 	waitFor(t, "stop", func() bool { return e.m.pod(name) == nil })
 	if s := e.m.InstanceStatus(req.Ref); s != StatusStopped {
 		t.Errorf("status after stop = %s", s)

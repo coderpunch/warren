@@ -243,6 +243,9 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 	lease, err := p.opts.Backend.Acquire(ctx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID, WebSocket: true})
 	if err != nil {
 		switch {
+		case errors.Is(err, backend.ErrCapacity):
+			p.opts.Metrics.ProxyError("limit")
+			refuse(websocket.CloseTryAgainLater, "The server has no capacity for a new terminal", "sandbox capacity")
 		case errors.Is(err, backend.ErrLimit):
 			p.opts.Metrics.ProxyError("limit")
 			refuse(closeForbidden, "You have too many terminals", "sandbox limit")

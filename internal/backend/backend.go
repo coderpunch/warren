@@ -43,8 +43,11 @@ var (
 	// ErrNotReady means that the sandbox did not become ready in time. The
 	// client can try again.
 	ErrNotReady = errors.New("sandbox is not ready")
-	// ErrLimit means that the user or the template has too many sandboxes.
-	ErrLimit = errors.New("sandbox limit reached")
+	// ErrLimit means that the user has the maximum number of sandboxes.
+	ErrLimit = errors.New("sandbox limit of the user reached")
+	// ErrCapacity means that warren has its maximum number of sandboxes.
+	// The user cannot correct this.
+	ErrCapacity = errors.New("no capacity for a new sandbox")
 )
 
 // Backend gives leases on sandboxes. An implementation can start a sandbox

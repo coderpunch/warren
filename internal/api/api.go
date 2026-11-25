@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/h3xcat/warren/internal/backend"
 	"github.com/h3xcat/warren/internal/httpx"
@@ -34,10 +35,20 @@ type Policies interface {
 type Instances interface {
 	InstanceStatus(ref scope.Ref) string
 	Instances(templateID string) []kube.Instance
-	Start(req backend.Request) error
-	Stop(ctx context.Context, ref scope.Ref)
+	Start(ctx context.Context, req backend.Request) error
+	Stop(ctx context.Context, ref scope.Ref) error
 	Restart(ctx context.Context, req backend.Request) error
+	// WaitReady waits until the sandbox is ready, or until it is clear
+	// that it does not start.
+	WaitReady(ctx context.Context, ref scope.Ref)
+	// Ready reports whether the data about the sandboxes is complete.
+	Ready() bool
 }
+
+// operationWait is the maximum time that a start or restart operation
+// waits for the sandbox. Open WebUI waits a maximum of 180 seconds for a
+// management call (docs/protocol.md, section 4.6).
+const operationWait = 90 * time.Second
 
 // Handler serves the management API. The caller must authenticate the
 // request before it calls the handler.
@@ -177,6 +188,11 @@ func (h *Handler) serveTemplate(w http.ResponseWriter, r *http.Request, rest str
 		return
 	}
 	switch {
+	case h.Instances != nil && !h.Instances.Ready():
+		// Without the data about the sandboxes, a reply would be wrong.
+		w.Header().Set("Retry-After", "5")
+		httpx.Error(w, http.StatusServiceUnavailable, "The server starts. Try again in a short time.")
+
 	case sub == "instances" && r.Method == http.MethodGet:
 		out := []instance{}
 		if h.Instances != nil {
@@ -260,21 +276,36 @@ func (h *Handler) instanceOperation(w http.ResponseWriter, r *http.Request, p po
 	var err error
 	switch op {
 	case "start":
-		err = h.Instances.Start(req)
+		err = h.Instances.Start(r.Context(), req)
 	case "restart":
 		err = h.Instances.Restart(r.Context(), req)
 	default: // "stop", and "instance" with DELETE
 		// The two operations delete the pod. The data of the sandbox stays.
-		h.Instances.Stop(r.Context(), ref)
+		err = h.Instances.Stop(r.Context(), ref)
 	}
 	switch {
 	case errors.Is(err, backend.ErrLimit):
 		httpx.Error(w, http.StatusTooManyRequests, "The user has too many terminals")
 		return
+	case errors.Is(err, backend.ErrCapacity):
+		w.Header().Set("Retry-After", "30")
+		httpx.Error(w, http.StatusServiceUnavailable, "The server has no capacity for a new terminal")
+		return
+	case errors.Is(err, backend.ErrNotReady):
+		w.Header().Set("Retry-After", "5")
+		httpx.Error(w, http.StatusServiceUnavailable, "The server starts. Try again in a short time.")
+		return
 	case err != nil:
 		info.Detail += ": " + err.Error()
 		httpx.Error(w, http.StatusBadGateway, "The operation was not successful")
 		return
+	}
+	if op == "start" || op == "restart" {
+		// Open WebUI shows each status that is not "running" as stopped.
+		// Wait for the sandbox, so that the reply shows the result.
+		ctx, cancel := context.WithTimeout(r.Context(), operationWait)
+		h.Instances.WaitReady(ctx, ref)
+		cancel()
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": h.Instances.InstanceStatus(ref)})
 }

@@ -12,8 +12,14 @@ import (
 	"github.com/h3xcat/warren/internal/scope"
 )
 
+// openAPIReads limits the number of sandbox documents that warren reads at
+// the same time. A hostile sandbox can send a large document for each
+// request, and warren must read it into memory.
+var openAPIReads = make(chan struct{}, 4)
+
 const (
-	maxOpenAPIBytes = 4 << 20
+	// The document of Open Terminal 0.18.1 has 40 KB.
+	maxOpenAPIBytes = 256 << 10
 	// openAPIStartWait is the time that the tool list waits for a sandbox.
 	// Open WebUI stops the chat turn if the tool list does not come in 10
 	// seconds (docs/protocol.md, section 9.4). Thus warren does not wait
@@ -43,7 +49,9 @@ func (p *Proxy) serveOpenAPI(w http.ResponseWriter, r *http.Request, rt route) {
 	cancel()
 	switch {
 	case err == nil:
-		if ops, ok := p.sandboxOperations(r.Context(), rt, lease.Target()); ok {
+		// A document that leaves no tool is not valid. Warren then sends
+		// its complete list.
+		if ops, ok := p.sandboxOperations(r.Context(), rt, lease.Target()); ok && p.opts.OpenAPI.Has(ops) {
 			body = p.opts.OpenAPI.Filtered(ops)
 			info.Detail = "tool list of the sandbox"
 		}
@@ -63,6 +71,13 @@ func (p *Proxy) serveOpenAPI(w http.ResponseWriter, r *http.Request, rt route) {
 func (p *Proxy) sandboxOperations(ctx context.Context, rt route, target backend.Target) (openapi.Operations, bool) {
 	ctx, cancel := context.WithTimeout(ctx, openAPIFetchTimeout)
 	defer cancel()
+	select {
+	case openAPIReads <- struct{}{}:
+		defer func() { <-openAPIReads }()
+	case <-ctx.Done():
+		// Too many reads at this time. The complete list is a safe reply.
+		return nil, false
+	}
 	u := *target.URL
 	u.Path = "/openapi.json"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)

@@ -99,6 +99,32 @@ func TestToolListComesFromWarren(t *testing.T) {
 	}
 }
 
+// A sandbox must not remove all tools, and its document must not make
+// warren use much memory.
+func TestToolListWithAHostileSandboxDocument(t *testing.T) {
+	e := newEnv(t)
+	docs := map[string]string{
+		"no paths":          `{"paths":{}}`,
+		"unknown paths":     `{"paths":{"/x":{"get":{}}}}`,
+		"upper-case method": `{"paths":{"/EXECUTE":{"POST":{}}}}`,
+		"not JSON":          `x`,
+		"too large":         `{"paths":{"/execute":{"post":{}}},"x":"` + strings.Repeat("A", 300<<10) + `"}`,
+	}
+	for name, doc := range docs {
+		e.alice.setOpenAPI(doc)
+		resp := e.request("GET", "/openapi.json", "alice", nil)
+		var out struct {
+			Paths map[string]any `json:"paths"`
+		}
+		if err := json.Unmarshal([]byte(body(t, resp)), &out); err != nil || resp.StatusCode != 200 {
+			t.Fatalf("%s: status %d, %v", name, resp.StatusCode, err)
+		}
+		if len(out.Paths) < 10 {
+			t.Errorf("%s: the tool list has %d paths, want the complete list", name, len(out.Paths))
+		}
+	}
+}
+
 func TestFrameworkPagesAreNotRelayed(t *testing.T) {
 	e := newEnv(t)
 	for _, path := range []string{"/docs", "/redoc", "/docs/oauth2-redirect"} {

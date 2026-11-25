@@ -247,18 +247,13 @@ func fillInfo(ctx context.Context, rt route) {
 	info.Sandbox = rt.ref.Name()
 }
 
-// startTimeout gives the maximum time that a request can wait for its
-// sandbox. Open WebUI has a different time limit for each call
-// (docs/protocol.md, section 9.4). A reply after that limit has no use.
-func startTimeout(path string) time.Duration {
-	switch path {
-	case "/files/cwd":
-		return 4 * time.Second // 5 seconds
-	case "/api/config", "/system":
-		return 2 * time.Second // 3 seconds for the two calls
-	}
-	return 50 * time.Second // 60 seconds for helper calls
-}
+// startTimeout is the maximum time that a request waits for its sandbox.
+// Helper calls of Open WebUI have a limit of 60 seconds, and browser
+// requests have 300 seconds (docs/protocol.md, section 9.4). The tool path
+// has shorter limits for /files/cwd, /api/config, and /system, but the
+// helper path and the browser use the same paths. When a client stops
+// earlier, the context of its request ends, and the start continues.
+const startTimeout = 50 * time.Second
 
 type proxyCtxKey struct{}
 
@@ -303,7 +298,7 @@ func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, rt route) {
 		return
 	}
 
-	startCtx, cancel := context.WithTimeout(r.Context(), startTimeout(r.URL.Path))
+	startCtx, cancel := context.WithTimeout(r.Context(), startTimeout)
 	lease, err := p.opts.Backend.Acquire(startCtx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID})
 	cancel()
 	if err != nil {
@@ -329,6 +324,11 @@ func (p *Proxy) acquireFailed(w http.ResponseWriter, r *http.Request, err error)
 		p.opts.Metrics.ProxyError("not_ready")
 		w.Header().Set("Retry-After", "5")
 		httpx.Error(w, http.StatusServiceUnavailable, "The terminal is not ready. Try again in a short time.")
+	case errors.Is(err, backend.ErrCapacity):
+		info.Detail = "sandbox capacity"
+		p.opts.Metrics.ProxyError("limit")
+		w.Header().Set("Retry-After", "30")
+		httpx.Error(w, http.StatusServiceUnavailable, "The server has no capacity for a new terminal. Try again later.")
 	case errors.Is(err, backend.ErrLimit):
 		info.Detail = "sandbox limit"
 		p.opts.Metrics.ProxyError("limit")

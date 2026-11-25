@@ -28,6 +28,9 @@ const (
 	// LabelOwner is a digest of the ID of the user that started the
 	// sandbox. A label cannot contain all characters of a user ID.
 	LabelOwner = prefix + "/owner"
+	// LabelSandbox is the name of the sandbox. A Secret has this label,
+	// because the name of a Secret has a random part.
+	LabelSandbox = prefix + "/sandbox"
 
 	// AnnotationContext is the context ID, for example "user:1234".
 	AnnotationContext = prefix + "/context-id"
@@ -37,6 +40,7 @@ const (
 	AnnotationActivity = prefix + "/last-activity"
 
 	secretKeyName  = "api-key"
+	keyVariable    = "OPEN_TERMINAL_API_KEY"
 	containerName  = "terminal"
 	terminalPort   = 8000
 	keyRandomBytes = 32
@@ -69,19 +73,58 @@ func labels(req backend.Request) map[string]string {
 	}
 }
 
-func (m *Manager) buildSecret(name string, req backend.Request, key string) *corev1.Secret {
+// newSecretName makes the name of the Secret for one start of a sandbox.
+// Each start has a different Secret. Thus two starts at the same time never
+// change the Secret of each other, and the pod that Kubernetes accepts has
+// the key of its own start.
+func newSecretName(sandbox string) (string, error) {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return sandbox + "-" + hex.EncodeToString(b), nil
+}
+
+// podSecretName returns the name of the Secret that has the key of a pod.
+func podSecretName(pod *corev1.Pod) string {
+	for _, c := range pod.Spec.Containers {
+		if c.Name != containerName {
+			continue
+		}
+		for _, e := range c.Env {
+			if e.Name == keyVariable && e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+				return e.ValueFrom.SecretKeyRef.Name
+			}
+		}
+	}
+	return ""
+}
+
+// containerRestarts returns the number of restarts of the sandbox container.
+func containerRestarts(pod *corev1.Pod) int32 {
+	for _, c := range pod.Status.ContainerStatuses {
+		if c.Name == containerName {
+			return c.RestartCount
+		}
+	}
+	return 0
+}
+
+func (m *Manager) buildSecret(sandbox, secretName string, req backend.Request, key string) *corev1.Secret {
+	l := labels(req)
+	l[LabelSandbox] = sandbox
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
+			Name:      secretName,
 			Namespace: m.cfg.Namespace,
-			Labels:    labels(req),
+			Labels:    l,
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{secretKeyName: []byte(key)},
 	}
 }
 
-func (m *Manager) buildPod(name string, req backend.Request) *corev1.Pod {
+func (m *Manager) buildPod(name, secretName string, req backend.Request) *corev1.Pod {
 	no := false
 	grace := int64(10)
 	port := intstr.FromInt32(terminalPort)
@@ -119,9 +162,9 @@ func (m *Manager) buildPod(name string, req backend.Request) *corev1.Pod {
 					Name: "http", ContainerPort: terminalPort, Protocol: corev1.ProtocolTCP,
 				}},
 				Env: []corev1.EnvVar{
-					{Name: "OPEN_TERMINAL_API_KEY", ValueFrom: &corev1.EnvVarSource{
+					{Name: keyVariable, ValueFrom: &corev1.EnvVarSource{
 						SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{Name: name},
+							LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
 							Key:                  secretKeyName,
 						},
 					}},

@@ -151,6 +151,20 @@ func (d *Document) render(have Operations) []byte {
 	return out
 }
 
+// Has reports whether the document has one or more operations of the set.
+// A sandbox must not remove all tools: Open WebUI stops a chat turn when
+// the tool list is empty.
+func (d *Document) Has(have Operations) bool {
+	for key, item := range d.paths {
+		for name := range item {
+			if methods[name] && have[key][name] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // OperationsOf reads the operations from the document of a sandbox. Warren
 // uses only the path keys and the method names of that document, and only to
 // compare them with the trusted document. It returns false if the data is

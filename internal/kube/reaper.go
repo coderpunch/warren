@@ -22,7 +22,8 @@ const (
 
 // activity returns the time of the last use of a pod.
 func (m *Manager) activity(pod *corev1.Pod, st *state) time.Time {
-	if st != nil && !st.lastActivity.IsZero() {
+	// A time from before the pod is the activity of a previous pod.
+	if st != nil && st.lastActivity.After(pod.CreationTimestamp.Time) {
 		return st.lastActivity
 	}
 	last := pod.CreationTimestamp.Time
@@ -52,11 +53,13 @@ func notReadySince(pod *corev1.Pod) time.Time {
 // pods, and it deletes Secrets that have no pod.
 func (m *Manager) Reap(ctx context.Context) {
 	now := m.now()
+	// live has the names of the Secrets that a pod uses.
 	live := map[string]bool{}
 	for _, obj := range m.informer.GetStore().List() {
 		pod := obj.(*corev1.Pod)
-		live[pod.Name] = true
+		live[podSecretName(pod)] = true
 		if pod.DeletionTimestamp != nil {
+			m.forceDelete(ctx, pod, now)
 			continue
 		}
 
@@ -80,28 +83,53 @@ func (m *Manager) Reap(ctx context.Context) {
 
 		switch {
 		case podTerminal(pod):
-			m.deletePod(ctx, pod, "failed")
+			_ = m.deletePod(ctx, pod, "failed", false)
 		case !podReady(pod) && now.Sub(notReadySince(pod)) > m.cfg.StartTimeout:
-			m.deletePod(ctx, pod, "not_ready")
+			_ = m.deletePod(ctx, pod, "not_ready", false)
 		case podReady(pod) && leases == 0 && m.cfg.IdleTimeout > 0 && now.Sub(last) > m.cfg.IdleTimeout:
-			m.deleteIdle(ctx, pod)
+			// deletePod looks at the leases again, together with its mark.
+			_ = m.deletePod(ctx, pod, "idle", true)
 		case persist:
 			m.persistActivity(ctx, pod, last)
 		}
 	}
 	m.deleteOrphanSecrets(ctx, live, now)
+
+	// Remove the records that have nothing behind them.
+	m.mu.Lock()
+	for name := range m.sandboxes {
+		m.dropLocked(name)
+	}
+	for name, bad := range m.badKeys {
+		if now.Sub(bad.last) > time.Hour {
+			delete(m.badKeys, name)
+		}
+	}
+	m.mu.Unlock()
 }
 
-// deleteIdle deletes an idle pod, if no lease started after the check.
-func (m *Manager) deleteIdle(ctx context.Context, pod *corev1.Pod) {
-	m.mu.Lock()
-	st := m.sandboxes[pod.Name]
-	busy := st != nil && st.leases > 0
-	m.mu.Unlock()
-	if busy {
+// stuckMargin is the time after the end of the grace period at which warren
+// removes a pod whose node does not confirm the deletion.
+const stuckMargin = 2 * time.Minute
+
+// forceDelete removes a pod that stays in deletion. The deletion time of a
+// pod is the time at which its grace period ends. A sandbox has no data
+// outside its pod, thus the removal is safe.
+func (m *Manager) forceDelete(ctx context.Context, pod *corev1.Pod, now time.Time) {
+	if now.Sub(pod.DeletionTimestamp.Time) <= stuckMargin {
 		return
 	}
-	m.deletePod(ctx, pod, "idle")
+	zero := int64(0)
+	err := m.cfg.Client.CoreV1().Pods(m.cfg.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+		GracePeriodSeconds: &zero,
+		Preconditions:      &metav1.Preconditions{UID: &pod.UID},
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
+		m.cfg.Logger.Warn("cannot remove a sandbox that stays in deletion", "sandbox", pod.Name, "error", err.Error())
+		return
+	}
+	m.cfg.Metrics.Reap("stuck")
+	m.cfg.Logger.Info("sandbox removed", "log", "audit", "sandbox", pod.Name, "reason", "stuck")
 }
 
 func (m *Manager) persistActivity(ctx context.Context, pod *corev1.Pod, last time.Time) {
@@ -128,11 +156,12 @@ func (m *Manager) deleteOrphanSecrets(ctx context.Context, live map[string]bool,
 		if live[s.Name] || now.Sub(s.CreationTimestamp.Time) < orphanAge {
 			continue
 		}
+		// A start request makes the Secret before the pod.
 		m.mu.Lock()
-		st := m.sandboxes[s.Name]
-		creating := st != nil && st.creating
+		st := m.sandboxes[s.Labels[LabelSandbox]]
+		starting := st != nil && (st.starting || st.creating)
 		m.mu.Unlock()
-		if creating {
+		if starting {
 			continue
 		}
 		if err := secrets.Delete(ctx, s.Name, metav1.DeleteOptions{
