@@ -120,11 +120,11 @@ The warren word for an instance is "sandbox".
 | Image, with an orchestrator default. A second default for Kubernetes backends. | v1 | One default image in warren. |
 | CPU and memory. The documentation says that the orchestrator sets limits only, not requests. | v1 | Warren sets requests and limits. |
 | Storage size. | v1 | |
-| Network profile: a name that selects one network configuration that an administrator defined. | v1 | In warren, the egress rules are part of the policy. |
+| Network profile: a name that selects one network configuration that an administrator defined. | v1 | In warren, the network settings are the key `network` of a policy. Warren shows them to Open WebUI as `internet`, `none`, or `custom`. Refer to `policies.md`, section 14. |
 | Environment variables as raw strings. | v1 | Warren does not show the variables of a policy to Open WebUI. |
 | Start directory. Open Terminal reads it from an environment variable. | v1 | Warren passes the variable. |
 | Runtime class (gVisor or Kata). The documentation describes none. | v1 | Addition in warren. |
-| Changes to the security context and the pod template of an instance. | Won't do | Warren has a fixed restricted security context. Only the runtime class, node selector, and tolerations can change. |
+| Changes to the security context and the pod template of an instance. | Won't do | Warren has a fixed restricted security context. A policy can set the runtime class, the node selector, the tolerations, the user ID, a user namespace, and the start command. Refer to `isolation.md`, section 2. |
 | Node selector and tolerations. In the documentation these are orchestrator settings, not template fields. | v1 | Keys of a policy, and of the `defaults` of the policy file. |
 | Users make and change templates in the Open WebUI user interface. | Later | In v1, an administrator defines policies in a YAML file or a ConfigMap. Warren shows each policy to Open WebUI as a read-only template. |
 
@@ -177,9 +177,9 @@ Warren must show values in these forms.
 
 | Feature in the documentation | Plan | Note |
 |---|---|---|
-| Optional NetworkPolicy objects for the orchestrator and the instance pods. The default is "off". | v1 | Always on in warren. Each sandbox gets a default-deny policy. Ingress is possible only from warren. |
+| Optional NetworkPolicy objects for the orchestrator and the instance pods. The default is "off". | v1 | Always on in warren. The sandbox namespace has a policy that refuses all connections, and each sandbox has its own policy. Ingress is possible only from warren. Warren tests that the cluster applies the policies. Refer to `isolation.md`, sections 3 and 4. |
 | Egress control with the in-container domain filter of Open Terminal. It needs `NET_ADMIN`. | Won't do | It conflicts with the restricted Pod Security Standard. |
-| Egress control with Kubernetes NetworkPolicy. | v1 | Rules by CIDR and port in each policy. The default rules block cluster addresses. Refer to `open-terminal-api.md`, section 7.2. |
+| Egress control with Kubernetes NetworkPolicy. | v1 | The modes `internet` and `none`, and a list of permitted networks or pods in each policy. The `internet` mode blocks private networks and the addresses of the cluster. Refer to `isolation.md`, section 3.3. |
 | Egress control by domain name in a network policy. The documentation describes none. | Later | Standard NetworkPolicy has no domain rules. Some CNI plug-ins have them. |
 | Namespace setting for instances. | v1 | One dedicated namespace for sandboxes. |
 | Labels on instance pods. | v1 | Warren also uses labels and annotations for its state. |

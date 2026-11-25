@@ -85,6 +85,10 @@ If the file is not valid, warren does not start.
 | `idleTimeout` | No | The flag `--idle-timeout` | Warren stops a sandbox after this time with no use. `0` means never. |
 | `nodeSelector` | No | None | Node labels that the pod of the sandbox requires. |
 | `tolerations` | No | None | A list of tolerations with the keys `key`, `operator`, `value`, `effect`, and `tolerationSeconds`. |
+| `network` | No | Refer to section 14 | The connections that the sandbox can open. |
+| `command` | No | Refer to section 15 | The start command of the sandbox, for an image with a different layout. |
+| `runAsUser` | No | `1001` | The user ID of the processes in the sandbox. Refer to section 15. |
+| `userNamespace` | No | `false` | `true` gives the sandbox its own user namespace. Refer to section 15. |
 
 A time is a number with a unit: `s`, `m`, `h`, or `d`. Examples are `30m`, `12h`, and `90d`. The value `0` needs no unit.
 The unit `d` is one day of 24 hours. Do not use the unit `d` together with a different unit. Write `36h`, not `1d12h`.
@@ -95,7 +99,8 @@ The optional key `defaults` at the top of the file can have each key of the tabl
 A policy uses a value of `defaults` when it does not set that value.
 
 - `env` and the resources merge by name. A policy adds to the variables of `defaults` or replaces them.
-- `nodeSelector`, `tolerations`, and `imagePullSecrets` do not merge. The value of the policy replaces the value of `defaults`.
+- `nodeSelector`, `tolerations`, `imagePullSecrets`, and `command` do not merge. The value of the policy replaces the value of `defaults`.
+- `network`: refer to section 14.3.
 
 ## 5. Scopes
 
@@ -299,12 +304,14 @@ If the new file is not valid, warren writes an error to its log and continues wi
 
 | Change | Result |
 |---|---|
-| Image, resources, storage, environment, runtime class, node selector, tolerations | Applies to pods that start after the change. A pod that operates keeps its settings. Send a restart operation to apply the change. |
+| Image, resources, storage, environment, runtime class, node selector, tolerations, command, user ID, user namespace | Applies to pods that start after the change. A pod that operates keeps its settings. Send a restart operation to apply the change. |
+| Network: a new permission | Applies in 30 seconds, also to the pods that operate. |
+| Network: a removed permission | Warren stops the sandboxes of the policy. The next request starts them again with the new settings. A network plugin can let an open connection continue after a change, thus only a stop closes it. |
 | Idle time | Applies immediately, also to the pods that operate. |
 | Retention time | Applies immediately, also to the volumes that exist. Refer to section 7.1. |
 | User list | Applies to the next request. A terminal that is open stays open. Refer to section 9. |
 | Storage type from persistent to ephemeral | New pods do not use the volume. The volume stays until its retention time, or until a person deletes the instance. |
-| You remove a policy | Each chat that uses the terminal gets an error. Warren stops each pod of the policy when the pod has no open connection. Warren keeps the volumes. |
+| You remove a policy | Each chat that uses the terminal gets an error. Warren stops the pods of the policy in 30 seconds, also a pod with an open terminal. Warren keeps the volumes. |
 | The scope of a policy changes | Warren does the same as for a removed policy, for the pods and volumes of the previous scope. The retention time of the policy does not apply to the volumes of the previous scope. |
 
 ### 11.1 Volumes of a removed policy
@@ -322,7 +329,7 @@ kubectl -n <sandbox namespace> delete pvc -l warren.h3xcat.github.io/template=<p
 ```
 
 To see the volumes first, use `get` in place of `delete` in the command.
-If a pod of the policy still operates, Kubernetes keeps its volume until the pod stops. Warren stops such a pod.
+Warren stops the pods of a removed policy, thus no pod uses these volumes.
 
 ## 12. Kubernetes objects
 
@@ -344,6 +351,10 @@ The service account of warren needs these permissions in the sandbox namespace:
 | `pods` | `get`, `list`, `watch`, `create`, `delete`, `patch` |
 | `secrets` | `get`, `list`, `create`, `delete`, `patch` |
 | `persistentvolumeclaims` | `get`, `list`, `watch`, `create`, `delete`, `patch` |
+| `networkpolicies` (`networking.k8s.io`) | `get`, `list`, `create`, `update`, `patch`, `delete` |
+
+At its start, warren asks Kubernetes for each of these permissions. If one is absent, warren stops with a message that names it.
+The network policies and the test pod of warren are in [isolation.md](isolation.md), section 9.
 
 ## 13. Metrics and audit records
 
@@ -352,7 +363,85 @@ The service account of warren needs these permissions in the sandbox namespace:
 | `warren_volumes` | The number of volumes at this time. |
 | `warren_volume_deletes_total{reason}` | Volumes that warren deleted. The reason is `api`, `retention`, `start_failed`, or `unbound`. |
 | `warren_sandbox_creates_total{result="volume_limit"}` | Starts that warren refused because of a volume limit. |
-| `warren_sandbox_reaps_total{reason}` | Pods that warren stopped. New reasons are `volume_gone` and `no_policy`. |
+| `warren_sandbox_reaps_total{reason}` | Pods that warren stopped. The reasons are `idle`, `failed`, `not_ready`, `api`, `bad_key`, `stuck`, `volume_gone`, `no_policy`, and the reasons of [isolation.md](isolation.md), section 7. |
 
 Warren writes an audit record (`"log":"audit"`) when it makes a volume and when it deletes a volume. The record has the sandbox name, the policy, and the context.
 The record of a new volume also has the user and the size. The record of a deleted volume also has the reason.
+
+## 14. Network
+
+```yaml
+network:
+  egress: none
+  dns: true
+  allow:
+    - cidr: 203.0.113.0/24
+      ports: [443]
+    - namespace: databases
+      podLabels: {app: postgres}
+      ports: [5432]
+```
+
+| Key | Default | Function |
+|---|---|---|
+| `egress` | `internet` | `internet` permits public addresses. `none` permits no connection. |
+| `dns` | `true` for `internet`, `false` for `none` | Permits name lookups with the DNS service of the cluster. |
+| `allow` | None | More destinations. Refer to section 14.1. |
+
+No policy can permit a connection to a sandbox. Only warren can connect to a sandbox.
+The `internet` mode does not permit private networks and the addresses of the cluster. Refer to [isolation.md](isolation.md), section 3.3.
+
+### 14.1 Destinations
+
+An item of `allow` has one of two forms:
+
+| Form | Keys | Use |
+|---|---|---|
+| Network | `cidr` | A destination that is not in the cluster, for example a database server in a private network. |
+| Pods | `namespace` and `podLabels` | Pods of the cluster. |
+
+The optional key `ports` limits an item to these TCP and UDP ports. Without it, the item permits all ports. A maximum of 16 ports is possible.
+For pods of the cluster, give the port of the pod, not the port of the service.
+
+- A `cidr` is a network with a prefix length, for example `10.20.0.0/16` or `2001:db8::/32`. The network of all addresses is not permitted.
+- `podLabels` is necessary with `namespace`. A list with no labels would select all pods of the namespace.
+- A file can have a maximum of 32 items in one `allow` list.
+
+An item of `allow` can permit a private address. Use it with care: a sandbox runs code that you do not control.
+
+### 14.2 What the modes mean
+
+- `egress: internet`: a user or a model can get data from the internet and send data to the internet. All connections come from the addresses of your cluster.
+- `egress: none`: the sandbox can open no connection. Package installation and downloads do not operate.
+- `egress: none` with `dns: true`: the sandbox can ask the DNS service only. Data can go out in DNS questions.
+
+Open WebUI shows the network settings of a template as `internet`, `none`, or `custom`. `none` means no connection and no DNS.
+
+### 14.3 The network settings of the defaults
+
+- A policy that sets `egress` replaces all network settings of `defaults`. It gets no `dns` value and no `allow` list from them.
+- A policy that sets only `dns` or `allow` keeps the `egress` mode of `defaults`.
+
+Thus `egress: none` in a policy always means none. And if `defaults` has `egress: none`, a policy that adds one destination does not get internet access.
+
+## 15. Command, user ID, and user namespace
+
+```yaml
+image: registry.example/terminal-alpine:1
+command: ["/sbin/tini", "--", "/usr/local/bin/python3", "-I", "-u", "-m", "open_terminal"]
+runAsUser: 1000
+userNamespace: true
+```
+
+| Key | Function |
+|---|---|
+| `command` | The start command. The first item must be an absolute path. Warren adds the arguments `run --host 0.0.0.0 --port 8000`. |
+| `runAsUser` | The user ID of the processes. It must not be 0. The group ID is always 1001. |
+| `userNamespace` | `true` gives the pod its own range of user IDs on the node. The cluster must support user namespaces. |
+
+Refer to [isolation.md](isolation.md), section 2, for the default command and for the security settings that a policy cannot change.
+
+Do not change `runAsUser` for a policy that has volumes. The files of a volume keep the user ID of the sandbox that made them, and a different user ID cannot change them.
+To change the user ID, delete the instances first.
+
+If a container cannot start with the image and the command of its policy, warren writes the message of Kubernetes to its log and stops the pod after 2 minutes.
