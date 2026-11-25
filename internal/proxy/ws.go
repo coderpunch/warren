@@ -249,6 +249,9 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 		case errors.Is(err, backend.ErrLimit):
 			p.opts.Metrics.ProxyError("limit")
 			refuse(closeForbidden, "You have too many terminals", "sandbox limit")
+		case errors.Is(err, backend.ErrVolumeLimit):
+			p.opts.Metrics.ProxyError("limit")
+			refuse(closeForbidden, "You have too many terminals with saved files", "volume limit")
 		case errors.Is(err, backend.ErrNotReady), errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 			// The browser client tries again after code 1013.
 			p.opts.Metrics.ProxyError("not_ready")

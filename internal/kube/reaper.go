@@ -48,9 +48,53 @@ func notReadySince(pod *corev1.Pod) time.Time {
 	return pod.CreationTimestamp.Time
 }
 
+// idleTimeout returns the idle time for a pod. It comes from the policy of
+// this time, thus a change of the policy file applies to the pods that
+// exist. If the policy is not in the file, it comes from the annotation that
+// the pod got at its start.
+func (m *Manager) idleTimeout(pod *corev1.Pod) time.Duration {
+	if pol, ok := m.cfg.Policies.Get(pod.Labels[LabelTemplate]); ok {
+		if pol.IdleTimeout != nil {
+			return *pol.IdleTimeout
+		}
+		return m.cfg.IdleTimeout
+	}
+	if v, ok := pod.Annotations[AnnotationIdleTimeout]; ok {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return m.cfg.IdleTimeout
+}
+
+// volumeGoneAfter is the minimum age of a pod before the reaper deletes it
+// because its volume is absent. The cache of the volumes can be later than
+// the cache of the pods.
+const volumeGoneAfter = 30 * time.Second
+
+// lostVolume reports whether the volume of a pod is in deletion or absent.
+// Such a pod cannot keep its files, or it cannot start.
+func (m *Manager) lostVolume(pod *corev1.Pod, now time.Time) bool {
+	if !usesVolume(pod) {
+		return false
+	}
+	v := m.volume(pod.Name)
+	if v != nil {
+		return v.DeletionTimestamp != nil
+	}
+	if now.Sub(pod.CreationTimestamp.Time) <= volumeGoneAfter {
+		return false
+	}
+	// The cache does not show the volume. Ask the API server before the
+	// delete of a pod: the watch of the volumes can be broken.
+	_, err := m.cfg.Client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+	return apierrors.IsNotFound(err)
+}
+
 // Reap does one run of the reaper. It deletes sandboxes that are idle,
 // failed, or not ready for too long. It writes the activity time to the
-// pods, and it deletes Secrets that have no pod.
+// pods, it deletes Secrets that have no pod, and it deletes volumes that no
+// sandbox used for the retention time of their policy.
 func (m *Manager) Reap(ctx context.Context) {
 	now := m.now()
 	// live has the names of the Secrets that a pod uses.
@@ -81,12 +125,22 @@ func (m *Manager) Reap(ctx context.Context) {
 		}
 		m.mu.Unlock()
 
+		m.warnUnschedulable(pod, now)
 		switch {
 		case podTerminal(pod):
 			_ = m.deletePod(ctx, pod, "failed", false)
+		case m.lostVolume(pod, now):
+			// A different process or a person deleted the volume. All that
+			// the user writes now is lost. Stop the pod, thus the next
+			// start makes a new volume.
+			_ = m.deletePod(ctx, pod, "volume_gone", false)
+		case leases == 0 && m.orphan(pod.Labels):
+			// The policy of the pod is not in the file, or it has a
+			// different scope. No request can get to the pod.
+			_ = m.deletePod(ctx, pod, "no_policy", true)
 		case !podReady(pod) && now.Sub(notReadySince(pod)) > m.cfg.StartTimeout:
 			_ = m.deletePod(ctx, pod, "not_ready", false)
-		case podReady(pod) && leases == 0 && m.cfg.IdleTimeout > 0 && now.Sub(last) > m.cfg.IdleTimeout:
+		case podReady(pod) && leases == 0 && m.idleTimeout(pod) > 0 && now.Sub(last) > m.idleTimeout(pod):
 			// deletePod looks at the leases again, together with its mark.
 			_ = m.deletePod(ctx, pod, "idle", true)
 		case persist:
@@ -94,6 +148,7 @@ func (m *Manager) Reap(ctx context.Context) {
 		}
 	}
 	m.deleteOrphanSecrets(ctx, live, now)
+	m.reapVolumes(ctx, now)
 
 	// Remove the records that have nothing behind them.
 	m.mu.Lock()
@@ -113,10 +168,28 @@ func (m *Manager) Reap(ctx context.Context) {
 const stuckMargin = 2 * time.Minute
 
 // forceDelete removes a pod that stays in deletion. The deletion time of a
-// pod is the time at which its grace period ends. A sandbox has no data
-// outside its pod, thus the removal is safe.
+// pod is the time at which its grace period ends.
+//
+// The removal does not wait for the node. It is safe only for a pod that has
+// no data outside the pod. A pod with a volume can continue to operate on a
+// node that does not answer. If warren removed it, the next pod would use
+// the same volume at the same time, and the files could break. Warren thus
+// keeps such a pod, and the sandbox is not available until Kubernetes
+// removes the pod.
 func (m *Manager) forceDelete(ctx context.Context, pod *corev1.Pod, now time.Time) {
 	if now.Sub(pod.DeletionTimestamp.Time) <= stuckMargin {
+		return
+	}
+	if usesVolume(pod) && pod.Spec.NodeName != "" {
+		m.mu.Lock()
+		st := m.stateLocked(pod.Name)
+		logged := st.stuck == pod.UID
+		st.stuck = pod.UID
+		m.mu.Unlock()
+		if !logged {
+			m.cfg.Logger.Warn("a sandbox with a volume stays in deletion. Warren does not remove it, because its node can still write to the volume. "+
+				"Examine the node.", "sandbox", pod.Name, "node", pod.Spec.NodeName)
+		}
 		return
 	}
 	zero := int64(0)
@@ -169,5 +242,174 @@ func (m *Manager) deleteOrphanSecrets(ctx context.Context, live map[string]bool,
 		}); err == nil {
 			m.cfg.Logger.Info("deleted a Secret that had no sandbox", "secret", s.Name)
 		}
+	}
+}
+
+// unschedulableAfter is the time after which warren writes a log record for
+// a pod that has no node.
+const unschedulableAfter = time.Minute
+
+// warnUnschedulable writes one log record for a pod for which Kubernetes
+// finds no node. The usual causes are a volume that cannot bind, a volume on
+// a node that the policy does not permit, and no free resources. Without
+// the record, an administrator sees only sandboxes that are not ready.
+func (m *Manager) warnUnschedulable(pod *corev1.Pod, now time.Time) {
+	if pod.Spec.NodeName != "" {
+		return
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type != corev1.PodScheduled || c.Status != corev1.ConditionFalse || c.Reason != corev1.PodReasonUnschedulable ||
+			now.Sub(c.LastTransitionTime.Time) < unschedulableAfter {
+			continue
+		}
+		m.mu.Lock()
+		st := m.stateLocked(pod.Name)
+		logged := st.unschedulable == pod.UID
+		st.unschedulable = pod.UID
+		m.mu.Unlock()
+		if !logged {
+			m.cfg.Logger.Warn("Kubernetes finds no node for a sandbox", "sandbox", pod.Name,
+				"template", pod.Labels[LabelTemplate], "message", c.Message)
+		}
+	}
+}
+
+// reapVolumes marks the volumes that no sandbox uses, and deletes a volume
+// when its mark is older than the retention time of its policy.
+//
+// The mark is the annotation "unused-since". The reaper sets it when a
+// volume has no pod, and a start removes it before it makes the pod. Thus
+// the time of a volume counts from the stop of its sandbox, and it survives
+// a restart of warren.
+func (m *Manager) reapVolumes(ctx context.Context, now time.Time) {
+	pvcs := m.cfg.Client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace)
+	// For some time after its start and after a change of the policies,
+	// warren deletes no volume. A policy file with a retention time that is
+	// too short would delete many volumes at the first run. The log record
+	// tells the administrator the number.
+	since := m.policiesSince()
+	hold := m.cfg.VolumeDeleteDelay > 0 && now.Sub(since) < m.cfg.VolumeDeleteDelay
+	m.reportVolumes(now, since, hold)
+	for _, obj := range m.volumes.GetStore().List() {
+		pvc := obj.(*corev1.PersistentVolumeClaim)
+		if pvc.DeletionTimestamp != nil {
+			continue
+		}
+		name := pvc.Name
+		mark, marked := pvc.Annotations[AnnotationUnusedSince]
+
+		// Do not change a volume while a start or a reset uses it, and let
+		// no start begin while this function works on the volume.
+		m.mu.Lock()
+		st := m.sandboxes[name]
+		busy := m.pod(name) != nil || (st != nil && (st.starting || st.creating || st.resetting || st.volumeBusy))
+		if !busy {
+			m.stateLocked(name).volumeBusy = true
+		}
+		m.mu.Unlock()
+		if busy {
+			if marked && m.pod(name) != nil {
+				// A pod uses the volume, thus the mark is wrong.
+				m.markVolume(ctx, pvc, "")
+			}
+			continue
+		}
+
+		since, err := time.Parse(timeFormat, mark)
+		switch {
+		case !marked || err != nil || since.After(now):
+			m.markVolume(ctx, pvc, now.UTC().Format(timeFormat))
+		default:
+			// Use the policy of this time. Warren keeps the volumes of a
+			// policy that is not in the file.
+			if hold || !m.expired(pvc, since, now) {
+				break
+			}
+			// Delete only the volume that this function examined, in the
+			// state that it examined. A start of a different warren process
+			// removes the mark, and that changes the resource version.
+			err := pvcs.Delete(ctx, name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{
+				UID: &pvc.UID, ResourceVersion: &pvc.ResourceVersion,
+			}})
+			switch {
+			case err == nil:
+				m.cfg.Metrics.VolumeDelete("retention")
+				m.cfg.Logger.Info("volume deleted", "log", "audit", "sandbox", name, "reason", "retention",
+					"template", pvc.Labels[LabelTemplate], "context", pvc.Annotations[AnnotationContext],
+					"unused_since", mark)
+			case !apierrors.IsNotFound(err) && !apierrors.IsConflict(err):
+				m.cfg.Logger.Warn("cannot delete a volume", "sandbox", name, "error", err.Error())
+			}
+		}
+
+		m.mu.Lock()
+		if st := m.sandboxes[name]; st != nil {
+			st.volumeBusy = false
+			m.dropLocked(name)
+		}
+		m.wakeLocked()
+		m.mu.Unlock()
+	}
+}
+
+// expired reports whether a volume with no pod is older than the retention
+// time of its policy. Warren keeps the volumes of a policy that is not in
+// the file.
+func (m *Manager) expired(pvc *corev1.PersistentVolumeClaim, since, now time.Time) bool {
+	pol, ok := m.cfg.Policies.Get(pvc.Labels[LabelTemplate])
+	return ok && pol.Storage.Retention != nil && *pol.Storage.Retention > 0 && now.Sub(since) > *pol.Storage.Retention
+}
+
+// reportVolumes writes one log record after the start of warren and after
+// each change of the policies: the number of volumes that are past their
+// retention time, and the number of volumes that have no policy.
+func (m *Manager) reportVolumes(now, since time.Time, hold bool) {
+	m.mu.Lock()
+	done := m.volumesReported.Equal(since)
+	m.volumesReported = since
+	m.mu.Unlock()
+	if done {
+		return
+	}
+	expired, orphans := 0, 0
+	for _, obj := range m.volumes.GetStore().List() {
+		pvc := obj.(*corev1.PersistentVolumeClaim)
+		if m.orphan(pvc.Labels) {
+			orphans++
+		}
+		if since, err := time.Parse(timeFormat, pvc.Annotations[AnnotationUnusedSince]); err == nil && m.pod(pvc.Name) == nil && m.expired(pvc, since, now) {
+			expired++
+		}
+	}
+	if expired > 0 {
+		text := "volumes are past the retention time of their policy. Warren deletes them now."
+		if hold {
+			text = "volumes are past the retention time of their policy. Warren deletes them after the delay. " +
+				"If this is not correct, change the policy file in that time."
+		}
+		m.cfg.Logger.Warn(text, "volumes", expired, "delay", m.cfg.VolumeDeleteDelay.String())
+	}
+	if orphans > 0 {
+		m.cfg.Logger.Warn("volumes have no policy: their policy is not in the file, or it has a different scope. "+
+			"Warren keeps them. Delete them with kubectl if they are not necessary.", "volumes", orphans)
+	}
+}
+
+// markVolume sets or removes the "unused-since" annotation of a volume. An
+// empty value removes it.
+func (m *Manager) markVolume(ctx context.Context, pvc *corev1.PersistentVolumeClaim, value string) {
+	var v any
+	if value != "" {
+		v = value
+	}
+	// The resource version makes the change conditional: it fails if the
+	// volume changed after the cache read it.
+	patch, _ := json.Marshal(map[string]any{"metadata": map[string]any{
+		"resourceVersion": pvc.ResourceVersion,
+		"annotations":     map[string]any{AnnotationUnusedSince: v},
+	}})
+	_, err := m.cfg.Client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).Patch(ctx, pvc.Name, types.MergePatchType, patch, metav1.PatchOptions{})
+	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+		m.cfg.Logger.Debug("cannot write the mark of a volume", "sandbox", pvc.Name, "error", err.Error())
 	}
 }

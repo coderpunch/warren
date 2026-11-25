@@ -9,8 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/h3xcat/warren/internal/backend"
 	"github.com/h3xcat/warren/internal/httpx"
@@ -38,6 +41,9 @@ type Instances interface {
 	Start(ctx context.Context, req backend.Request) error
 	Stop(ctx context.Context, ref scope.Ref) error
 	Restart(ctx context.Context, req backend.Request) error
+	// Delete stops a sandbox and deletes its data. The next request of a
+	// user starts the sandbox again.
+	Delete(ctx context.Context, ref scope.Ref) error
 	// WaitReady waits until the sandbox is ready, or until it is clear
 	// that it does not start.
 	WaitReady(ctx context.Context, ref scope.Ref)
@@ -57,6 +63,8 @@ type Handler struct {
 	// Instances is nil in development mode. The instance operations are
 	// then not available.
 	Instances Instances
+	// DefaultImage is the image of a policy that sets no image.
+	DefaultImage string
 }
 
 // instanceContext is the body of an instance operation
@@ -101,12 +109,37 @@ type status struct {
 	NetworkProfiles []string `json:"network_profiles"`
 }
 
-func toTemplate(p policy.Policy) template {
+// toTemplate shows a policy in the form of an Open WebUI template. It does
+// not show the environment variables: each person who manages the connection
+// in Open WebUI can read a template.
+func (h *Handler) toTemplate(p policy.Policy) template {
 	t := template{ID: p.ID, Data: templateData{Name: p.Name}}
 	// Open WebUI uses null for the shared scope.
 	if p.Scope != scope.KindShared {
 		s := string(p.Scope)
 		t.Data.Scope = &s
+	}
+	text := func(s string) *string {
+		if s == "" {
+			return nil
+		}
+		return &s
+	}
+	image := p.Image
+	if image == "" {
+		image = h.DefaultImage
+	}
+	t.Data.Image = text(image)
+	if cpu, ok := p.Resources.Limits[corev1.ResourceCPU]; ok {
+		// The user interface of Open WebUI reads a decimal number of
+		// processors (docs/protocol.md, section 4.6).
+		t.Data.CPULimit = text(strconv.FormatFloat(cpu.AsApproximateFloat64(), 'f', -1, 64))
+	}
+	if memory, ok := p.Resources.Limits[corev1.ResourceMemory]; ok {
+		t.Data.MemoryLimit = text(memory.String())
+	}
+	if p.Storage.Size != nil {
+		t.Data.Storage = text(p.Storage.Size.String())
 	}
 	return t
 }
@@ -146,7 +179,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		list := h.Policies.List()
 		out := make([]template, 0, len(list))
 		for _, p := range list {
-			out = append(out, toTemplate(p))
+			out = append(out, h.toTemplate(p))
 		}
 		httpx.WriteJSON(w, http.StatusOK, out)
 
@@ -179,7 +212,7 @@ func (h *Handler) serveTemplate(w http.ResponseWriter, r *http.Request, rest str
 	if !hasSub {
 		switch r.Method {
 		case http.MethodGet:
-			httpx.WriteJSON(w, http.StatusOK, toTemplate(p))
+			httpx.WriteJSON(w, http.StatusOK, h.toTemplate(p))
 		case http.MethodPatch, http.MethodDelete:
 			readOnly(w)
 		default:
@@ -215,12 +248,9 @@ func (h *Handler) serveTemplate(w http.ResponseWriter, r *http.Request, rest str
 		}
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": status})
 
-	case (sub == "start" || sub == "stop" || sub == "restart") && r.Method == http.MethodPost,
+	case (sub == "start" || sub == "stop" || sub == "restart" || sub == "reset") && r.Method == http.MethodPost,
 		sub == "instance" && r.Method == http.MethodDelete:
 		h.instanceOperation(w, r, p, sub)
-
-	case sub == "reset" && r.Method == http.MethodPost:
-		notImplemented(w)
 
 	case sub == "instance", sub == "instances", sub == "start", sub == "stop", sub == "restart", sub == "reset":
 		methodNotAllowed(w, "GET, POST, DELETE")
@@ -272,6 +302,15 @@ func (h *Handler) instanceOperation(w http.ResponseWriter, r *http.Request, p po
 	info := httpx.InfoFrom(r.Context())
 	info.UserID, info.Template, info.Context, info.Sandbox = userID, ref.TemplateID, ref.ContextID(), ref.Name()
 	info.Detail = "instance operation: " + op
+	// For the user scope, the user ID of the body is the user of the
+	// sandbox. A policy with a user list gives no sandbox to other users.
+	// The stop, delete, and reset operations start nothing, thus they stay
+	// possible for a user that is not in the list.
+	if p.Scope == scope.KindUser && !p.Allows(userID) && (op == "start" || op == "restart") {
+		info.Detail += ": the policy does not permit the user"
+		httpx.Error(w, http.StatusForbidden, "The policy of this terminal does not permit this user")
+		return
+	}
 
 	var err error
 	switch op {
@@ -279,13 +318,21 @@ func (h *Handler) instanceOperation(w http.ResponseWriter, r *http.Request, p po
 		err = h.Instances.Start(r.Context(), req)
 	case "restart":
 		err = h.Instances.Restart(r.Context(), req)
-	default: // "stop", and "instance" with DELETE
-		// The two operations delete the pod. The data of the sandbox stays.
+	case "stop":
+		// The files of the sandbox stay.
 		err = h.Instances.Stop(r.Context(), ref)
+	default: // "reset", and "instance" with DELETE
+		// Open WebUI tells the person that a delete removes the instance
+		// and its files (docs/protocol.md, section 4.6). Open WebUI 0.13.4
+		// does not send a reset. Warren gives it the same function.
+		err = h.Instances.Delete(r.Context(), ref)
 	}
 	switch {
 	case errors.Is(err, backend.ErrLimit):
 		httpx.Error(w, http.StatusTooManyRequests, "The user has too many terminals")
+		return
+	case errors.Is(err, backend.ErrVolumeLimit):
+		httpx.Error(w, http.StatusTooManyRequests, "The user has too many terminal volumes")
 		return
 	case errors.Is(err, backend.ErrCapacity):
 		w.Header().Set("Retry-After", "30")

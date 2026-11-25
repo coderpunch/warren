@@ -55,6 +55,9 @@ type config struct {
 	startTimeout     time.Duration
 	maxPerUser       int
 	maxSandboxes     int
+	maxVolumes       int
+	maxVolumesTotal  int
+	volumeDelay      time.Duration
 	openAPIFile      string
 }
 
@@ -121,6 +124,18 @@ func parseFlags(args []string) (config, error) {
 	if err != nil {
 		return c, err
 	}
+	maxVolumes, err := envInt("WARREN_MAX_VOLUMES_PER_USER", 20)
+	if err != nil {
+		return c, err
+	}
+	maxVolumesTotal, err := envInt("WARREN_MAX_VOLUMES", 0)
+	if err != nil {
+		return c, err
+	}
+	volumeDelay, err := envDuration("WARREN_VOLUME_DELETE_DELAY", 10*time.Minute)
+	if err != nil {
+		return c, err
+	}
 	shutdownDelay, err := envDuration("WARREN_SHUTDOWN_DELAY", 5*time.Second)
 	if err != nil {
 		return c, err
@@ -128,11 +143,14 @@ func parseFlags(args []string) (config, error) {
 	fs := flag.NewFlagSet("warren", flag.ContinueOnError)
 	fs.StringVar(&c.kubeconfig, "kubeconfig", envDefault("WARREN_KUBECONFIG", ""), "kubeconfig file (the default is the configuration of the pod)")
 	fs.StringVar(&c.sandboxNamespace, "sandbox-namespace", envDefault("WARREN_SANDBOX_NAMESPACE", ""), "namespace for the sandbox pods")
-	fs.StringVar(&c.sandboxImage, "sandbox-image", envDefault("WARREN_SANDBOX_IMAGE", defaultImage), "container image of a sandbox")
-	fs.DurationVar(&c.idleTimeout, "idle-timeout", idle, "stop a sandbox after this time with no use (0 = never)")
+	fs.StringVar(&c.sandboxImage, "sandbox-image", envDefault("WARREN_SANDBOX_IMAGE", defaultImage), "container image of a sandbox, for a policy that sets no image")
+	fs.DurationVar(&c.idleTimeout, "idle-timeout", idle, "stop a sandbox after this time with no use, for a policy that sets no time (0 = never)")
 	fs.DurationVar(&c.startTimeout, "start-timeout", startTimeout, "delete a sandbox that is not ready after this time")
 	fs.IntVar(&c.maxPerUser, "max-sandboxes-per-user", maxPerUser, "maximum number of sandboxes that one user can start (0 = no limit)")
 	fs.IntVar(&c.maxSandboxes, "max-sandboxes", maxSandboxes, "maximum number of sandboxes (0 = no limit)")
+	fs.IntVar(&c.maxVolumes, "max-volumes-per-user", maxVolumes, "maximum number of volumes of the chat scope and the model scope that one user can have (0 = no limit)")
+	fs.IntVar(&c.maxVolumesTotal, "max-volumes", maxVolumesTotal, "maximum number of volumes (0 = no limit)")
+	fs.DurationVar(&c.volumeDelay, "volume-delete-delay", volumeDelay, "after a start of warren, delete no volume for this time")
 	fs.DurationVar(&c.shutdownDelay, "shutdown-delay", shutdownDelay, "after a stop signal, continue to serve for this time, until Kubernetes sends no more requests")
 	fs.StringVar(&c.openAPIFile, "openapi-file", envDefault("WARREN_OPENAPI_FILE", ""), "OpenAPI document for the tool list (the default is the document of Open Terminal 0.18.1)")
 	fs.StringVar(&c.listen, "listen", envDefault("WARREN_LISTEN", ":8080"), "address for Open WebUI traffic")
@@ -165,7 +183,7 @@ func parseFlags(args []string) (config, error) {
 	if c.devUpstreamURL == "" && c.sandboxNamespace == "" {
 		return c, errors.New("--sandbox-namespace is necessary")
 	}
-	if c.idleTimeout < 0 || c.startTimeout <= 0 || c.maxPerUser < 0 || c.maxSandboxes < 0 || c.shutdownDelay < 0 {
+	if c.idleTimeout < 0 || c.startTimeout <= 0 || c.maxPerUser < 0 || c.maxSandboxes < 0 || c.maxVolumes < 0 || c.maxVolumesTotal < 0 || c.volumeDelay < 0 || c.shutdownDelay < 0 {
 		return c, errors.New("a time or a limit has a negative value")
 	}
 	return c, nil
@@ -180,7 +198,7 @@ func newLogger(level string) (*slog.Logger, error) {
 }
 
 // kubeBackend makes the Kubernetes backend.
-func kubeBackend(c config, logger *slog.Logger, m *metrics.Metrics) (*kube.Manager, error) {
+func kubeBackend(c config, policies *policy.Store, logger *slog.Logger, m *metrics.Metrics) (*kube.Manager, error) {
 	var restConfig *rest.Config
 	var err error
 	if c.kubeconfig != "" {
@@ -200,15 +218,19 @@ func kubeBackend(c config, logger *slog.Logger, m *metrics.Metrics) (*kube.Manag
 		return nil, fmt.Errorf("client for Kubernetes: %w", err)
 	}
 	return kube.New(kube.Config{
-		Client:       client,
-		Namespace:    c.sandboxNamespace,
-		Image:        c.sandboxImage,
-		IdleTimeout:  c.idleTimeout,
-		StartTimeout: c.startTimeout,
-		MaxPerUser:   c.maxPerUser,
-		MaxTotal:     c.maxSandboxes,
-		Logger:       logger,
-		Metrics:      m,
+		Client:            client,
+		Namespace:         c.sandboxNamespace,
+		Image:             c.sandboxImage,
+		Policies:          policies,
+		IdleTimeout:       c.idleTimeout,
+		StartTimeout:      c.startTimeout,
+		MaxPerUser:        c.maxPerUser,
+		MaxTotal:          c.maxSandboxes,
+		MaxVolumesPerUser: c.maxVolumes,
+		MaxVolumes:        c.maxVolumesTotal,
+		VolumeDeleteDelay: c.volumeDelay,
+		Logger:            logger,
+		Metrics:           m,
 	})
 }
 
@@ -240,7 +262,7 @@ func devBackend(c config, logger *slog.Logger) (backend.Backend, error) {
 // reloadInterval is the time between two checks of the key file and the
 // certificate files. Kubernetes changes the files of a mounted Secret when
 // the Secret changes.
-const reloadInterval = 30 * time.Second
+var reloadInterval = 30 * time.Second
 
 // watchKeys reads the key file again when its content changes. Thus an
 // administrator can replace the connection key with no restart.
@@ -272,6 +294,46 @@ func watchKeys(ctx context.Context, path string, keys *auth.Keys, logger *slog.L
 			continue
 		}
 		logger.Info("connection keys replaced", "keys", keys.Len())
+	}
+}
+
+// watchPolicies reads the policy file again when its content changes. Thus
+// an administrator can change a policy with no restart, and the open
+// terminals stay open. If the new file is not valid, the current policies
+// stay.
+//
+// last is the digest of the file content that is in use. The caller gives
+// it, thus a change between the first read and the start of this function
+// is not lost.
+func watchPolicies(ctx context.Context, path string, last [sha256.Size]byte, store *policy.Store, logger *slog.Logger) {
+	digest := func() ([sha256.Size]byte, []byte, error) {
+		data, err := os.ReadFile(path)
+		return sha256.Sum256(data), data, err
+	}
+	ticker := time.NewTicker(reloadInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		now, data, err := digest()
+		if err != nil {
+			logger.Warn("cannot read the policy file. The current policies stay.", "error", err.Error())
+			continue
+		}
+		if now == last {
+			continue
+		}
+		last = now
+		set, err := policy.Parse(data)
+		if err != nil {
+			logger.Error("the new policy file is not valid. The current policies stay.", "error", err.Error())
+			continue
+		}
+		store.Replace(set)
+		logger.Info("policies replaced", "policies", len(set.List()))
 	}
 }
 
@@ -336,10 +398,15 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	policies, err := policy.Load(c.policyFile)
+	policyData, err := os.ReadFile(c.policyFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("read policy file: %w", err)
 	}
+	policySet, err := policy.Parse(policyData)
+	if err != nil {
+		return fmt.Errorf("policy file %s: %w", c.policyFile, err)
+	}
+	policies := policy.NewStore(policySet)
 	tools := openapi.Default()
 	if c.openAPIFile != "" {
 		data, err := os.ReadFile(c.openAPIFile)
@@ -360,7 +427,7 @@ func run(args []string) error {
 			return err
 		}
 	} else {
-		if manager, err = kubeBackend(c, logger, metric); err != nil {
+		if manager, err = kubeBackend(c, policies, logger, metric); err != nil {
 			return err
 		}
 		sandboxes, instances = manager, manager
@@ -388,7 +455,7 @@ func run(args []string) error {
 		Addr: c.listen,
 		Handler: &server.Server{
 			Keys:    keys,
-			API:     &api.Handler{Policies: policies, Instances: instances},
+			API:     &api.Handler{Policies: policies, Instances: instances, DefaultImage: c.sandboxImage},
 			Proxy:   px,
 			Logger:  logger,
 			Metrics: metric,
@@ -444,6 +511,7 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go watchKeys(ctx, c.apiKeyFile, keys, logger)
+	go watchPolicies(ctx, c.policyFile, sha256.Sum256(policyData), policies, logger)
 
 	errc := make(chan error, 3)
 	// The pod cache must operate until the last request is complete. Thus

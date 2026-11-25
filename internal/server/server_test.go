@@ -273,6 +273,8 @@ type mapBackend struct {
 	released int
 	// block, if not nil, makes Acquire wait until the context ends.
 	block chan struct{}
+	// errors has the error that Acquire returns for a sandbox name.
+	errors map[string]error
 }
 
 type mapLease struct {
@@ -293,7 +295,11 @@ func (m *mapBackend) Acquire(ctx context.Context, req backend.Request) (backend.
 	m.calls = append(m.calls, req)
 	block := m.block
 	t, ok := m.targets[req.Ref.Name()]
+	fail := m.errors[req.Ref.Name()]
 	m.mu.Unlock()
+	if fail != nil {
+		return nil, fail
+	}
 	if block != nil {
 		select {
 		case <-ctx.Done():
@@ -370,6 +376,7 @@ func newEnvWith(t *testing.T, mod func(*proxy.Options)) *env {
 		{ID: "by-chat", Name: "Chat", Scope: scope.KindChat},
 		{ID: "team", Name: "Team", Scope: scope.KindShared},
 		{ID: "by-model", Name: "Model", Scope: scope.KindModel},
+		{ID: "limited", Name: "Limited", Scope: scope.KindUser, Users: []string{"alice"}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -389,6 +396,7 @@ func newEnvWith(t *testing.T, mod func(*proxy.Options)) *env {
 		scope.Ref{TemplateID: "personal", Kind: scope.KindUser, Value: "alice"}.Name():    e.alice.target(),
 		scope.Ref{TemplateID: "personal", Kind: scope.KindUser, Value: "bob"}.Name():      e.bob.target(),
 		scope.Ref{TemplateID: "team", Kind: scope.KindShared}.Name():                      e.shared.target(),
+		scope.Ref{TemplateID: "limited", Kind: scope.KindUser, Value: "alice"}.Name():     e.alice.target(),
 	}}
 	logger := slog.New(slog.NewJSONHandler(e.logs, nil))
 	opts := proxy.Options{
@@ -708,8 +716,8 @@ func TestManagementAPI(t *testing.T) {
 	if err := json.Unmarshal([]byte(body(t, resp)), &list); err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 4 {
-		t.Fatalf("list has %d templates, want 4", len(list))
+	if len(list) != 5 {
+		t.Fatalf("list has %d templates, want 5", len(list))
 	}
 	scopes := map[string]any{}
 	for _, tpl := range list {

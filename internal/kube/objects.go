@@ -5,13 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"sort"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/h3xcat/warren/internal/backend"
+	"github.com/h3xcat/warren/internal/policy"
 )
 
 // Warren keeps its state in these labels and annotations. It has no other
@@ -38,12 +41,28 @@ const (
 	AnnotationCreatedBy = prefix + "/created-by"
 	// AnnotationActivity is the time of the last use, in RFC 3339 form.
 	AnnotationActivity = prefix + "/last-activity"
+	// AnnotationIdleTimeout is the idle time of the policy at the start of
+	// the pod. A pod without it uses the idle time of warren.
+	AnnotationIdleTimeout = prefix + "/idle-timeout"
+	// AnnotationUnusedSince is on a volume. It is the time at which warren
+	// found that no sandbox uses the volume, in RFC 3339 form.
+	AnnotationUnusedSince = prefix + "/unused-since"
 
 	secretKeyName  = "api-key"
 	keyVariable    = "OPEN_TERMINAL_API_KEY"
 	containerName  = "terminal"
 	terminalPort   = 8000
 	keyRandomBytes = 32
+
+	// homePath is the home directory in all images of Open Terminal
+	// (docs/open-terminal-api.md, section 8.1).
+	homePath   = "/home/user"
+	homeVolume = "home"
+	tmpVolume  = "tmp"
+	// volumeGroup is the group that owns the files of a volume. The process
+	// of the sandbox is a member of this group, thus it can write to the
+	// volume with each user ID.
+	volumeGroup = 1001
 )
 
 // managedSelector selects the objects that warren made.
@@ -85,6 +104,17 @@ func newSecretName(sandbox string) (string, error) {
 	return sandbox + "-" + hex.EncodeToString(b), nil
 }
 
+// usesVolume reports whether a pod has its home directory on a volume that
+// stays after the pod.
+func usesVolume(pod *corev1.Pod) bool {
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // podSecretName returns the name of the Secret that has the key of a pod.
 func podSecretName(pod *corev1.Pod) string {
 	for _, c := range pod.Spec.Containers {
@@ -124,16 +154,11 @@ func (m *Manager) buildSecret(sandbox, secretName string, req backend.Request, k
 	}
 }
 
-func (m *Manager) buildPod(name, secretName string, req backend.Request) *corev1.Pod {
-	no := false
-	grace := int64(10)
-	port := intstr.FromInt32(terminalPort)
-	probe := func() *corev1.ProbeHandler {
-		// The health route of Open Terminal accepts only GET and needs no
-		// key (docs/open-terminal-api.md, section 6).
-		return &corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: port}}
-	}
-	return &corev1.Pod{
+// buildVolume makes the volume that keeps the home directory of a sandbox.
+// The volume has the name of the sandbox, and no pod owns it. Thus it stays
+// when the pod goes away.
+func (m *Manager) buildVolume(name string, req backend.Request, pol policy.Policy) *corev1.PersistentVolumeClaim {
+	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: m.cfg.Namespace,
@@ -141,8 +166,100 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request) *corev1
 			Annotations: map[string]string{
 				AnnotationContext:   req.Ref.ContextID(),
 				AnnotationCreatedBy: req.UserID,
-				AnnotationActivity:  m.now().UTC().Format(timeFormat),
 			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: pol.Storage.Size.DeepCopy()},
+			},
+		},
+	}
+	if pol.Storage.StorageClassName != "" {
+		class := pol.Storage.StorageClassName
+		pvc.Spec.StorageClassName = &class
+	}
+	return pvc
+}
+
+// reservedVariables are the variables that warren sets. The policy file
+// cannot set them (internal/policy). This is a second protection.
+var reservedVariables = map[string]bool{keyVariable: true, "OPEN_TERMINAL_ISOLATED": true, "OPEN_TERMINAL_MULTI_USER": true}
+
+func (m *Manager) buildPod(name, secretName string, req backend.Request, pol policy.Policy) *corev1.Pod {
+	no := false
+	grace := int64(10)
+	group := int64(volumeGroup)
+	onMismatch := corev1.FSGroupChangeOnRootMismatch
+	port := intstr.FromInt32(terminalPort)
+	probe := func() *corev1.ProbeHandler {
+		// The health route of Open Terminal accepts only GET and needs no
+		// key (docs/open-terminal-api.md, section 6).
+		return &corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/health", Port: port}}
+	}
+
+	image := pol.Image
+	if image == "" {
+		image = m.cfg.Image
+	}
+	annotations := map[string]string{
+		AnnotationContext:   req.Ref.ContextID(),
+		AnnotationCreatedBy: req.UserID,
+		AnnotationActivity:  m.now().UTC().Format(timeFormat),
+	}
+	if pol.IdleTimeout != nil {
+		annotations[AnnotationIdleTimeout] = pol.IdleTimeout.String()
+	}
+
+	env := []corev1.EnvVar{
+		{Name: keyVariable, ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+				Key:                  secretKeyName,
+			},
+		}},
+		// Ignore the configuration files, which the user can write.
+		{Name: "OPEN_TERMINAL_ISOLATED", Value: "true"},
+		// One pod for each scope key gives the isolation.
+		{Name: "OPEN_TERMINAL_MULTI_USER", Value: "false"},
+	}
+	names := make([]string, 0, len(pol.Env))
+	for n := range pol.Env {
+		if !reservedVariables[n] {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		// Kubernetes replaces "$(NAME)" in a value with a variable that is
+		// earlier in the list, also with the key of the sandbox. "$$" is
+		// the escape for one "$", thus the value stays as the file has it.
+		env = append(env, corev1.EnvVar{Name: n, Value: strings.ReplaceAll(pol.Env[n], "$", "$$")})
+	}
+
+	resources := *pol.Resources.DeepCopy()
+	home := corev1.Volume{Name: homeVolume}
+	if pol.Persistent() {
+		home.PersistentVolumeClaim = &corev1.PersistentVolumeClaimVolumeSource{ClaimName: name}
+	} else {
+		size := pol.Storage.Size.DeepCopy()
+		home.EmptyDir = &corev1.EmptyDirVolumeSource{SizeLimit: &size}
+		// The limit for ephemeral storage of a pod includes its emptyDir
+		// volumes. The home directory gets its size in addition to the
+		// limit of the policy. If not, the smaller value of the two is
+		// the real limit.
+		if limit, ok := resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+			limit.Add(size)
+			resources.Limits[corev1.ResourceEphemeralStorage] = limit
+		}
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   m.cfg.Namespace,
+			Labels:      labels(req),
+			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                 corev1.RestartPolicyAlways,
@@ -151,27 +268,37 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request) *corev1
 			// data about other services.
 			AutomountServiceAccountToken: &no,
 			EnableServiceLinks:           &no,
+			NodeSelector:                 pol.NodeSelector,
+			Tolerations:                  pol.Tolerations,
+			SecurityContext: &corev1.PodSecurityContext{
+				FSGroup:             &group,
+				FSGroupChangePolicy: &onMismatch,
+			},
+			Volumes: []corev1.Volume{
+				home,
+				// The server writes response bodies and other temporary
+				// files (docs/open-terminal-api.md, section 8.4).
+				{Name: tmpVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			},
 			Containers: []corev1.Container{{
-				Name:  containerName,
-				Image: m.cfg.Image,
+				Name:            containerName,
+				Image:           image,
+				ImagePullPolicy: pol.ImagePullPolicy,
 				// The address and the port are on the command line. If
 				// not, a configuration file in the home directory can
 				// change them (docs/open-terminal-api.md, section 2.1).
 				Args: []string{"run", "--host", "0.0.0.0", "--port", strconv.Itoa(terminalPort)},
+				// The file routes use the working directory as the home
+				// directory (docs/open-terminal-api.md, section 8.4).
+				WorkingDir: homePath,
 				Ports: []corev1.ContainerPort{{
 					Name: "http", ContainerPort: terminalPort, Protocol: corev1.ProtocolTCP,
 				}},
-				Env: []corev1.EnvVar{
-					{Name: keyVariable, ValueFrom: &corev1.EnvVarSource{
-						SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
-							Key:                  secretKeyName,
-						},
-					}},
-					// Ignore the configuration files, which the user can write.
-					{Name: "OPEN_TERMINAL_ISOLATED", Value: "true"},
-					// One pod for each scope key gives the isolation.
-					{Name: "OPEN_TERMINAL_MULTI_USER", Value: "false"},
+				Env:       env,
+				Resources: resources,
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: homeVolume, MountPath: homePath},
+					{Name: tmpVolume, MountPath: "/tmp"},
 				},
 				// The server does not listen before its setup is complete.
 				StartupProbe: &corev1.Probe{
@@ -189,4 +316,12 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request) *corev1
 			}},
 		},
 	}
+	for _, s := range pol.ImagePullSecrets {
+		pod.Spec.ImagePullSecrets = append(pod.Spec.ImagePullSecrets, corev1.LocalObjectReference{Name: s})
+	}
+	if pol.RuntimeClassName != "" {
+		class := pol.RuntimeClassName
+		pod.Spec.RuntimeClassName = &class
+	}
+	return pod
 }

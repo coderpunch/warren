@@ -103,7 +103,8 @@ func TestRefusedRequestsLeaveNoRecords(t *testing.T) {
 	}
 	// The record of a sandbox goes away with its pod.
 	_ = e.m.Stop(context.Background(), chatRef("alice", "c0").Ref)
-	waitFor(t, "stop", func() bool { return len(e.pods()) == 0 })
+	// Wait for the cache, not only for the API server.
+	waitFor(t, "stop", func() bool { return e.m.pod(chatRef("alice", "c0").Ref.Name()) == nil })
 	e.m.Reap(context.Background())
 	if n := e.recordCount(); n != 0 {
 		t.Errorf("records with no sandbox = %d, want 0", n)
@@ -332,7 +333,7 @@ func TestPodThatStaysInDeletion(t *testing.T) {
 	req := userRef("alice")
 	name := req.Ref.Name()
 	deleted := metav1.NewTime(e.clock.Now())
-	stuck := e.m.buildPod(name, name+"-00000000", req)
+	stuck := e.m.buildPod(name, name+"-00000000", req, e.policy(req))
 	stuck.DeletionTimestamp = &deleted
 	stuck.Finalizers = []string{"example.test/never"}
 	if _, err := e.client.CoreV1().Pods(testNamespace).Create(context.Background(), stuck, metav1.CreateOptions{}); err != nil {

@@ -45,6 +45,9 @@ var (
 	ErrNotReady = errors.New("sandbox is not ready")
 	// ErrLimit means that the user has the maximum number of sandboxes.
 	ErrLimit = errors.New("sandbox limit of the user reached")
+	// ErrVolumeLimit means that the user has the maximum number of volumes.
+	// A new sandbox would need one more.
+	ErrVolumeLimit = errors.New("volume limit of the user reached")
 	// ErrCapacity means that warren has its maximum number of sandboxes.
 	// The user cannot correct this.
 	ErrCapacity = errors.New("no capacity for a new sandbox")
