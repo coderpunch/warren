@@ -19,9 +19,16 @@ import (
 	"syscall"
 	"time"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+
 	"github.com/h3xcat/warren/internal/api"
 	"github.com/h3xcat/warren/internal/auth"
 	"github.com/h3xcat/warren/internal/backend"
+	"github.com/h3xcat/warren/internal/kube"
+	"github.com/h3xcat/warren/internal/metrics"
+	"github.com/h3xcat/warren/internal/openapi"
 	"github.com/h3xcat/warren/internal/policy"
 	"github.com/h3xcat/warren/internal/proxy"
 	"github.com/h3xcat/warren/internal/server"
@@ -38,6 +45,43 @@ type config struct {
 	devUpstreamKey string
 	logLevel       string
 	allowSetCookie bool
+
+	kubeconfig       string
+	sandboxNamespace string
+	sandboxImage     string
+	idleTimeout      time.Duration
+	startTimeout     time.Duration
+	maxPerUser       int
+	maxSandboxes     int
+	openAPIFile      string
+}
+
+// defaultImage is the image variant of Open Terminal that needs no root
+// privilege (docs/open-terminal-api.md, section 8.5).
+const defaultImage = "ghcr.io/open-webui/open-terminal:0.18.1-openshift"
+
+func envDuration(name string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a duration", name, v)
+	}
+	return d, nil
+}
+
+func envInt(name string, def int) (int, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a number", name, v)
+	}
+	return n, nil
 }
 
 // envDefault returns the value of an environment variable, or a default.
@@ -59,7 +103,31 @@ func parseFlags(args []string) (config, error) {
 		}
 		allowSetCookie = b
 	}
+	idle, err := envDuration("WARREN_IDLE_TIMEOUT", 30*time.Minute)
+	if err != nil {
+		return c, err
+	}
+	startTimeout, err := envDuration("WARREN_START_TIMEOUT", 10*time.Minute)
+	if err != nil {
+		return c, err
+	}
+	maxPerUser, err := envInt("WARREN_MAX_SANDBOXES_PER_USER", 5)
+	if err != nil {
+		return c, err
+	}
+	maxSandboxes, err := envInt("WARREN_MAX_SANDBOXES", 0)
+	if err != nil {
+		return c, err
+	}
 	fs := flag.NewFlagSet("warren", flag.ContinueOnError)
+	fs.StringVar(&c.kubeconfig, "kubeconfig", envDefault("WARREN_KUBECONFIG", ""), "kubeconfig file (the default is the configuration of the pod)")
+	fs.StringVar(&c.sandboxNamespace, "sandbox-namespace", envDefault("WARREN_SANDBOX_NAMESPACE", ""), "namespace for the sandbox pods")
+	fs.StringVar(&c.sandboxImage, "sandbox-image", envDefault("WARREN_SANDBOX_IMAGE", defaultImage), "container image of a sandbox")
+	fs.DurationVar(&c.idleTimeout, "idle-timeout", idle, "stop a sandbox after this time with no use (0 = never)")
+	fs.DurationVar(&c.startTimeout, "start-timeout", startTimeout, "delete a sandbox that is not ready after this time")
+	fs.IntVar(&c.maxPerUser, "max-sandboxes-per-user", maxPerUser, "maximum number of sandboxes that one user can start (0 = no limit)")
+	fs.IntVar(&c.maxSandboxes, "max-sandboxes", maxSandboxes, "maximum number of sandboxes (0 = no limit)")
+	fs.StringVar(&c.openAPIFile, "openapi-file", envDefault("WARREN_OPENAPI_FILE", ""), "OpenAPI document for the tool list (the default is the document of Open Terminal 0.18.1)")
 	fs.StringVar(&c.listen, "listen", envDefault("WARREN_LISTEN", ":8080"), "address for Open WebUI traffic")
 	fs.StringVar(&c.adminListen, "admin-listen", envDefault("WARREN_ADMIN_LISTEN", ":9090"), "address for health checks")
 	fs.StringVar(&c.apiKeyFile, "api-key-file", envDefault("WARREN_API_KEY_FILE", ""), "file with the connection key (one key on each line)")
@@ -87,6 +155,12 @@ func parseFlags(args []string) (config, error) {
 	if (c.tlsCertFile == "") != (c.tlsKeyFile == "") {
 		return c, errors.New("--tls-cert-file and --tls-key-file must be set together")
 	}
+	if c.devUpstreamURL == "" && c.sandboxNamespace == "" {
+		return c, errors.New("--sandbox-namespace is necessary")
+	}
+	if c.idleTimeout < 0 || c.startTimeout <= 0 || c.maxPerUser < 0 || c.maxSandboxes < 0 {
+		return c, errors.New("a time or a limit has a negative value")
+	}
 	return c, nil
 }
 
@@ -98,10 +172,36 @@ func newLogger(level string) (*slog.Logger, error) {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l})), nil
 }
 
-func devBackend(c config, logger *slog.Logger) (backend.Backend, error) {
-	if c.devUpstreamURL == "" {
-		return nil, errors.New("no sandbox backend: the Kubernetes backend is not in this version; set --dev-upstream-url for development")
+// kubeBackend makes the Kubernetes backend.
+func kubeBackend(c config, logger *slog.Logger, m *metrics.Metrics) (*kube.Manager, error) {
+	var restConfig *rest.Config
+	var err error
+	if c.kubeconfig != "" {
+		restConfig, err = clientcmd.BuildConfigFromFlags("", c.kubeconfig)
+	} else {
+		restConfig, err = rest.InClusterConfig()
 	}
+	if err != nil {
+		return nil, fmt.Errorf("Kubernetes configuration: %w", err)
+	}
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("Kubernetes client: %w", err)
+	}
+	return kube.New(kube.Config{
+		Client:       client,
+		Namespace:    c.sandboxNamespace,
+		Image:        c.sandboxImage,
+		IdleTimeout:  c.idleTimeout,
+		StartTimeout: c.startTimeout,
+		MaxPerUser:   c.maxPerUser,
+		MaxTotal:     c.maxSandboxes,
+		Logger:       logger,
+		Metrics:      m,
+	})
+}
+
+func devBackend(c config, logger *slog.Logger) (backend.Backend, error) {
 	u, err := url.Parse(c.devUpstreamURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("--dev-upstream-url is not an http or https URL: %q", c.devUpstreamURL)
@@ -229,9 +329,30 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	sandboxes, err := devBackend(c, logger)
-	if err != nil {
-		return err
+	tools := openapi.Default()
+	if c.openAPIFile != "" {
+		data, err := os.ReadFile(c.openAPIFile)
+		if err != nil {
+			return fmt.Errorf("OpenAPI file: %w", err)
+		}
+		if tools, err = openapi.Parse(data); err != nil {
+			return fmt.Errorf("OpenAPI file %s: %w", c.openAPIFile, err)
+		}
+	}
+
+	metric := metrics.New()
+	var sandboxes backend.Backend
+	var manager *kube.Manager
+	var instances api.Instances
+	if c.devUpstreamURL != "" {
+		if sandboxes, err = devBackend(c, logger); err != nil {
+			return err
+		}
+	} else {
+		if manager, err = kubeBackend(c, logger, metric); err != nil {
+			return err
+		}
+		sandboxes, instances = manager, manager
 	}
 
 	logger.Warn("warren trusts the identity headers of each client that has the connection key. " +
@@ -249,14 +370,17 @@ func run(args []string) error {
 		Backend:        sandboxes,
 		Logger:         logger,
 		AllowSetCookie: c.allowSetCookie,
+		OpenAPI:        tools,
+		Metrics:        metric,
 	})
 	main := &http.Server{
 		Addr: c.listen,
 		Handler: &server.Server{
-			Keys:   keys,
-			API:    &api.Handler{Policies: policies},
-			Proxy:  px,
-			Logger: logger,
+			Keys:    keys,
+			API:     &api.Handler{Policies: policies, Instances: instances},
+			Proxy:   px,
+			Logger:  logger,
+			Metrics: metric,
 		},
 		// No read or write timeout: uploads, downloads, long requests, and
 		// WebSockets have no time limit. The header timeout stops slow
@@ -283,7 +407,15 @@ func run(args []string) error {
 	adminMux := http.NewServeMux()
 	ok := func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) }
 	adminMux.HandleFunc("GET /healthz", ok)
-	adminMux.HandleFunc("GET /readyz", ok)
+	adminMux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		// Warren is ready when it knows the sandboxes of the cluster.
+		if manager != nil && !manager.Ready() {
+			http.Error(w, "the sandbox cache is not ready", http.StatusServiceUnavailable)
+			return
+		}
+		ok(w, r)
+	})
+	adminMux.Handle("GET /metrics", metric.Handler())
 	admin := &http.Server{
 		Addr:              c.adminListen,
 		Handler:           adminMux,
@@ -296,7 +428,14 @@ func run(args []string) error {
 	defer stop()
 	go watchKeys(ctx, c.apiKeyFile, keys, logger)
 
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
+	if manager != nil {
+		go func() {
+			if err := manager.Run(ctx); err != nil {
+				errc <- err
+			}
+		}()
+	}
 	go func() {
 		logger.Info("listen", "addr", c.listen, "tls", c.tlsCertFile != "",
 			"policies", len(policies.List()), "keys", keys.Len())

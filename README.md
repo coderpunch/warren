@@ -4,8 +4,8 @@ Warren is a Kubernetes orchestrator for Open Terminal sandboxes.
 It gives each Open WebUI user, chat, or model an isolated sandbox pod.
 Warren is an independent project with the Apache-2.0 license. It is not an Open WebUI product.
 
-Status: in development. The proxy and the authentication are complete. The Kubernetes backend is not complete.
-At this time, warren can operate only in development mode, with one Open Terminal server for all users.
+Status: in development. The proxy, the authentication, and the sandbox lifecycle are complete.
+Storage, policies with resource limits, network isolation, and the Helm chart are not complete.
 
 ## Documents
 
