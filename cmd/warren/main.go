@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,6 +46,7 @@ type config struct {
 	devUpstreamKey string
 	logLevel       string
 	allowSetCookie bool
+	shutdownDelay  time.Duration
 
 	kubeconfig       string
 	sandboxNamespace string
@@ -119,6 +121,10 @@ func parseFlags(args []string) (config, error) {
 	if err != nil {
 		return c, err
 	}
+	shutdownDelay, err := envDuration("WARREN_SHUTDOWN_DELAY", 5*time.Second)
+	if err != nil {
+		return c, err
+	}
 	fs := flag.NewFlagSet("warren", flag.ContinueOnError)
 	fs.StringVar(&c.kubeconfig, "kubeconfig", envDefault("WARREN_KUBECONFIG", ""), "kubeconfig file (the default is the configuration of the pod)")
 	fs.StringVar(&c.sandboxNamespace, "sandbox-namespace", envDefault("WARREN_SANDBOX_NAMESPACE", ""), "namespace for the sandbox pods")
@@ -127,6 +133,7 @@ func parseFlags(args []string) (config, error) {
 	fs.DurationVar(&c.startTimeout, "start-timeout", startTimeout, "delete a sandbox that is not ready after this time")
 	fs.IntVar(&c.maxPerUser, "max-sandboxes-per-user", maxPerUser, "maximum number of sandboxes that one user can start (0 = no limit)")
 	fs.IntVar(&c.maxSandboxes, "max-sandboxes", maxSandboxes, "maximum number of sandboxes (0 = no limit)")
+	fs.DurationVar(&c.shutdownDelay, "shutdown-delay", shutdownDelay, "after a stop signal, continue to serve for this time, until Kubernetes sends no more requests")
 	fs.StringVar(&c.openAPIFile, "openapi-file", envDefault("WARREN_OPENAPI_FILE", ""), "OpenAPI document for the tool list (the default is the document of Open Terminal 0.18.1)")
 	fs.StringVar(&c.listen, "listen", envDefault("WARREN_LISTEN", ":8080"), "address for Open WebUI traffic")
 	fs.StringVar(&c.adminListen, "admin-listen", envDefault("WARREN_ADMIN_LISTEN", ":9090"), "address for health checks")
@@ -158,7 +165,7 @@ func parseFlags(args []string) (config, error) {
 	if c.devUpstreamURL == "" && c.sandboxNamespace == "" {
 		return c, errors.New("--sandbox-namespace is necessary")
 	}
-	if c.idleTimeout < 0 || c.startTimeout <= 0 || c.maxPerUser < 0 || c.maxSandboxes < 0 {
+	if c.idleTimeout < 0 || c.startTimeout <= 0 || c.maxPerUser < 0 || c.maxSandboxes < 0 || c.shutdownDelay < 0 {
 		return c, errors.New("a time or a limit has a negative value")
 	}
 	return c, nil
@@ -184,6 +191,10 @@ func kubeBackend(c config, logger *slog.Logger, m *metrics.Metrics) (*kube.Manag
 	if err != nil {
 		return nil, fmt.Errorf("configuration for Kubernetes: %w", err)
 	}
+	// The default of client-go is 5 requests each second for the process.
+	// One start of a sandbox needs 4 requests.
+	restConfig.QPS = 50
+	restConfig.Burst = 100
 	client, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("client for Kubernetes: %w", err)
@@ -407,7 +418,13 @@ func run(args []string) error {
 	adminMux := http.NewServeMux()
 	ok := func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) }
 	adminMux.HandleFunc("GET /healthz", ok)
+	var draining atomic.Bool
 	adminMux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		// After a stop signal, tell Kubernetes to send no more requests.
+		if draining.Load() {
+			http.Error(w, "warren stops", http.StatusServiceUnavailable)
+			return
+		}
 		// Warren is ready when it knows the sandboxes of the cluster.
 		if manager != nil && !manager.Ready() {
 			http.Error(w, "the sandbox cache is not ready", http.StatusServiceUnavailable)
@@ -429,9 +446,13 @@ func run(args []string) error {
 	go watchKeys(ctx, c.apiKeyFile, keys, logger)
 
 	errc := make(chan error, 3)
+	// The pod cache must operate until the last request is complete. Thus
+	// the manager does not stop on the signal. It stops when run returns.
+	managerCtx, stopManager := context.WithCancel(context.Background())
+	defer stopManager()
 	if manager != nil {
 		go func() {
-			if err := manager.Run(ctx); err != nil {
+			if err := manager.Run(managerCtx); err != nil {
 				errc <- err
 			}
 		}()
@@ -457,7 +478,11 @@ func run(args []string) error {
 	}
 	// A second signal stops the process immediately.
 	stop()
-	logger.Info("shutdown")
+	logger.Info("shutdown", "delay", c.shutdownDelay.String())
+	// Kubernetes removes a pod that stops from its Service a short time
+	// after the signal. Continue to serve in that time.
+	draining.Store(true)
+	time.Sleep(c.shutdownDelay)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = admin.Shutdown(shutdownCtx)
