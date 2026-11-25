@@ -11,9 +11,11 @@ Status: research phase. There is no implementation at this time.
 | Document | Contents |
 |---|---|
 | [docs/protocol.md](docs/protocol.md) | How Open WebUI calls a terminal server |
-| [docs/open-terminal-api.md](docs/open-terminal-api.md) | The Open Terminal endpoints that warren must proxy |
+| [docs/open-terminal-api.md](docs/open-terminal-api.md) | The Open Terminal routes that warren must proxy |
 | [docs/feature-parity.md](docs/feature-parity.md) | Features of the enterprise orchestrator and the warren plan |
 
 ## Clean-room rule
 
-Contributors must not read, copy, or adapt source code from `github.com/open-webui/terminals` or its forks.
+Contributors must not read source code from `github.com/open-webui/terminals` or its forks.
+Contributors must not copy that source code.
+Contributors must not change that source code for use in warren.
