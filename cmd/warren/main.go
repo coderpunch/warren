@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"flag"
@@ -12,7 +13,9 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,8 +41,9 @@ type config struct {
 }
 
 // envDefault returns the value of an environment variable, or a default.
+// An empty variable is the same as an absent variable.
 func envDefault(name, def string) string {
-	if v, ok := os.LookupEnv(name); ok {
+	if v := os.Getenv(name); v != "" {
 		return v
 	}
 	return def
@@ -47,6 +51,14 @@ func envDefault(name, def string) string {
 
 func parseFlags(args []string) (config, error) {
 	var c config
+	allowSetCookie := false
+	if v := os.Getenv("WARREN_ALLOW_SET_COOKIE"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return c, fmt.Errorf("WARREN_ALLOW_SET_COOKIE: %q is not true or false", v)
+		}
+		allowSetCookie = b
+	}
 	fs := flag.NewFlagSet("warren", flag.ContinueOnError)
 	fs.StringVar(&c.listen, "listen", envDefault("WARREN_LISTEN", ":8080"), "address for Open WebUI traffic")
 	fs.StringVar(&c.adminListen, "admin-listen", envDefault("WARREN_ADMIN_LISTEN", ":9090"), "address for health checks")
@@ -57,9 +69,14 @@ func parseFlags(args []string) (config, error) {
 	fs.StringVar(&c.devUpstreamURL, "dev-upstream-url", envDefault("WARREN_DEV_UPSTREAM_URL", ""), "DEVELOPMENT ONLY: send all sandboxes to this one Open Terminal server")
 	fs.StringVar(&c.devUpstreamKey, "dev-upstream-key-file", envDefault("WARREN_DEV_UPSTREAM_KEY_FILE", ""), "DEVELOPMENT ONLY: file with the API key of that server")
 	fs.StringVar(&c.logLevel, "log-level", envDefault("WARREN_LOG_LEVEL", "info"), "debug, info, warn, or error")
-	fs.BoolVar(&c.allowSetCookie, "allow-set-cookie", envDefault("WARREN_ALLOW_SET_COOKIE", "") == "true", "let a sandbox set browser cookies (not recommended)")
+	fs.BoolVar(&c.allowSetCookie, "allow-set-cookie", allowSetCookie, "let an application in a sandbox set browser cookies (not recommended)")
 	if err := fs.Parse(args); err != nil {
 		return c, err
+	}
+	// The flag package stops at the first argument that is not a flag and
+	// ignores all subsequent flags. Refuse such a command line.
+	if fs.NArg() > 0 {
+		return c, fmt.Errorf("unexpected argument %q (write a boolean flag as --flag=false)", fs.Arg(0))
 	}
 	if c.apiKeyFile == "" {
 		return c, errors.New("--api-key-file is necessary")
@@ -81,7 +98,7 @@ func newLogger(level string) (*slog.Logger, error) {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l})), nil
 }
 
-func devResolver(c config, logger *slog.Logger) (backend.Resolver, error) {
+func devBackend(c config, logger *slog.Logger) (backend.Backend, error) {
 	if c.devUpstreamURL == "" {
 		return nil, errors.New("no sandbox backend: the Kubernetes backend is not in this version; set --dev-upstream-url for development")
 	}
@@ -106,7 +123,93 @@ func devResolver(c config, logger *slog.Logger) (backend.Resolver, error) {
 	}
 	logger.Warn("DEVELOPMENT MODE: all users share one Open Terminal server. There is no isolation.",
 		"upstream", u.String())
-	return backend.Static{Target: backend.Target{URL: u, APIKey: k}}, nil
+	return backend.Static{Server: backend.Target{URL: u, APIKey: k}}, nil
+}
+
+// reloadInterval is the time between two checks of the key file and the
+// certificate files. Kubernetes changes the files of a mounted Secret when
+// the Secret changes.
+const reloadInterval = 30 * time.Second
+
+// watchKeys reads the key file again when its content changes. Thus an
+// administrator can replace the connection key with no restart.
+func watchKeys(ctx context.Context, path string, keys *auth.Keys, logger *slog.Logger) {
+	digest := func() ([sha256.Size]byte, []string, error) {
+		list, err := auth.ReadKeyFile(path)
+		return sha256.Sum256([]byte(strings.Join(list, "\n"))), list, err
+	}
+	last, _, _ := digest()
+	ticker := time.NewTicker(reloadInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		now, list, err := digest()
+		if err != nil {
+			logger.Warn("cannot read the key file. The current keys stay.", "error", err.Error())
+			continue
+		}
+		if now == last {
+			continue
+		}
+		last = now
+		if err := keys.Replace(list); err != nil {
+			logger.Warn("the new key file is not valid. The current keys stay.", "error", err.Error())
+			continue
+		}
+		logger.Info("connection keys replaced", "keys", keys.Len())
+	}
+}
+
+// certLoader reads the TLS certificate again when its files change. Thus a
+// renewed certificate needs no restart.
+type certLoader struct {
+	certFile, keyFile string
+	logger            *slog.Logger
+
+	mu      sync.Mutex
+	cert    *tls.Certificate
+	stamp   string
+	checked time.Time
+}
+
+func (l *certLoader) fileStamp() string {
+	var b strings.Builder
+	for _, f := range []string{l.certFile, l.keyFile} {
+		if st, err := os.Stat(f); err == nil {
+			fmt.Fprintf(&b, "%d:%d;", st.ModTime().UnixNano(), st.Size())
+		}
+	}
+	return b.String()
+}
+
+func (l *certLoader) load() error {
+	cert, err := tls.LoadX509KeyPair(l.certFile, l.keyFile)
+	if err != nil {
+		return err
+	}
+	l.cert = &cert
+	return nil
+}
+
+func (l *certLoader) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if time.Since(l.checked) > reloadInterval {
+		l.checked = time.Now()
+		if stamp := l.fileStamp(); stamp != l.stamp {
+			l.stamp = stamp
+			if err := l.load(); err != nil {
+				l.logger.Warn("cannot read the new TLS certificate. The current certificate stays.", "error", err.Error())
+			} else {
+				l.logger.Info("TLS certificate replaced")
+			}
+		}
+	}
+	return l.cert, nil
 }
 
 func run(args []string) error {
@@ -126,7 +229,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	resolver, err := devResolver(c, logger)
+	sandboxes, err := devBackend(c, logger)
 	if err != nil {
 		return err
 	}
@@ -136,11 +239,14 @@ func run(args []string) error {
 	if c.tlsCertFile == "" {
 		logger.Warn("TLS is off. The connection key goes through the network as clear text.")
 	}
+	if c.allowSetCookie {
+		logger.Warn("allow-set-cookie is on. An application in a sandbox can set cookies for the origin of Open WebUI.")
+	}
 
 	px := proxy.New(proxy.Options{
 		Keys:           keys,
 		Policies:       policies,
-		Resolver:       resolver,
+		Backend:        sandboxes,
 		Logger:         logger,
 		AllowSetCookie: c.allowSetCookie,
 	})
@@ -161,8 +267,14 @@ func run(args []string) error {
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
 	if c.tlsCertFile != "" {
+		loader := &certLoader{certFile: c.tlsCertFile, keyFile: c.tlsKeyFile, logger: logger}
+		if err := loader.load(); err != nil {
+			return fmt.Errorf("TLS certificate: %w", err)
+		}
+		loader.stamp, loader.checked = loader.fileStamp(), time.Now()
 		main.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS13,
+			MinVersion:     tls.VersionTLS13,
+			GetCertificate: loader.get,
 			// WebSockets need HTTP/1.1.
 			NextProtos: []string{"http/1.1"},
 		}
@@ -182,12 +294,14 @@ func run(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	go watchKeys(ctx, c.apiKeyFile, keys, logger)
 
 	errc := make(chan error, 2)
 	go func() {
-		logger.Info("listen", "addr", c.listen, "tls", c.tlsCertFile != "", "policies", len(policies.List()))
+		logger.Info("listen", "addr", c.listen, "tls", c.tlsCertFile != "",
+			"policies", len(policies.List()), "keys", keys.Len())
 		if c.tlsCertFile != "" {
-			errc <- main.ListenAndServeTLS(c.tlsCertFile, c.tlsKeyFile)
+			errc <- main.ListenAndServeTLS("", "")
 		} else {
 			errc <- main.ListenAndServe()
 		}
@@ -202,11 +316,22 @@ func run(args []string) error {
 		return err
 	case <-ctx.Done():
 	}
+	// A second signal stops the process immediately.
+	stop()
 	logger.Info("shutdown")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = admin.Shutdown(shutdownCtx)
-	return main.Shutdown(shutdownCtx)
+	// Close the WebSockets with a close message. Their audit records are
+	// written before the process stops.
+	if err := px.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("some WebSockets did not close in time")
+	}
+	if err := main.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("some requests did not complete in time")
+		_ = main.Close()
+	}
+	return nil
 }
 
 func main() {

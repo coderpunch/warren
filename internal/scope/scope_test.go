@@ -136,6 +136,35 @@ func TestNamesSeparateSandboxes(t *testing.T) {
 	}
 }
 
+// The name of a sandbox must not change between versions. A different name
+// gives each user a new, empty sandbox and volume.
+func TestNameIsStableBetweenVersions(t *testing.T) {
+	cases := map[string]Ref{
+		"wr-2cb29e44df46e8a9652898e31ab8398ca782fa47": {TemplateID: "personal", Kind: KindUser, Value: "alice"},
+	}
+	for want, ref := range cases {
+		if got := ref.Name(); got != want {
+			t.Errorf("Name(%+v) = %s, want %s", ref, got, want)
+		}
+	}
+	if n := len(Ref{TemplateID: "t", Kind: KindShared}.Name()); n != 43 {
+		t.Errorf("name length = %d, want 43", n)
+	}
+}
+
+// Without a length prefix, these two references give the same digest input.
+func TestNameSeparatesTemplateFromContext(t *testing.T) {
+	a := Ref{TemplateID: "t", Kind: KindUser, Value: "x|user:alice"}
+	b := Ref{TemplateID: "t|user:x", Kind: KindUser, Value: "alice"}
+	if a.Name() == b.Name() {
+		t.Error("two different sandboxes have the same name")
+	}
+	// A user ID of hexadecimal digits must not show in the name.
+	if name := (Ref{TemplateID: "t", Kind: KindUser, Value: "deadbeefcafe"}).Name(); strings.Contains(name, "deadbeefcafe") {
+		t.Errorf("name %q shows the user ID", name)
+	}
+}
+
 func TestParseContextID(t *testing.T) {
 	for _, r := range []Ref{
 		{Kind: KindUser, Value: "u1"},

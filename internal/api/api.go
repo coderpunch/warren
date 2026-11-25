@@ -68,6 +68,21 @@ func toTemplate(p policy.Policy) template {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Open WebUI sends no identity header on a management call
+	// (docs/protocol.md, section 4.6). A request with an identity header is
+	// a tool call or an agent call. A sandbox can change the path of such a
+	// call, thus it must never get to the management API.
+	if HasIdentityHeader(r.Header) {
+		httpx.InfoFrom(r.Context()).Detail = "management path on a sandbox request"
+		httpx.Error(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	// A template ID is a DNS label. No management path needs an encoded
+	// character, and an encoded "/" must not become a path separator.
+	if strings.Contains(r.URL.EscapedPath(), "%") {
+		httpx.Error(w, http.StatusNotFound, "Not found")
+		return
+	}
 	path := r.URL.Path
 	switch {
 	case path == "/api/v1/terminals/status":
@@ -99,6 +114,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HasIdentityHeader reports whether a request has a header that Open WebUI
+// sends only on sandbox traffic.
+func HasIdentityHeader(h http.Header) bool {
+	for name := range h {
+		if name == scope.HeaderUserID || name == scope.HeaderSessionID || strings.HasPrefix(name, "X-Terminal-") {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) serveTemplate(w http.ResponseWriter, r *http.Request, rest string) {
 	id, sub, hasSub := strings.Cut(rest, "/")
 	p, ok := h.Policies.Get(id)
@@ -118,12 +144,30 @@ func (h *Handler) serveTemplate(w http.ResponseWriter, r *http.Request, rest str
 		return
 	}
 	switch sub {
-	case "instance", "instances", "restart", "stop", "start", "reset":
-		// The instance calls come with the lifecycle controller.
-		httpx.Error(w, http.StatusNotImplemented, "Instance operations are not available in this version")
+	case "instance":
+		// Open WebUI reads only "status" (docs/protocol.md, section 4.6).
+		// This version has no lifecycle controller. A sandbox that the
+		// backend can give is in operation.
+		if r.Method == http.MethodGet {
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "running"})
+			return
+		}
+		notImplemented(w)
+	case "instances":
+		if r.Method == http.MethodGet {
+			httpx.WriteJSON(w, http.StatusOK, []struct{}{})
+			return
+		}
+		notImplemented(w)
+	case "restart", "stop", "start", "reset":
+		notImplemented(w)
 	default:
 		httpx.Error(w, http.StatusNotFound, "Not found")
 	}
+}
+
+func notImplemented(w http.ResponseWriter) {
+	httpx.Error(w, http.StatusNotImplemented, "Instance operations are not available in this version")
 }
 
 func allow(w http.ResponseWriter, r *http.Request, method string) bool {

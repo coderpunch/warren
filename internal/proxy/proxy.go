@@ -3,19 +3,22 @@
 // The proxy is the only path to a sandbox. It makes a new set of request
 // headers for the sandbox, puts the private key of the sandbox in place of
 // the connection key, and never sends a credential of Open WebUI to a
-// sandbox.
+// sandbox. A sandbox is hostile: it runs the code of users and models. Thus
+// the proxy also examines each response before Open WebUI gets it.
 package proxy
 
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/h3xcat/warren/internal/auth"
 	"github.com/h3xcat/warren/internal/backend"
@@ -33,7 +36,7 @@ type Policies interface {
 type Options struct {
 	Keys     *auth.Keys
 	Policies Policies
-	Resolver backend.Resolver
+	Backend  backend.Backend
 	Logger   *slog.Logger
 
 	// AllowSetCookie lets a sandbox set cookies in the browser of the user.
@@ -44,14 +47,38 @@ type Options struct {
 	AuthTimeout time.Duration
 	// MaxMessageBytes is the maximum size of one WebSocket message.
 	MaxMessageBytes int64
+	// MaxPreAuthSockets is the maximum number of WebSockets that wait for
+	// their first message at the same time.
+	MaxPreAuthSockets int
+	// WriteTimeout is the maximum time for one write to a sandbox or to a
+	// WebSocket client. A peer that does not read for this time is stopped.
+	WriteTimeout time.Duration
 }
 
 // Proxy is an http.Handler for sandbox traffic.
 type Proxy struct {
-	opts Options
-	rp   *httputil.ReverseProxy
-	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	opts   Options
+	rp     *httputil.ReverseProxy
+	client *http.Client
+	dial   func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	preAuth chan struct{}
+
+	// mu guards stopped. No socket starts after stopped is true.
+	mu      sync.Mutex
+	stopped bool
+	closing chan struct{}
+	sockets sync.WaitGroup
 }
+
+const (
+	// maxErrorText is the maximum number of bytes of an error text in a
+	// log record. A sandbox controls a part of these texts.
+	maxErrorText = 256
+	// maxSandboxHeaderBytes is the maximum size of the response header of
+	// a sandbox.
+	maxSandboxHeaderBytes = 64 << 10
+)
 
 // New makes a Proxy.
 func New(opts Options) *Proxy {
@@ -66,29 +93,82 @@ func New(opts Options) *Proxy {
 		// (docs/protocol.md, section 4.7).
 		opts.MaxMessageBytes = 32 << 20
 	}
+	if opts.MaxPreAuthSockets <= 0 {
+		opts.MaxPreAuthSockets = 256
+	}
+	if opts.WriteTimeout <= 0 {
+		opts.WriteTimeout = 60 * time.Second
+	}
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-	p := &Proxy{opts: opts, dial: dialer.DialContext}
-	p.rp = &httputil.ReverseProxy{
-		Rewrite: p.rewrite,
-		Transport: &http.Transport{
-			// No environment proxy: a sandbox address is always direct.
-			Proxy:               nil,
-			DialContext:         dialer.DialContext,
-			DisableCompression:  true,
-			MaxIdleConnsPerHost: 8,
-			// The keep-alive time of the Open Terminal server is 5 seconds
-			// by default. Warren must stop the use of an idle connection
-			// before that time (docs/open-terminal-api.md, section 9).
-			IdleConnTimeout:       3 * time.Second,
-			ExpectContinueTimeout: time.Second,
+	p := &Proxy{
+		opts:    opts,
+		dial:    dialer.DialContext,
+		preAuth: make(chan struct{}, opts.MaxPreAuthSockets),
+		closing: make(chan struct{}),
+	}
+	transport := &http.Transport{
+		// No environment proxy: a sandbox address is always direct.
+		Proxy: nil,
+		// Each write to a sandbox has a time limit. If not, a sandbox that
+		// stops reading holds an upload, and its goroutines, with no end.
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &writeDeadlineConn{Conn: conn, timeout: opts.WriteTimeout}, nil
 		},
+		DisableCompression:  true,
+		MaxIdleConnsPerHost: 8,
+		// The keep-alive time of the Open Terminal server is 5 seconds by
+		// default. Warren must stop the use of an idle connection before
+		// that time (docs/open-terminal-api.md, section 9).
+		IdleConnTimeout:        3 * time.Second,
+		ExpectContinueTimeout:  time.Second,
+		MaxResponseHeaderBytes: maxSandboxHeaderBytes,
+	}
+	p.client = &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	p.rp = &httputil.ReverseProxy{
+		Rewrite:   p.rewrite,
+		Transport: transport,
 		// A negative value sends each write immediately. Downloads, long
 		// requests, and event streams need this.
 		FlushInterval:  -1,
 		ModifyResponse: p.modifyResponse,
 		ErrorHandler:   p.errorHandler,
+		ErrorLog:       slog.NewLogLogger(opts.Logger.Handler(), slog.LevelDebug),
 	}
 	return p
+}
+
+// writeDeadlineConn sets a new deadline before each write.
+type writeDeadlineConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *writeDeadlineConn) Write(b []byte) (int, error) {
+	if err := c.Conn.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(b)
+}
+
+// truncate cuts a text to a maximum number of bytes. It does not cut in the
+// middle of a character.
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max] + "..."
 }
 
 // route is the result of the identity and policy checks for one request.
@@ -111,11 +191,11 @@ type routeError struct {
 func readIdentity(h http.Header) (scope.Identity, string, *routeError) {
 	id, err := scope.IdentityFromHeaders(h)
 	if err != nil {
-		return scope.Identity{}, "", &routeError{http.StatusBadRequest, 4000, err.Error()}
+		return scope.Identity{}, "", &routeError{http.StatusBadRequest, closeBad, err.Error()}
 	}
 	sessionID, err := scope.SingleHeader(h, scope.HeaderSessionID)
 	if err != nil {
-		return scope.Identity{}, "", &routeError{http.StatusBadRequest, 4000, err.Error()}
+		return scope.Identity{}, "", &routeError{http.StatusBadRequest, closeBad, err.Error()}
 	}
 	return id, sessionID, nil
 }
@@ -124,20 +204,20 @@ func readIdentity(h http.Header) (scope.Identity, string, *routeError) {
 // authentication, because the result shows which templates exist.
 func (p *Proxy) resolveRoute(id scope.Identity, sessionID string) (route, *routeError) {
 	if id.TemplateID == "" {
-		return route{}, &routeError{http.StatusBadRequest, 4000, scope.HeaderTemplateID + " is necessary"}
+		return route{}, &routeError{http.StatusBadRequest, closeBad, scope.HeaderTemplateID + " is necessary"}
 	}
 	pol, ok := p.opts.Policies.Get(id.TemplateID)
 	if !ok {
-		return route{}, &routeError{http.StatusNotFound, 4004, "Template not found"}
+		return route{}, &routeError{http.StatusNotFound, closeNotFound, "Template not found"}
 	}
 	ref, err := scope.Resolve(pol.Scope, id)
 	switch {
 	case err == nil:
 	case errors.Is(err, scope.ErrMissingChat), errors.Is(err, scope.ErrMissingModel):
 		// Open WebUI uses status 409 for a context that is absent.
-		return route{}, &routeError{http.StatusConflict, 4003, capitalize(err.Error())}
+		return route{}, &routeError{http.StatusConflict, closeForbidden, capitalize(err.Error())}
 	default:
-		return route{}, &routeError{http.StatusBadRequest, 4000, capitalize(err.Error())}
+		return route{}, &routeError{http.StatusBadRequest, closeBad, capitalize(err.Error())}
 	}
 	return route{id: id, sessionID: sessionID, ref: ref}, nil
 }
@@ -157,6 +237,21 @@ func fillInfo(ctx context.Context, rt route) {
 	info.Sandbox = rt.ref.Name()
 }
 
+// startTimeout gives the maximum time that a request can wait for its
+// sandbox. Open WebUI has a different time limit for each call
+// (docs/protocol.md, section 9.4). A reply after that limit has no use.
+func startTimeout(path string) time.Duration {
+	switch path {
+	case "/openapi.json":
+		return 8 * time.Second // limit of Open WebUI: 10 seconds
+	case "/files/cwd":
+		return 4 * time.Second // 5 seconds
+	case "/api/config", "/system":
+		return 2 * time.Second // 3 seconds for the two calls
+	}
+	return 50 * time.Second // 60 seconds for helper calls
+}
+
 type proxyCtxKey struct{}
 
 type proxyCtx struct {
@@ -167,8 +262,17 @@ type proxyCtx struct {
 // ServeHTTP sends one HTTP request to a sandbox. The caller must
 // authenticate the request first.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	info := httpx.InfoFrom(r.Context())
 	if err := validatePath(r.URL.Path); err != nil {
+		info.Detail = "invalid path"
 		httpx.Error(w, http.StatusBadRequest, "Invalid path")
+		return
+	}
+	// The pages of the framework show the OpenAPI document of a sandbox in
+	// a browser. Warren does not relay them.
+	switch r.URL.Path {
+	case "/docs", "/redoc", "/docs/oauth2-redirect":
+		httpx.Error(w, http.StatusNotFound, "Not found")
 		return
 	}
 	id, sessionID, rerr := readIdentity(r.Header)
@@ -180,25 +284,35 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	httpx.InfoFrom(r.Context()).Detail = rerr.detail
+	info.Detail = rerr.detail
 	httpx.Error(w, rerr.status, rerr.detail)
 }
 
 func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, rt route) {
 	fillInfo(r.Context(), rt)
-	target, err := p.opts.Resolver.Resolve(r.Context(), rt.ref)
+
+	startCtx, cancel := context.WithTimeout(r.Context(), startTimeout(r.URL.Path))
+	lease, err := p.opts.Backend.Acquire(startCtx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID})
+	cancel()
 	if err != nil {
-		p.resolveFailed(w, r, err)
+		p.acquireFailed(w, r, err)
 		return
 	}
-	ctx := context.WithValue(r.Context(), proxyCtxKey{}, &proxyCtx{target: target, route: rt})
+	defer lease.Release()
+
+	pc := &proxyCtx{target: lease.Target(), route: rt}
+	if r.URL.Path == "/openapi.json" {
+		p.serveOpenAPI(w, r, pc)
+		return
+	}
+	ctx := context.WithValue(r.Context(), proxyCtxKey{}, pc)
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
 }
 
-func (p *Proxy) resolveFailed(w http.ResponseWriter, r *http.Request, err error) {
+func (p *Proxy) acquireFailed(w http.ResponseWriter, r *http.Request, err error) {
 	info := httpx.InfoFrom(r.Context())
 	switch {
-	case errors.Is(err, context.Canceled):
+	case r.Context().Err() != nil:
 		info.Detail = "client went away"
 		// The client is not there. The status is for the log only.
 		w.WriteHeader(499)
@@ -206,8 +320,11 @@ func (p *Proxy) resolveFailed(w http.ResponseWriter, r *http.Request, err error)
 		info.Detail = "sandbox not ready"
 		w.Header().Set("Retry-After", "5")
 		httpx.Error(w, http.StatusServiceUnavailable, "The terminal is not ready. Try again in a short time.")
+	case errors.Is(err, backend.ErrLimit):
+		info.Detail = "sandbox limit"
+		httpx.Error(w, http.StatusTooManyRequests, "You have too many terminals. Stop one, then try again.")
 	default:
-		info.Detail = "resolve: " + err.Error()
+		info.Detail = "acquire: " + truncate(err.Error(), maxErrorText)
 		httpx.Error(w, http.StatusBadGateway, "The terminal is not available")
 	}
 }
@@ -267,44 +384,84 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 
 func (p *Proxy) modifyResponse(resp *http.Response) error {
 	pc := resp.Request.Context().Value(proxyCtxKey{}).(*proxyCtx)
-	if !p.opts.AllowSetCookie {
-		resp.Header.Del("Set-Cookie")
-	}
+	reqPath := resp.Request.URL.Path
+	filterResponseHeaders(resp.Header, reqPath, p.opts.AllowSetCookie)
+
 	if loc := resp.Header.Get("Location"); loc != "" {
-		resp.Header.Set("Location", relativeLocation(loc, pc.target.URL))
+		if safe, ok := safeLocation(loc, resp.Request.URL, pc.target.URL); ok {
+			resp.Header.Set("Location", safe)
+		} else {
+			resp.Header.Del("Location")
+			httpx.InfoFrom(resp.Request.Context()).Detail = "removed a redirect of the sandbox"
+		}
 	}
+
+	// A trailer is a header that comes after the body. It does not go
+	// through the rules above, thus warren sends no trailers.
+	resp.Trailer = nil
+	resp.Header.Del("Trailer")
+	resp.Body = &noTrailerBody{ReadCloser: resp.Body, resp: resp}
 	return nil
 }
 
-// relativeLocation changes a redirect that points to the sandbox address
-// into a relative redirect. The framework of Open Terminal makes absolute
-// redirects from the Host header (docs/open-terminal-api.md, section 7.3).
-// The sandbox address must not go to a client.
-func relativeLocation(loc string, target *url.URL) string {
-	u, err := url.Parse(loc)
-	if err != nil || !u.IsAbs() || !strings.EqualFold(u.Host, target.Host) {
-		return loc
+// noTrailerBody removes the trailers that the transport adds when the body
+// is complete.
+type noTrailerBody struct {
+	io.ReadCloser
+	resp *http.Response
+}
+
+func (b *noTrailerBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.resp.Trailer = nil
 	}
-	rel := url.URL{Path: u.Path, RawPath: u.RawPath, RawQuery: u.RawQuery, Fragment: u.Fragment}
-	if rel.Path == "" {
-		rel.Path = "/"
-	}
-	return rel.String()
+	return n, err
+}
+
+func (b *noTrailerBody) Close() error {
+	b.resp.Trailer = nil
+	return b.ReadCloser.Close()
 }
 
 func (p *Proxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	info := httpx.InfoFrom(r.Context())
-	if errors.Is(err, context.Canceled) {
+	// A read error of the request body also cancels the context of the
+	// request. Thus this test finds each failure that the client caused.
+	if errors.Is(err, context.Canceled) || r.Context().Err() != nil {
 		info.Detail = "client went away"
 		w.WriteHeader(499)
 		return
 	}
-	info.Detail = "upstream: " + err.Error()
-	p.opts.Logger.Warn("proxy error", "request_id", info.RequestID, "sandbox", info.Sandbox, "error", err.Error())
+	text := truncate(err.Error(), maxErrorText)
+	info.Detail = "upstream: " + text
+	p.opts.Logger.Warn("proxy error", "request_id", info.RequestID, "sandbox", info.Sandbox, "error", text)
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		httpx.Error(w, http.StatusGatewayTimeout, "The terminal did not answer in time")
 		return
 	}
 	httpx.Error(w, http.StatusBadGateway, "The terminal is not available")
+}
+
+// Shutdown closes all open WebSockets with a close message and waits until
+// their handlers stop, or until the context ends.
+func (p *Proxy) Shutdown(ctx context.Context) error {
+	p.mu.Lock()
+	if !p.stopped {
+		p.stopped = true
+		close(p.closing)
+	}
+	p.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		p.sockets.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

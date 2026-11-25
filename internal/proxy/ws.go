@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
-	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -51,16 +54,22 @@ func classifyWS(path string) wsAuth {
 // Close codes that warren sends. Open WebUI and its browser client give
 // these codes a meaning (docs/protocol.md, section 4.2).
 const (
+	closeBad       = 4000
 	closeAuth      = 4001
 	closeForbidden = 4003
 	closeNotFound  = 4004
-	closeBad       = 4000
 )
 
 const (
 	maxAuthMessageBytes = 64 << 10
-	closeWriteWait      = 5 * time.Second
+	maxHandshakeBytes   = 64 << 10
 	handshakeTimeout    = 15 * time.Second
+	// wsStartTimeout is the maximum time that a WebSocket waits for its
+	// sandbox.
+	wsStartTimeout = 50 * time.Second
+	// closeWait is the maximum time that warren waits for the reply to a
+	// close message.
+	closeWait = 3 * time.Second
 )
 
 var upgrader = websocket.Upgrader{
@@ -71,7 +80,7 @@ var upgrader = websocket.Upgrader{
 	// header. A request with an Origin header comes from a browser, and
 	// warren refuses it.
 	CheckOrigin: func(r *http.Request) bool { return r.Header.Get("Origin") == "" },
-	Error: func(w http.ResponseWriter, _ *http.Request, status int, reason error) {
+	Error: func(w http.ResponseWriter, _ *http.Request, status int, _ error) {
 		httpx.Error(w, status, "WebSocket handshake failed")
 	},
 }
@@ -79,21 +88,39 @@ var upgrader = websocket.Upgrader{
 // ServeWS handles a WebSocket upgrade request. It does the authentication
 // itself, because six routes have their credential in the first message and
 // not in a header.
-func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request) {
+//
+// ServeWS calls finished one time before it returns. Shutdown waits until
+// that call is complete. Thus the caller can write its audit record there,
+// and the record is not lost when warren stops.
+func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func()) {
+	if finished == nil {
+		finished = func() {}
+	}
+	counted := false
+	defer func() {
+		finished()
+		if counted {
+			p.sockets.Done()
+		}
+	}()
+
 	info := httpx.InfoFrom(r.Context())
 	info.WebSocket = true
 
 	kind := classifyWS(r.URL.Path)
 	if kind == wsUnknown {
+		info.Detail = "no WebSocket route"
 		httpx.Error(w, http.StatusNotFound, "Not found")
 		return
 	}
 	if err := validatePath(r.URL.Path); err != nil {
+		info.Detail = "invalid path"
 		httpx.Error(w, http.StatusBadRequest, "Invalid path")
 		return
 	}
 	id, sessionID, rerr := readIdentity(r.Header)
 	if rerr != nil {
+		info.Detail = rerr.detail
 		httpx.Error(w, rerr.status, rerr.detail)
 		return
 	}
@@ -114,9 +141,44 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Warren must accept a WebSocket before it can read the key from the
+	// first message. A limit on the number of such sockets prevents a
+	// client with no key from the use of all memory.
+	preAuth := !headerAuth
+	if preAuth {
+		select {
+		case p.preAuth <- struct{}{}:
+		default:
+			info.Detail = "too many WebSockets wait for authentication"
+			w.Header().Set("Retry-After", "1")
+			httpx.Error(w, http.StatusServiceUnavailable, "Too many connections")
+			return
+		}
+	}
+	releasePreAuth := func() {
+		if preAuth {
+			<-p.preAuth
+			preAuth = false
+		}
+	}
+	defer releasePreAuth()
+
+	// Count the socket before the upgrade. Shutdown waits for all sockets.
+	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		info.Detail = "warren stops"
+		w.Header().Set("Retry-After", "5")
+		httpx.Error(w, http.StatusServiceUnavailable, "The server restarts")
+		return
+	}
+	p.sockets.Add(1)
+	counted = true
+	p.mu.Unlock()
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		info.Detail = "upgrade: " + err.Error()
+		info.Detail = "upgrade: " + truncate(err.Error(), maxErrorText)
 		return
 	}
 	defer conn.Close()
@@ -127,56 +189,98 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request) {
 		firstMessage, ok = p.readAuthMessage(conn, headerAuth)
 		if !ok {
 			info.Detail = "first message authentication failed"
-			closeConn(conn, closeAuth, "Invalid API key")
+			closeAndWait(conn, closeAuth, "Invalid API key")
 			return
 		}
 	}
+	releasePreAuth()
 	conn.SetReadLimit(p.opts.MaxMessageBytes)
 
 	// The caller is authenticated from this point.
 	rt, rerr := p.resolveRoute(id, sessionID)
 	if rerr != nil {
 		info.Detail = rerr.detail
-		closeConn(conn, rerr.close, rerr.detail)
+		closeAndWait(conn, rerr.close, rerr.detail)
 		return
 	}
 	fillInfo(r.Context(), rt)
+	p.opts.Logger.Info("websocket open", "log", "audit", "request_id", info.RequestID,
+		"path", httpx.RedactPath(r.URL.Path), "user", info.UserID, "template", info.Template,
+		"context", info.Context, "sandbox", info.Sandbox)
 
-	target, err := p.opts.Resolver.Resolve(r.Context(), rt.ref)
+	// After the upgrade, the HTTP server does not monitor the connection.
+	// The context ends when the client goes away, when warren stops, or
+	// when the wait for the sandbox is too long.
+	ctx, cancel := context.WithTimeout(r.Context(), wsStartTimeout)
+	defer cancel()
+	go func() {
+		select {
+		case <-p.closing:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	s := &session{proxy: p, client: conn}
+	// From this point only the client pump reads from the client. It finds
+	// a client that goes away, and it answers pings, while the sandbox
+	// starts.
+	sandboxReady := make(chan *websocket.Conn, 1)
+	clientDone := make(chan closeInfo, 1)
+	go func() { clientDone <- s.pumpClient(sandboxReady, cancel) }()
+
+	// refuse stops a connection that has no sandbox connection.
+	refuse := func(code int, text, detail string) {
+		sandboxReady <- nil
+		info.Detail = detail
+		closeConn(conn, code, text)
+		_ = conn.NetConn().SetReadDeadline(time.Now().Add(closeWait))
+		<-clientDone
+	}
+
+	lease, err := p.opts.Backend.Acquire(ctx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID, WebSocket: true})
 	if err != nil {
-		if errors.Is(err, backend.ErrNotReady) || errors.Is(err, context.DeadlineExceeded) {
-			info.Detail = "sandbox not ready"
+		switch {
+		case errors.Is(err, backend.ErrLimit):
+			refuse(closeForbidden, "You have too many terminals", "sandbox limit")
+		case errors.Is(err, backend.ErrNotReady), errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 			// The browser client tries again after code 1013.
-			closeConn(conn, websocket.CloseTryAgainLater, "The terminal is not ready")
-		} else {
-			info.Detail = "resolve: " + err.Error()
-			closeConn(conn, websocket.CloseInternalServerErr, "The terminal is not available")
+			refuse(websocket.CloseTryAgainLater, "The terminal is not ready", "sandbox not ready")
+		default:
+			refuse(websocket.CloseInternalServerErr, "The terminal is not available",
+				"acquire: "+truncate(err.Error(), maxErrorText))
 		}
 		return
 	}
+	defer lease.Release()
+	target := lease.Target()
 
-	up, code, err := p.dialSandbox(r, rt, target)
+	up, code, err := p.dialSandbox(ctx, r, rt, target)
 	if err != nil {
-		info.Detail = "dial sandbox: " + err.Error()
-		closeConn(conn, code, "The terminal refused the connection")
+		refuse(code, "The terminal refused the connection", "dial sandbox: "+truncate(err.Error(), maxErrorText))
 		return
 	}
 	defer up.Close()
 	up.SetReadLimit(p.opts.MaxMessageBytes)
+	s.sandbox = up
 
 	if firstMessage != nil {
 		// Put the private key of the sandbox in place of the connection key.
 		token, _ := json.Marshal(target.APIKey)
 		firstMessage["token"] = token
 		data, _ := json.Marshal(firstMessage)
+		_ = up.SetWriteDeadline(time.Now().Add(p.opts.WriteTimeout))
 		if err := up.WriteMessage(websocket.TextMessage, data); err != nil {
-			info.Detail = "send first message: " + err.Error()
-			closeConn(conn, websocket.CloseInternalServerErr, "The terminal is not available")
+			refuse(websocket.CloseInternalServerErr, "The terminal is not available",
+				"send first message: "+truncate(err.Error(), maxErrorText))
 			return
 		}
 	}
+	sandboxReady <- up
+	sandboxDone := make(chan closeInfo, 1)
+	go func() { sandboxDone <- s.copyMessages(conn, up, false, 0, nil) }()
 
-	relay(conn, up)
+	info.Detail = s.finish(clientDone, sandboxDone)
 }
 
 func unauthorized(w http.ResponseWriter) {
@@ -214,9 +318,37 @@ func (p *Proxy) readAuthMessage(conn *websocket.Conn, headerAuth bool) (map[stri
 	return msg, p.opts.Keys.Match(token)
 }
 
+// budgetConn stops a read when the peer sent more bytes than the budget.
+// The WebSocket library reads the handshake reply with no size limit. A
+// hostile sandbox can send a reply that has no end.
+type budgetConn struct {
+	net.Conn
+	// left is the number of bytes that the peer can send. A negative
+	// value means no limit.
+	left atomic.Int64
+}
+
+var errHandshakeTooLarge = errors.New("the handshake reply of the sandbox is too large")
+
+func (c *budgetConn) Read(p []byte) (int, error) {
+	left := c.left.Load()
+	if left < 0 {
+		return c.Conn.Read(p)
+	}
+	if left == 0 {
+		return 0, errHandshakeTooLarge
+	}
+	if int64(len(p)) > left {
+		p = p[:left]
+	}
+	n, err := c.Conn.Read(p)
+	c.left.Add(-int64(n))
+	return n, err
+}
+
 // dialSandbox opens the WebSocket to the sandbox. On a failure it returns
 // the close code for the client.
-func (p *Proxy) dialSandbox(r *http.Request, rt route, target backend.Target) (*websocket.Conn, int, error) {
+func (p *Proxy) dialSandbox(ctx context.Context, r *http.Request, rt route, target backend.Target) (*websocket.Conn, int, error) {
 	u := *target.URL
 	switch u.Scheme {
 	case "https":
@@ -237,14 +369,23 @@ func (p *Proxy) dialSandbox(r *http.Request, rt route, target backend.Target) (*
 		h.Set(scope.HeaderSessionID, rt.sessionID)
 	}
 
+	var limited *budgetConn
 	dialer := websocket.Dialer{
-		Proxy:            nil,
-		NetDialContext:   p.dial,
+		Proxy: nil,
+		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := p.dial(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			limited = &budgetConn{Conn: conn}
+			limited.left.Store(maxHandshakeBytes)
+			return limited, nil
+		},
 		HandshakeTimeout: handshakeTimeout,
 		ReadBufferSize:   32 << 10,
 		WriteBufferSize:  32 << 10,
 	}
-	up, resp, err := dialer.DialContext(r.Context(), u.String(), h)
+	up, resp, err := dialer.DialContext(ctx, u.String(), h)
 	if err != nil {
 		code := websocket.CloseInternalServerErr
 		if resp != nil {
@@ -260,76 +401,237 @@ func (p *Proxy) dialSandbox(r *http.Request, rt route, target backend.Target) (*
 		}
 		return nil, code, err
 	}
+	// Warren offers no extension and no subprotocol. The library accepts
+	// compression that a server selects with no offer, and the size limit
+	// then counts only compressed bytes.
+	if resp.Header.Get("Sec-WebSocket-Extensions") != "" || resp.Header.Get("Sec-WebSocket-Protocol") != "" {
+		_ = up.Close()
+		return nil, websocket.CloseInternalServerErr,
+			errors.New("the sandbox selected an extension or a subprotocol that warren did not offer")
+	}
+	limited.left.Store(-1)
 	return up, 0, nil
+}
+
+// side is one end of a relay.
+type side int
+
+const (
+	sideClient side = iota
+	sideSandbox
+	sideWarren
+)
+
+func (s side) String() string {
+	switch s {
+	case sideClient:
+		return "client"
+	case sideSandbox:
+		return "sandbox"
+	}
+	return "warren"
 }
 
 // closeInfo describes why one direction of a relay stopped.
 type closeInfo struct {
-	fromClient bool
-	code       int
-	text       string
+	// side is the end that stopped.
+	side side
+	code int
+	text string
+	// writeFailed: a write to this side failed. The reader of this side
+	// can have the real close code.
+	writeFailed bool
 }
 
-// relay copies messages in the two directions until one side stops. It then
-// sends the close code to the other side.
-func relay(client, sandbox *websocket.Conn) {
-	done := make(chan closeInfo, 2)
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		done <- copyMessages(sandbox, client, true)
-	}()
-	go func() {
-		defer wg.Done()
-		done <- copyMessages(client, sandbox, false)
-	}()
+// session is one WebSocket relay.
+type session struct {
+	proxy   *Proxy
+	client  *websocket.Conn
+	sandbox *websocket.Conn
+	// closing is true after warren sent a close message. The copy loops
+	// then read and discard, until the reply to the close message comes.
+	closing atomic.Bool
+}
 
-	first := <-done
-	if first.fromClient {
-		closeConn(sandbox, clientCloseCode(first.code), first.text)
-	} else {
-		closeConn(client, sandboxCloseCode(first.code), first.text)
+// pumpClient reads the client. Before the sandbox connection exists, it
+// only waits for the first message: thus it sees a client that goes away,
+// and the library answers pings. When the sandbox connection is ready, it
+// copies messages to the sandbox.
+func (s *session) pumpClient(sandboxReady <-chan *websocket.Conn, clientGone func()) closeInfo {
+	mt, reader, err := s.client.NextReader()
+	if err != nil {
+		clientGone()
+		<-sandboxReady
+		return readFailure(sideClient, err)
 	}
-	// Stop the other direction.
-	_ = client.Close()
-	_ = sandbox.Close()
-	wg.Wait()
+	up := <-sandboxReady
+	if up == nil {
+		// No sandbox. Read until the client answers the close message.
+		for {
+			if _, _, err := s.client.NextReader(); err != nil {
+				return readFailure(sideClient, err)
+			}
+		}
+	}
+	return s.copyMessages(up, s.client, true, mt, reader)
+}
+
+func otherSide(fromClient bool) (src, dst side) {
+	if fromClient {
+		return sideClient, sideSandbox
+	}
+	return sideSandbox, sideClient
+}
+
+func readFailure(src side, err error) closeInfo {
+	info := closeInfo{side: src, code: websocket.CloseAbnormalClosure}
+	var ce *websocket.CloseError
+	switch {
+	case errors.As(err, &ce):
+		info.code, info.text = ce.Code, ce.Text
+	case errors.Is(err, websocket.ErrReadLimit):
+		info.code, info.text = websocket.CloseMessageTooBig, "Message too large"
+	}
+	return info
 }
 
 // copyMessages copies each message from src to dst as a stream. It does not
-// keep a message in memory, and it does not group messages. Open Terminal
+// keep a message in memory, and it does not group messages: Open Terminal
 // closes a terminal when too much input waits
-// (docs/open-terminal-api.md, section 3.4).
-func copyMessages(dst, src *websocket.Conn, fromClient bool) closeInfo {
+// (docs/open-terminal-api.md, section 3.4). If reader is not nil, it is a
+// message of src that the caller started to read.
+func (s *session) copyMessages(dst, src *websocket.Conn, fromClient bool, mt int, reader io.Reader) closeInfo {
+	srcSide, dstSide := otherSide(fromClient)
+	writeFailure := closeInfo{side: dstSide, code: websocket.CloseAbnormalClosure, writeFailed: true}
+	timeout := s.proxy.opts.WriteTimeout
 	buf := make([]byte, 32<<10)
 	for {
-		mt, reader, err := src.NextReader()
-		if err != nil {
-			info := closeInfo{fromClient: fromClient, code: websocket.CloseAbnormalClosure}
-			var ce *websocket.CloseError
-			if errors.As(err, &ce) {
-				info.code, info.text = ce.Code, ce.Text
+		if reader == nil {
+			var err error
+			mt, reader, err = src.NextReader()
+			if err != nil {
+				return readFailure(srcSide, err)
 			}
-			return info
 		}
+		if s.closing.Load() {
+			if _, err := io.Copy(io.Discard, reader); err != nil {
+				return readFailure(srcSide, err)
+			}
+			reader = nil
+			continue
+		}
+		// Each write has a time limit. If not, a peer that stops reading
+		// holds the relay, and nothing sees that the other peer went away.
+		_ = dst.SetWriteDeadline(time.Now().Add(timeout))
 		writer, err := dst.NextWriter(mt)
 		if err != nil {
-			// The other side is gone. Report it as the cause.
-			return closeInfo{fromClient: !fromClient, code: websocket.CloseAbnormalClosure}
+			return writeFailure
 		}
-		if _, err := io.CopyBuffer(writer, reader, buf); err != nil {
-			_ = writer.Close()
-			var ce *websocket.CloseError
-			if errors.As(err, &ce) {
-				return closeInfo{fromClient: fromClient, code: ce.Code, text: ce.Text}
+		for {
+			n, rerr := reader.Read(buf)
+			if n > 0 {
+				_ = dst.SetWriteDeadline(time.Now().Add(timeout))
+				if _, werr := writer.Write(buf[:n]); werr != nil {
+					return writeFailure
+				}
 			}
-			return closeInfo{fromClient: fromClient, code: websocket.CloseAbnormalClosure}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				// Do not close the writer. A close sends the last frame,
+				// and the part would arrive as a complete message.
+				return readFailure(srcSide, rerr)
+			}
 		}
 		if err := writer.Close(); err != nil {
-			return closeInfo{fromClient: !fromClient, code: websocket.CloseAbnormalClosure}
+			return writeFailure
+		}
+		reader = nil
+	}
+}
+
+// finish waits until one side of a relay stops. It then sends the close
+// code to the other side, waits for the reply, and closes the connections.
+// It returns a text for the audit record.
+func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
+	var first closeInfo
+	clientRunning, sandboxRunning := true, true
+	take := func(info closeInfo, fromClientPump bool) {
+		first = info
+		if fromClientPump {
+			clientRunning = false
+		} else {
+			sandboxRunning = false
 		}
 	}
+	select {
+	case info := <-clientDone:
+		take(info, true)
+	case info := <-sandboxDone:
+		take(info, false)
+	case <-s.proxy.closing:
+		first = closeInfo{side: sideWarren}
+	}
+
+	// A failed write says only that a side is gone. The reader of that
+	// side gets the close code. Wait a short time for it.
+	if first.writeFailed {
+		timer := time.NewTimer(time.Second)
+		select {
+		case info := <-clientDone:
+			clientRunning = false
+			if !info.writeFailed {
+				first = info
+			}
+		case info := <-sandboxDone:
+			sandboxRunning = false
+			if !info.writeFailed {
+				first = info
+			}
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
+
+	s.closing.Store(true)
+	switch first.side {
+	case sideClient:
+		closeConn(s.sandbox, clientCloseCode(first.code), first.text)
+	case sideSandbox:
+		closeConn(s.client, sandboxCloseCode(first.code), first.text)
+	default:
+		closeConn(s.client, websocket.CloseServiceRestart, "The server restarts")
+		closeConn(s.sandbox, websocket.CloseGoingAway, "")
+	}
+
+	// Wait for the reply to the close message. A client loses the close
+	// code if the connection closes immediately after the message.
+	deadline := time.Now().Add(closeWait)
+	_ = s.client.NetConn().SetReadDeadline(deadline)
+	_ = s.sandbox.NetConn().SetReadDeadline(deadline)
+	timer := time.NewTimer(closeWait + time.Second)
+	defer timer.Stop()
+	for clientRunning || sandboxRunning {
+		select {
+		case <-clientDone:
+			clientRunning = false
+		case <-sandboxDone:
+			sandboxRunning = false
+		case <-timer.C:
+			// A copy loop can wait in a write. Stop it.
+			_ = s.client.Close()
+			_ = s.sandbox.Close()
+			if clientRunning {
+				<-clientDone
+			}
+			if sandboxRunning {
+				<-sandboxDone
+			}
+			clientRunning, sandboxRunning = false, false
+		}
+	}
+	return fmt.Sprintf("closed by %s, code %d", first.side, first.code)
 }
 
 // reserved reports whether a close code must not be in a close message.
@@ -361,12 +663,27 @@ func clientCloseCode(code int) int {
 	return code
 }
 
-// closeConn sends a close message. The reason text has a maximum of 123
-// bytes in the protocol.
+// closeConn sends a close message. The protocol permits a maximum of 123
+// bytes of valid UTF-8 for the reason text.
 func closeConn(conn *websocket.Conn, code int, text string) {
-	if len(text) > 120 {
-		text = text[:120]
+	if len(text) > 123 {
+		text = text[:123]
+	}
+	for len(text) > 0 && !utf8.ValidString(text) {
+		text = text[:len(text)-1]
 	}
 	_ = conn.WriteControl(websocket.CloseMessage,
-		websocket.FormatCloseMessage(code, text), time.Now().Add(closeWriteWait))
+		websocket.FormatCloseMessage(code, text), time.Now().Add(closeWait))
+}
+
+// closeAndWait sends a close message and reads until the peer answers, or
+// until a time limit. Use it only when no other goroutine reads from conn.
+func closeAndWait(conn *websocket.Conn, code int, text string) {
+	closeConn(conn, code, text)
+	_ = conn.SetReadDeadline(time.Now().Add(closeWait))
+	for {
+		if _, _, err := conn.NextReader(); err != nil {
+			return
+		}
+	}
 }
