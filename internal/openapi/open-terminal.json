@@ -1,0 +1,1752 @@
+{
+ "components": {
+  "schemas": {
+   "Action": {
+    "additionalProperties": false,
+    "properties": {
+     "action": {
+      "enum": [
+       "navigate",
+       "back",
+       "forward",
+       "reload",
+       "click",
+       "double_click",
+       "move",
+       "drag",
+       "scroll",
+       "type",
+       "key"
+      ],
+      "title": "Action",
+      "type": "string"
+     },
+     "amount": {
+      "default": 400,
+      "description": "Scroll distance in pixels",
+      "maximum": 10000.0,
+      "minimum": 1.0,
+      "title": "Amount",
+      "type": "integer"
+     },
+     "button": {
+      "default": "left",
+      "enum": [
+       "left",
+       "middle",
+       "right"
+      ],
+      "title": "Button",
+      "type": "string"
+     },
+     "direction": {
+      "default": "down",
+      "enum": [
+       "up",
+       "down",
+       "left",
+       "right"
+      ],
+      "title": "Direction",
+      "type": "string"
+     },
+     "key": {
+      "anyOf": [
+       {
+        "maxLength": 100,
+        "pattern": "^[A-Za-z0-9_+]+$",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Key or combination, e.g. Enter, Tab, ArrowDown, ctrl+a, command+a",
+      "title": "Key"
+     },
+     "ref": {
+      "anyOf": [
+       {
+        "maxLength": 64,
+        "pattern": "^@?e[0-9]+$",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Element ref from browser_snapshot, e.g. @e1",
+      "title": "Ref"
+     },
+     "text": {
+      "anyOf": [
+       {
+        "maxLength": 20000,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Text"
+     },
+     "to_x": {
+      "anyOf": [
+       {
+        "maximum": 16384.0,
+        "minimum": 0.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "To X"
+     },
+     "to_y": {
+      "anyOf": [
+       {
+        "maximum": 16384.0,
+        "minimum": 0.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "To Y"
+     },
+     "url": {
+      "anyOf": [
+       {
+        "maxLength": 16384,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Url"
+     },
+     "x": {
+      "anyOf": [
+       {
+        "maximum": 16384.0,
+        "minimum": 0.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "X"
+     },
+     "y": {
+      "anyOf": [
+       {
+        "maximum": 16384.0,
+        "minimum": 0.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Y"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "Action",
+    "type": "object"
+   },
+   "ActionRequest": {
+    "additionalProperties": false,
+    "properties": {
+     "actions": {
+      "description": "Actions to run in order in one tab, with one final accessibility snapshot.",
+      "items": {
+       "$ref": "#/components/schemas/Action"
+      },
+      "maxItems": 50,
+      "minItems": 1,
+      "title": "Actions",
+      "type": "array"
+     },
+     "session_id": {
+      "anyOf": [
+       {
+        "maxLength": 128,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Session Id"
+     }
+    },
+    "required": [
+     "actions"
+    ],
+    "title": "ActionRequest",
+    "type": "object"
+   },
+   "ExecRequest": {
+    "properties": {
+     "command": {
+      "description": "Shell command to execute. Supports chaining (&&, ||, ;), pipes (|), and redirections.",
+      "examples": [
+       "echo hello",
+       "ls -la && whoami"
+      ],
+      "title": "Command",
+      "type": "string"
+     },
+     "cwd": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Working directory for the command. Defaults to the server's current directory if not set.",
+      "title": "Cwd"
+     },
+     "env": {
+      "anyOf": [
+       {
+        "additionalProperties": {
+         "type": "string"
+        },
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Extra environment variables merged into the subprocess environment.",
+      "title": "Env"
+     }
+    },
+    "required": [
+     "command"
+    ],
+    "title": "ExecRequest",
+    "type": "object"
+   },
+   "HTTPValidationError": {
+    "properties": {
+     "detail": {
+      "items": {
+       "$ref": "#/components/schemas/ValidationError"
+      },
+      "title": "Detail",
+      "type": "array"
+     }
+    },
+    "title": "HTTPValidationError",
+    "type": "object"
+   },
+   "InputRequest": {
+    "properties": {
+     "input": {
+      "description": "Text to send to the process's stdin. Include newline characters as needed.",
+      "title": "Input",
+      "type": "string"
+     }
+    },
+    "required": [
+     "input"
+    ],
+    "title": "InputRequest",
+    "type": "object"
+   },
+   "ReplaceRequest": {
+    "properties": {
+     "path": {
+      "description": "Path to the file to modify.",
+      "title": "Path",
+      "type": "string"
+     },
+     "replacements": {
+      "description": "List of find-and-replace operations to apply sequentially.",
+      "items": {
+       "$ref": "#/components/schemas/ReplacementChunk"
+      },
+      "title": "Replacements",
+      "type": "array"
+     }
+    },
+    "required": [
+     "path",
+     "replacements"
+    ],
+    "title": "ReplaceRequest",
+    "type": "object"
+   },
+   "ReplacementChunk": {
+    "properties": {
+     "allow_multiple": {
+      "default": false,
+      "description": "If true, replaces all occurrences. If false, errors when multiple matches are found.",
+      "title": "Allow Multiple",
+      "type": "boolean"
+     },
+     "end_line": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Narrow the search to lines at or before this (1-indexed).",
+      "title": "End Line"
+     },
+     "replacement": {
+      "description": "Content to replace the target with.",
+      "title": "Replacement",
+      "type": "string"
+     },
+     "start_line": {
+      "anyOf": [
+       {
+        "minimum": 1.0,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Narrow the search to lines at or after this (1-indexed).",
+      "title": "Start Line"
+     },
+     "target": {
+      "description": "Exact string to find. Must match precisely, including whitespace.",
+      "title": "Target",
+      "type": "string"
+     }
+    },
+    "required": [
+     "target",
+     "replacement"
+    ],
+    "title": "ReplacementChunk",
+    "type": "object"
+   },
+   "ValidationError": {
+    "properties": {
+     "ctx": {
+      "title": "Context",
+      "type": "object"
+     },
+     "input": {
+      "title": "Input"
+     },
+     "loc": {
+      "items": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "title": "Location",
+      "type": "array"
+     },
+     "msg": {
+      "title": "Message",
+      "type": "string"
+     },
+     "type": {
+      "title": "Error Type",
+      "type": "string"
+     }
+    },
+    "required": [
+     "loc",
+     "msg",
+     "type"
+    ],
+    "title": "ValidationError",
+    "type": "object"
+   },
+   "WriteRequest": {
+    "properties": {
+     "content": {
+      "description": "Text content to write to the file.",
+      "title": "Content",
+      "type": "string"
+     },
+     "path": {
+      "description": "Absolute or relative path to write to. Parent directories are created automatically.",
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ],
+    "title": "WriteRequest",
+    "type": "object"
+   }
+  },
+  "securitySchemes": {
+   "HTTPBearer": {
+    "scheme": "bearer",
+    "type": "http"
+   }
+  }
+ },
+ "info": {
+  "description": "A remote machine API.",
+  "title": "Open Terminal",
+  "version": "0.18.1"
+ },
+ "openapi": "3.1.0",
+ "paths": {
+  "/api/terminals/user/input": {
+   "post": {
+    "description": "Send literal text to the user's active shell, or last-used shell when none is visible.\nInput goes to that shell or its foreground program.\nInclude actual newlines to submit input. Read the shell first. Sending input\ndoes not wait for command completion and does not create a shell.",
+    "operationId": "send_user_terminal_input",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/InputRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Send User Terminal Input"
+   }
+  },
+  "/api/terminals/user/output": {
+   "get": {
+    "description": "Read recent output from the user's active shell, or last-used shell when none is visible.\nInspect before sending input:\na foreground program may already be running. Does not create a shell.",
+    "operationId": "read_user_terminal",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Read User Terminal"
+   }
+  },
+  "/browser/action": {
+   "post": {
+    "description": "Batch known steps in one call; stop when you need a fresh observation.\nExecutes 1\u201350 actions in one tab and returns one final accessibility snapshot.\nRefs may expire after page changes.\nEach item can navigate, click, drag, scroll, type, or press a key in the\nexisting Chrome browser tab using refs from browser_snapshot. Typing with a ref\nreplaces that input's contents; without a ref it types into the focused element.\nPixel coordinates from browser_screenshot are also supported for visual targets.\nDefaults to the active tab, or the last-used browser tab when hidden. Set a\nsession_id from browser_tabs at the top level to target one tab for the batch.\nBatches stop on failure and report completed_actions and failed_action_index\n(zero-based, null if only the final snapshot failed). Completed actions are\nnot rolled back; the failed action may also have taken effect. Inspect the\npage before retrying, and do not blindly replay the batch.",
+    "operationId": "browser_action",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ActionRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Interact with the user's Browser tab",
+    "tags": [
+     "browser"
+    ]
+   }
+  },
+  "/browser/screenshot": {
+   "get": {
+    "description": "Return a PNG for visual inspection of layouts, canvas, and other page graphics.\nDefaults to the active\nbrowser tab, or the last-used browser tab when hidden. Accepts a session_id\nfrom browser_tabs. Action coordinates are pixels in the returned image.",
+    "operationId": "browser_screenshot",
+    "parameters": [
+     {
+      "in": "query",
+      "name": "session_id",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maxLength": 128,
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Session Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Capture a Browser tab image",
+    "tags": [
+     "browser"
+    ]
+   }
+  },
+  "/browser/snapshot": {
+   "get": {
+    "description": "Return the page's accessibility tree with text, roles, values, states, and\nelement refs such as @e1 for browser_action. Defaults to the active browser tab,\nor the last-used browser tab when hidden. Accepts a session_id from browser_tabs.",
+    "operationId": "browser_snapshot",
+    "parameters": [
+     {
+      "in": "query",
+      "name": "session_id",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maxLength": 128,
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Session Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Read the current Browser tab",
+    "tags": [
+     "browser"
+    ]
+   }
+  },
+  "/browser/tabs": {
+   "get": {
+    "description": "List this user's open browser tabs in this chat, including their session IDs,\nURLs, titles, and modes. The selected tab is the active browser tab, or the\nlast-used browser tab when hidden.",
+    "operationId": "browser_tabs",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "List the user's open Browser tabs",
+    "tags": [
+     "browser"
+    ]
+   }
+  },
+  "/execute": {
+   "get": {
+    "description": "Returns tracked processes for the current user and chat, including running, done, and killed.",
+    "operationId": "list_processes",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "List running commands"
+   },
+   "post": {
+    "description": "Run a shell command in the background and return a command ID.\n\nThis system is running Linux 6.18.44-fc-v880 (x86_64) on vm as user 'unknown' with /bin/bash. Python 3.13.18 is available.",
+    "operationId": "run_command",
+    "parameters": [
+     {
+      "description": "Seconds to wait for the command to finish before returning. If the command completes in time, output is included inline. Null to return immediately.",
+      "in": "query",
+      "name": "wait",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maximum": 300,
+         "minimum": 0,
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Seconds to wait for the command to finish before returning. If the command completes in time, output is included inline. Null to return immediately.",
+       "title": "Wait"
+      }
+     },
+     {
+      "description": "Return only the last N output entries. Useful to limit response size when only recent output matters.",
+      "in": "query",
+      "name": "tail",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "minimum": 1,
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Return only the last N output entries. Useful to limit response size when only recent output matters.",
+       "title": "Tail"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ExecRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Execute a command"
+   }
+  },
+  "/execute/{process_id}": {
+   "delete": {
+    "description": "Terminate the process. Sends SIGTERM by default for graceful shutdown. Use force=true to send SIGKILL.",
+    "operationId": "kill_process",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "process_id",
+      "required": true,
+      "schema": {
+       "title": "Process Id",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Send SIGKILL instead of SIGTERM.",
+      "in": "query",
+      "name": "force",
+      "required": false,
+      "schema": {
+       "default": false,
+       "description": "Send SIGKILL instead of SIGTERM.",
+       "title": "Force",
+       "type": "boolean"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "Process not found."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Kill a running command"
+   }
+  },
+  "/execute/{process_id}/input": {
+   "post": {
+    "description": "Write text to the process's stdin. Include newline characters as needed.",
+    "operationId": "send_process_input",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "process_id",
+      "required": true,
+      "schema": {
+       "title": "Process Id",
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/InputRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "400": {
+      "description": "Process has already exited or stdin is closed."
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "Process not found."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Send input to a running command"
+   }
+  },
+  "/execute/{process_id}/status": {
+   "get": {
+    "description": "Returns new output since the given offset, process status, and exit code. Reads do not consume output; each reader keeps its own offset.",
+    "operationId": "get_process_status",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "process_id",
+      "required": true,
+      "schema": {
+       "title": "Process Id",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Seconds to wait for the process to finish before returning. Returns early if the process exits. Null to return immediately.",
+      "in": "query",
+      "name": "wait",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "maximum": 300,
+         "minimum": 0,
+         "type": "number"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Seconds to wait for the process to finish before returning. Returns early if the process exits. Null to return immediately.",
+       "title": "Wait"
+      }
+     },
+     {
+      "description": "Number of output entries to skip. Use next_offset from the previous response to get only new output.",
+      "in": "query",
+      "name": "offset",
+      "required": false,
+      "schema": {
+       "default": 0,
+       "description": "Number of output entries to skip. Use next_offset from the previous response to get only new output.",
+       "minimum": 0,
+       "title": "Offset",
+       "type": "integer"
+      }
+     },
+     {
+      "description": "Return only the last N output entries. Useful to limit response size when only recent output matters.",
+      "in": "query",
+      "name": "tail",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "minimum": 1,
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Return only the last N output entries. Useful to limit response size when only recent output matters.",
+       "title": "Tail"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "Process not found."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Get command status and output"
+   }
+  },
+  "/files/display": {
+   "get": {
+    "description": "Open a file in the user's file viewer so they can see it. Use this when the user wants to view or look at a file. This does not return file content to you \u2014 use read_file if you need to read the content yourself.",
+    "operationId": "display_file",
+    "parameters": [
+     {
+      "description": "Absolute path to the file to display.",
+      "in": "query",
+      "name": "path",
+      "required": true,
+      "schema": {
+       "description": "Absolute path to the file to display.",
+       "title": "Path",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Display a file to the user"
+   }
+  },
+  "/files/glob": {
+   "get": {
+    "description": "Search for files and subdirectories by name within a specified directory using glob patterns. Results will include the relative path, type, size, and modification time.",
+    "operationId": "glob_search",
+    "parameters": [
+     {
+      "description": "Glob pattern to search for (e.g. '*.py').",
+      "in": "query",
+      "name": "pattern",
+      "required": true,
+      "schema": {
+       "description": "Glob pattern to search for (e.g. '*.py').",
+       "title": "Pattern",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Directory to search within.",
+      "in": "query",
+      "name": "path",
+      "required": false,
+      "schema": {
+       "default": ".",
+       "description": "Directory to search within.",
+       "title": "Path",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Glob patterns to exclude from search results.",
+      "in": "query",
+      "name": "exclude",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "items": {
+          "type": "string"
+         },
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Glob patterns to exclude from search results.",
+       "title": "Exclude"
+      }
+     },
+     {
+      "description": "Type filter: 'file', 'directory', or 'any'.",
+      "in": "query",
+      "name": "type",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "pattern": "^(file|directory|any)$",
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": "any",
+       "description": "Type filter: 'file', 'directory', or 'any'.",
+       "title": "Type"
+      }
+     },
+     {
+      "description": "Maximum number of matches to return.",
+      "in": "query",
+      "name": "max_results",
+      "required": false,
+      "schema": {
+       "default": 50,
+       "description": "Maximum number of matches to return.",
+       "maximum": 500,
+       "minimum": 1,
+       "title": "Max Results",
+       "type": "integer"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "Search directory not found."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Search files by name"
+   }
+  },
+  "/files/grep": {
+   "get": {
+    "description": "Search for a text pattern across files in a directory. Returns structured matches with file paths, line numbers, and matching lines. Skips binary files.",
+    "operationId": "grep_search",
+    "parameters": [
+     {
+      "description": "Text or regex pattern to search for.",
+      "in": "query",
+      "name": "query",
+      "required": true,
+      "schema": {
+       "description": "Text or regex pattern to search for.",
+       "title": "Query",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Directory or file to search in.",
+      "in": "query",
+      "name": "path",
+      "required": false,
+      "schema": {
+       "default": ".",
+       "description": "Directory or file to search in.",
+       "title": "Path",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Use regex. Set false for literal search.",
+      "in": "query",
+      "name": "regex",
+      "required": false,
+      "schema": {
+       "default": true,
+       "description": "Use regex. Set false for literal search.",
+       "title": "Regex",
+       "type": "boolean"
+      }
+     },
+     {
+      "description": "Perform case-insensitive matching.",
+      "in": "query",
+      "name": "case_insensitive",
+      "required": false,
+      "schema": {
+       "default": false,
+       "description": "Perform case-insensitive matching.",
+       "title": "Case Insensitive",
+       "type": "boolean"
+      }
+     },
+     {
+      "description": "Glob patterns to filter files (e.g. '*.py'). Files must match at least one pattern.",
+      "in": "query",
+      "name": "include",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "items": {
+          "type": "string"
+         },
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Glob patterns to filter files (e.g. '*.py'). Files must match at least one pattern.",
+       "title": "Include"
+      }
+     },
+     {
+      "description": "If true, return each matching line with line numbers. If false, return only the names of matching files.",
+      "in": "query",
+      "name": "match_per_line",
+      "required": false,
+      "schema": {
+       "default": true,
+       "description": "If true, return each matching line with line numbers. If false, return only the names of matching files.",
+       "title": "Match Per Line",
+       "type": "boolean"
+      }
+     },
+     {
+      "description": "Maximum number of matches to return.",
+      "in": "query",
+      "name": "max_results",
+      "required": false,
+      "schema": {
+       "default": 50,
+       "description": "Maximum number of matches to return.",
+       "maximum": 500,
+       "minimum": 1,
+       "title": "Max Results",
+       "type": "integer"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "400": {
+      "description": "Invalid regex pattern."
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "Search path not found."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Search file contents"
+   }
+  },
+  "/files/list": {
+   "get": {
+    "description": "Return a structured listing of files and directories at the given path.",
+    "operationId": "list_files",
+    "parameters": [
+     {
+      "description": "Directory path to list.",
+      "in": "query",
+      "name": "directory",
+      "required": false,
+      "schema": {
+       "default": ".",
+       "description": "Directory path to list.",
+       "title": "Directory",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "Directory not found."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "List directory contents"
+   }
+  },
+  "/files/matches": {
+   "get": {
+    "description": "Search files and directories by ranked name, path, and content matches.",
+    "operationId": "match_files",
+    "parameters": [
+     {
+      "description": "Literal text to match.",
+      "in": "query",
+      "name": "query",
+      "required": true,
+      "schema": {
+       "description": "Literal text to match.",
+       "title": "Query",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Directory to search within.",
+      "in": "query",
+      "name": "path",
+      "required": false,
+      "schema": {
+       "default": ".",
+       "description": "Directory to search within.",
+       "title": "Path",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Include hidden dotfiles and dot-directories.",
+      "in": "query",
+      "name": "show_hidden",
+      "required": false,
+      "schema": {
+       "default": false,
+       "description": "Include hidden dotfiles and dot-directories.",
+       "title": "Show Hidden",
+       "type": "boolean"
+      }
+     },
+     {
+      "description": "Result offset.",
+      "in": "query",
+      "name": "offset",
+      "required": false,
+      "schema": {
+       "default": 0,
+       "description": "Result offset.",
+       "minimum": 0,
+       "title": "Offset",
+       "type": "integer"
+      }
+     },
+     {
+      "description": "Maximum number of results to return.",
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "default": 100,
+       "description": "Maximum number of results to return.",
+       "maximum": 100,
+       "minimum": 1,
+       "title": "Limit",
+       "type": "integer"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "400": {
+      "description": "Blank query."
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "Search directory not found."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Search files by name and contents"
+   }
+  },
+  "/files/read": {
+   "get": {
+    "description": "Read a file and return its contents. Supports text files and images (PNG, JPEG, WebP, etc.). For text files you can optionally request a specific line range. Images are returned as binary so you can view and analyze them directly. Use display_file to show a file to the user.",
+    "operationId": "read_file",
+    "parameters": [
+     {
+      "description": "Path to the file to read.",
+      "in": "query",
+      "name": "path",
+      "required": true,
+      "schema": {
+       "description": "Path to the file to read.",
+       "title": "Path",
+       "type": "string"
+      }
+     },
+     {
+      "description": "First line to return (1-indexed, inclusive). Defaults to the beginning of the file.",
+      "in": "query",
+      "name": "start_line",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "minimum": 1,
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "First line to return (1-indexed, inclusive). Defaults to the beginning of the file.",
+       "title": "Start Line"
+      }
+     },
+     {
+      "description": "Last line to return (1-indexed, inclusive). Defaults to the end of the file.",
+      "in": "query",
+      "name": "end_line",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "minimum": 1,
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "description": "Last line to return (1-indexed, inclusive). Defaults to the end of the file.",
+       "title": "End Line"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "File not found."
+     },
+     "415": {
+      "description": "Unsupported binary file type."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Read a file"
+   }
+  },
+  "/files/replace": {
+   "post": {
+    "description": "Find and replace exact strings in a file. Supports multiple replacements in one call with optional line range narrowing.",
+    "operationId": "replace_file_content",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ReplaceRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "400": {
+      "description": "Target string not found or ambiguous match."
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "File not found."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Replace content in a file"
+   }
+  },
+  "/files/search": {
+   "get": {
+    "description": "Search for files and subdirectories by ranked filename match.",
+    "operationId": "search_files",
+    "parameters": [
+     {
+      "description": "Filename search term.",
+      "in": "query",
+      "name": "query",
+      "required": false,
+      "schema": {
+       "default": "",
+       "description": "Filename search term.",
+       "title": "Query",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Directory to search within.",
+      "in": "query",
+      "name": "path",
+      "required": false,
+      "schema": {
+       "default": ".",
+       "description": "Directory to search within.",
+       "title": "Path",
+       "type": "string"
+      }
+     },
+     {
+      "description": "Maximum number of matches to return.",
+      "in": "query",
+      "name": "limit",
+      "required": false,
+      "schema": {
+       "default": 20,
+       "description": "Maximum number of matches to return.",
+       "maximum": 100,
+       "minimum": 1,
+       "title": "Limit",
+       "type": "integer"
+      }
+     },
+     {
+      "description": "Type filter: 'file', 'directory', or 'any'.",
+      "in": "query",
+      "name": "type",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "pattern": "^(file|directory|any)$",
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": "any",
+       "description": "Type filter: 'file', 'directory', or 'any'.",
+       "title": "Type"
+      }
+     },
+     {
+      "description": "Include hidden dotfiles and dot-directories.",
+      "in": "query",
+      "name": "show_hidden",
+      "required": false,
+      "schema": {
+       "default": false,
+       "description": "Include hidden dotfiles and dot-directories.",
+       "title": "Show Hidden",
+       "type": "boolean"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "404": {
+      "description": "Search directory not found."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Search files by name"
+   }
+  },
+  "/files/write": {
+   "post": {
+    "description": "Write text content to a file. Creates parent directories automatically. Overwrites if the file already exists.",
+    "operationId": "write_file",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/WriteRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Invalid or missing API key."
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "security": [
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "summary": "Write a file"
+   }
+  }
+ }
+}

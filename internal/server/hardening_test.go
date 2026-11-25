@@ -33,8 +33,9 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timeout: %s", what)
 }
 
-// A sandbox must not select the address of the tool calls of Open WebUI.
-func TestOpenAPIDocumentIsExamined(t *testing.T) {
+// A sandbox must not select the address of the tool calls of Open WebUI,
+// and it must not put text into the tool list.
+func TestToolListComesFromWarren(t *testing.T) {
 	e := newEnv(t)
 	resp := e.request("GET", "/openapi.json", "alice", nil)
 	if resp.StatusCode != 200 {
@@ -52,6 +53,8 @@ func TestOpenAPIDocumentIsExamined(t *testing.T) {
 	if doc.Servers != nil || strings.Contains(text, "evil.example") {
 		t.Errorf("the document has an address of the sandbox: %s", text)
 	}
+	// The sandbox has three tools that warren knows. All other path keys
+	// of the sandbox are not in the result.
 	want := map[string]bool{"/execute": true, "/files/list": true, "/execute/{process_id}/status": true}
 	for key := range doc.Paths {
 		if !want[key] {
@@ -63,14 +66,36 @@ func TestOpenAPIDocumentIsExamined(t *testing.T) {
 			t.Errorf("the document lost the path key %q", key)
 		}
 	}
-	if op, _ := doc.Paths["/execute"]["post"].(map[string]any); op["operationId"] != "run_command" {
-		t.Errorf("the operation of /execute changed: %v", doc.Paths["/execute"])
+	// The sandbox has only POST on /execute. The text of the operation
+	// comes from warren.
+	if doc.Paths["/execute"]["get"] != nil {
+		t.Error("the document has an operation that the sandbox does not have")
 	}
-	if doc.Info["title"] != "t" {
-		t.Error("the document lost its info object")
+	if op, _ := doc.Paths["/execute"]["post"].(map[string]any); op["operationId"] == "run_command" && op["description"] == nil {
+		t.Errorf("the operation of /execute comes from the sandbox: %v", op)
+	}
+	if doc.Info["title"] != "Open Terminal" {
+		t.Errorf("the info object comes from the sandbox: %v", doc.Info)
 	}
 	if got := e.alice.last().Header.Get("Authorization"); got != "Bearer pod-key-alice" {
 		t.Errorf("the request for the document had the key %q", got)
+	}
+
+	// A sandbox that is not ready: warren sends its complete tool list
+	// immediately. Open WebUI stops the chat turn after 10 seconds.
+	start := time.Now()
+	resp = e.request("GET", "/openapi.json", "carol", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("sandbox not ready: status = %d", resp.StatusCode)
+	}
+	if err := json.Unmarshal([]byte(body(t, resp)), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Paths) < 10 || doc.Paths["/files/read"] == nil {
+		t.Errorf("sandbox not ready: the tool list has %d paths", len(doc.Paths))
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("sandbox not ready: the tool list came after %v", d)
 	}
 }
 
