@@ -229,7 +229,7 @@ func TestTemplateShowsThePolicySettings(t *testing.T) {
 		"name": "Tuned", "scope": "chat", "image": "registry.example/tuned:2",
 		// Open WebUI reads the CPU limit as a decimal number.
 		"cpu_limit": "0.5", "memory_limit": "3Gi", "storage": "1Gi",
-		"network_profile": nil, "env": nil,
+		"network_profile": "internet", "env": nil,
 	}
 	for key, w := range want {
 		if got, ok := data[key]; !ok || got != w {

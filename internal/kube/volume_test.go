@@ -797,7 +797,7 @@ func TestPolicySettingsAreInThePod(t *testing.T) {
 	for _, v := range c.Env {
 		names = append(names, v.Name)
 	}
-	if got := strings.Join(names, ","); got != "OPEN_TERMINAL_API_KEY,OPEN_TERMINAL_ISOLATED,OPEN_TERMINAL_MULTI_USER,ALPHA,OPEN_TERMINAL_EXECUTE_TIMEOUT,ZED" {
+	if got := strings.Join(names, ","); got != "OPEN_TERMINAL_API_KEY,HOME,OPEN_TERMINAL_ISOLATED,OPEN_TERMINAL_MULTI_USER,ALPHA,OPEN_TERMINAL_EXECUTE_TIMEOUT,ZED" {
 		t.Errorf("variables = %s", got)
 	}
 	if pod.Spec.NodeSelector["pool"] != "sandboxes" || len(pod.Spec.Tolerations) != 1 || pod.Spec.Tolerations[0].Key != "dedicated" {
@@ -943,13 +943,10 @@ policies:
 	if e.m.pod(kept.Ref.Name()) == nil {
 		t.Error("the reaper stopped a pod that has a policy")
 	}
-	// A pod with an open connection stays until the connection closes.
-	if e.m.pod(templateRef("quick", "alice").Ref.Name()) == nil {
-		t.Fatal("the reaper stopped a pod with an open connection")
-	}
-	open.Release()
-	e.m.Reap(context.Background())
+	// A pod with an open connection also stops. An open terminal must not
+	// keep the sandbox of a policy that the administrator removed.
 	waitFor(t, "stop of the pod with no policy", func() bool { return e.m.pod(templateRef("quick", "alice").Ref.Name()) == nil })
+	open.Release()
 	// Warren keeps the volumes that have no policy.
 	e.clock.Advance(10000 * time.Hour)
 	e.m.Reap(context.Background())

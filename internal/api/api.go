@@ -148,6 +148,7 @@ func (h *Handler) toTemplate(p policy.Policy) template {
 		size := p.Storage.Size.DeepCopy()
 		t.Data.Storage = text(size.String())
 	}
+	t.Data.NetworkProfile = text(p.Network.Profile())
 	return t
 }
 
@@ -173,7 +174,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, http.MethodGet) {
 			return
 		}
-		httpx.WriteJSON(w, http.StatusOK, status{NetworkProfiles: []string{}})
+		// The names of the network settings that a template can show.
+		httpx.WriteJSON(w, http.StatusOK, status{NetworkProfiles: []string{"internet", "none", "custom"}})
 
 	case path == templatesPath:
 		if r.Method == http.MethodPost {

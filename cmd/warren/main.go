@@ -58,7 +58,19 @@ type config struct {
 	maxVolumes       int
 	maxVolumesTotal  int
 	volumeDelay      time.Duration
-	openAPIFile      string
+
+	warrenNamespace string
+	warrenPodLabels string
+	ingressCIDRs    string
+	dnsNamespace    string
+	dnsPodLabels    string
+	dnsCIDRs        string
+	blockedCIDRs    string
+	dnsPorts        string
+	acceptedNP      string
+	allowOtherPods  bool
+	skipNetworkTest bool
+	openAPIFile     string
 }
 
 // defaultImage is the image variant of Open Terminal that needs no root
@@ -75,6 +87,12 @@ func envDuration(name string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %q is not a duration", name, v)
 	}
 	return d, nil
+}
+
+// envBool returns true if an environment variable has a true value.
+func envBool(name string) bool {
+	b, _ := strconv.ParseBool(os.Getenv(name))
+	return b
 }
 
 func envInt(name string, def int) (int, error) {
@@ -151,6 +169,17 @@ func parseFlags(args []string) (config, error) {
 	fs.IntVar(&c.maxVolumes, "max-volumes-per-user", maxVolumes, "maximum number of volumes of the chat scope and the model scope that one user can have (0 = no limit)")
 	fs.IntVar(&c.maxVolumesTotal, "max-volumes", maxVolumesTotal, "maximum number of volumes (0 = no limit)")
 	fs.DurationVar(&c.volumeDelay, "volume-delete-delay", volumeDelay, "after a start of warren, delete no volume for this time")
+	fs.StringVar(&c.warrenNamespace, "warren-namespace", envDefault("WARREN_NAMESPACE", ownNamespace()), "namespace of the warren pods (the default is the namespace of this pod)")
+	fs.StringVar(&c.warrenPodLabels, "warren-pod-labels", envDefault("WARREN_POD_LABELS", "app.kubernetes.io/name=warren"), "labels of the warren pods, as key=value with commas. Only these pods can connect to a sandbox.")
+	fs.StringVar(&c.ingressCIDRs, "ingress-cidrs", envDefault("WARREN_INGRESS_CIDRS", ""), "more networks that can connect to a sandbox, with commas (for a warren that is not a pod)")
+	fs.StringVar(&c.dnsNamespace, "dns-namespace", envDefault("WARREN_DNS_NAMESPACE", "kube-system"), "namespace of the DNS pods of the cluster")
+	fs.StringVar(&c.dnsPodLabels, "dns-pod-labels", envDefault("WARREN_DNS_POD_LABELS", "k8s-app=kube-dns"), "labels of the DNS pods of the cluster, as key=value with commas")
+	fs.StringVar(&c.dnsCIDRs, "dns-cidrs", envDefault("WARREN_DNS_CIDRS", ""), "more DNS servers that a sandbox can use, as networks with commas (for example a DNS cache on each node)")
+	fs.StringVar(&c.dnsPorts, "dns-ports", envDefault("WARREN_DNS_PORTS", "53"), "ports of the DNS pods of the cluster, with commas (5353 on OpenShift)")
+	fs.StringVar(&c.acceptedNP, "accepted-network-policies", envDefault("WARREN_ACCEPTED_NETWORK_POLICIES", ""), "names of network policies in the sandbox namespace that warren did not make and that you accept, with commas. A different policy stops the start of sandboxes.")
+	fs.BoolVar(&c.allowOtherPods, "allow-other-pods", envBool("WARREN_ALLOW_OTHER_PODS"), "let warren stop all connections in a sandbox namespace that has pods of a different owner (not recommended)")
+	fs.BoolVar(&c.skipNetworkTest, "skip-network-policy-test", envBool("WARREN_SKIP_NETWORK_POLICY_TEST"), "do not test if the cluster applies network policies (not recommended)")
+	fs.StringVar(&c.blockedCIDRs, "egress-blocked-cidrs", envDefault("WARREN_EGRESS_BLOCKED_CIDRS", ""), "more networks that a sandbox with internet access must not get to, with commas (for example public addresses of the nodes)")
 	fs.DurationVar(&c.shutdownDelay, "shutdown-delay", shutdownDelay, "after a stop signal, continue to serve for this time, until Kubernetes sends no more requests")
 	fs.StringVar(&c.openAPIFile, "openapi-file", envDefault("WARREN_OPENAPI_FILE", ""), "OpenAPI document for the tool list (the default is the document of Open Terminal 0.18.1)")
 	fs.StringVar(&c.listen, "listen", envDefault("WARREN_LISTEN", ":8080"), "address for Open WebUI traffic")
@@ -217,7 +246,37 @@ func kubeBackend(c config, policies *policy.Store, logger *slog.Logger, m *metri
 	if err != nil {
 		return nil, fmt.Errorf("client for Kubernetes: %w", err)
 	}
-	return kube.New(kube.Config{
+	podLabels, err := parseLabels(c.warrenPodLabels)
+	if err != nil {
+		return nil, fmt.Errorf("--warren-pod-labels: %w", err)
+	}
+	dnsLabels, err := parseLabels(c.dnsPodLabels)
+	if err != nil {
+		return nil, fmt.Errorf("--dns-pod-labels: %w", err)
+	}
+	var dnsPorts []int32
+	for _, item := range splitList(c.dnsPorts) {
+		n, err := strconv.Atoi(item)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("--dns-ports: %q is not a port number", item)
+		}
+		dnsPorts = append(dnsPorts, int32(n))
+	}
+	network := kube.NetworkConfig{
+		WarrenNamespace:      c.warrenNamespace,
+		WarrenPodLabels:      podLabels,
+		IngressCIDRs:         splitList(c.ingressCIDRs),
+		DNSNamespace:         c.dnsNamespace,
+		DNSPodLabels:         dnsLabels,
+		DNSCIDRs:             splitList(c.dnsCIDRs),
+		DNSPorts:             dnsPorts,
+		BlockedCIDRs:         splitList(c.blockedCIDRs),
+		AcceptedPolicies:     splitList(c.acceptedNP),
+		AllowOtherPods:       c.allowOtherPods,
+		SkipEnforcementCheck: c.skipNetworkTest,
+	}
+	manager, err := kube.New(kube.Config{
+		Network:           network,
 		Client:            client,
 		Namespace:         c.sandboxNamespace,
 		Image:             c.sandboxImage,
@@ -232,6 +291,77 @@ func kubeBackend(c config, policies *policy.Store, logger *slog.Logger, m *metri
 		Logger:            logger,
 		Metrics:           m,
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Examine the pod of warren itself. The host name of a pod is its name.
+	podName := ""
+	if c.kubeconfig == "" {
+		podName, _ = os.Hostname()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// The namespace of this pod, also when the flag has a different value.
+	// With a kubeconfig file, warren can manage a different cluster.
+	if own := ownNamespace(); c.kubeconfig == "" && own != "" && own == c.sandboxNamespace {
+		return nil, fmt.Errorf("warren operates in the sandbox namespace %q. The sandboxes must have a namespace of their own", own)
+	}
+	missing, err := kube.MissingPermissions(ctx, client, c.sandboxNamespace)
+	switch {
+	case err != nil:
+		logger.Warn("warren cannot examine its permissions in the sandbox namespace", "error", err.Error())
+	case len(missing) > 0:
+		return nil, fmt.Errorf("the service account of warren has not all necessary permissions in the namespace %s. Absent: %s",
+			c.sandboxNamespace, strings.Join(missing, ", "))
+	}
+	if err := kube.SelfCheck(ctx, client, podName, network, os.Getenv("KUBERNETES_SERVICE_HOST"), logger); err != nil {
+		return nil, err
+	}
+	if c.skipNetworkTest {
+		logger.Warn("warren does not test if the cluster applies network policies. On a cluster that ignores them, the sandboxes have no network isolation.")
+	}
+	return manager, nil
+}
+
+// namespaceFile has the namespace of a pod. Kubernetes mounts it with the
+// token of the service account.
+const namespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// ownNamespace returns the namespace of this pod, or an empty text if
+// warren is not a pod.
+func ownNamespace() string {
+	data, err := os.ReadFile(namespaceFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// splitList reads a list with commas. Empty items are ignored.
+func splitList(s string) []string {
+	var out []string
+	for _, item := range strings.Split(s, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// parseLabels reads labels in the form key=value with commas.
+func parseLabels(s string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, item := range splitList(s) {
+		key, value, found := strings.Cut(item, "=")
+		if !found || key == "" || value == "" {
+			return nil, fmt.Errorf("%q is not a label in the form key=value", item)
+		}
+		if _, dup := out[key]; dup {
+			return nil, fmt.Errorf("the label %q occurs two times", key)
+		}
+		out[key] = value
+	}
+	return out, nil
 }
 
 func devBackend(c config, logger *slog.Logger) (backend.Backend, error) {
@@ -493,9 +623,11 @@ func run(args []string) error {
 			return
 		}
 		// Warren is ready when it knows the sandboxes of the cluster.
-		if manager != nil && !manager.Ready() {
-			http.Error(w, "the sandbox cache is not ready", http.StatusServiceUnavailable)
-			return
+		if manager != nil {
+			if reason := manager.NotReadyReason(); reason != "" {
+				http.Error(w, reason, http.StatusServiceUnavailable)
+				return
+			}
 		}
 		ok(w, r)
 	})

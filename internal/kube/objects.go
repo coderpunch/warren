@@ -31,9 +31,13 @@ const (
 	// LabelOwner is a digest of the ID of the user that started the
 	// sandbox. A label cannot contain all characters of a user ID.
 	LabelOwner = prefix + "/owner"
-	// LabelSandbox is the name of the sandbox. A Secret has this label,
-	// because the name of a Secret has a random part.
+	// LabelSandbox is the name of the sandbox. A Secret and a network
+	// policy have this label, because their names have a random part.
 	LabelSandbox = prefix + "/sandbox"
+	// LabelStart is on a pod. Its value is the name of the Secret and of
+	// the network policy of that start of the sandbox. The network policy
+	// selects its pod with this label.
+	LabelStart = prefix + "/start"
 
 	// AnnotationContext is the context ID, for example "user:1234".
 	AnnotationContext = prefix + "/context-id"
@@ -44,6 +48,9 @@ const (
 	// AnnotationIdleTimeout is the idle time of the policy at the start of
 	// the pod. A pod without it uses the idle time of warren.
 	AnnotationIdleTimeout = prefix + "/idle-timeout"
+	// AnnotationNetwork is on a network policy. It has the network settings
+	// of the sandbox policy from which warren made the network policy.
+	AnnotationNetwork = prefix + "/network"
 	// AnnotationUnusedSince is on a volume. It is the time at which warren
 	// found that no sandbox uses the volume, in RFC 3339 form.
 	AnnotationUnusedSince = prefix + "/unused-since"
@@ -63,7 +70,22 @@ const (
 	// of the sandbox is a member of this group, thus it can write to the
 	// volume with each user ID.
 	volumeGroup = 1001
+	// defaultUser is the user ID of the processes of a sandbox, for a
+	// policy that sets no user ID. It is the user of the default image. The
+	// server of Open Terminal operates with each user ID.
+	defaultUser = 1001
+
+	// defaultDenyName is the name of the network policy that refuses all
+	// connections of all pods in the sandbox namespace.
+	defaultDenyName = "warren-default-deny"
 )
+
+// defaultCommand starts the server of the default image. It does not use
+// the entry point of the image, and it does not look for a program in PATH:
+// the home directory of a sandbox is in PATH, and its user can write to it.
+// The option -I makes Python ignore the modules of the home directory and
+// the PYTHON variables.
+var defaultCommand = []string{"/usr/bin/tini", "--", "/usr/local/bin/python3", "-I", "-u", "-m", "open_terminal"}
 
 // managedSelector selects the objects that warren made.
 const managedSelector = LabelManagedBy + "=" + ManagedByValue
@@ -184,12 +206,16 @@ func (m *Manager) buildVolume(name string, req backend.Request, pol policy.Polic
 
 // reservedVariables are the variables that warren sets. The policy file
 // cannot set them (internal/policy). This is a second protection.
-var reservedVariables = map[string]bool{keyVariable: true, "OPEN_TERMINAL_ISOLATED": true, "OPEN_TERMINAL_MULTI_USER": true}
+var reservedVariables = map[string]bool{keyVariable: true, "HOME": true, "OPEN_TERMINAL_ISOLATED": true, "OPEN_TERMINAL_MULTI_USER": true}
 
 func (m *Manager) buildPod(name, secretName string, req backend.Request, pol policy.Policy) *corev1.Pod {
-	no := false
+	no, yes := false, true
 	grace := int64(10)
 	group := int64(volumeGroup)
+	user := int64(defaultUser)
+	if pol.RunAsUser != nil {
+		user = *pol.RunAsUser
+	}
 	onMismatch := corev1.FSGroupChangeOnRootMismatch
 	port := intstr.FromInt32(terminalPort)
 	probe := func() *corev1.ProbeHandler {
@@ -218,6 +244,10 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request, pol pol
 				Key:                  secretKeyName,
 			},
 		}},
+		// The home directory does not depend on the image and on the user
+		// ID. A user ID with no entry in the user file of the image has no
+		// home directory.
+		{Name: "HOME", Value: homePath},
 		// Ignore the configuration files, which the user can write.
 		{Name: "OPEN_TERMINAL_ISOLATED", Value: "true"},
 		// One pod for each scope key gives the isolation.
@@ -254,11 +284,19 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request, pol pol
 		}
 	}
 
+	podLabels := labels(req)
+	podLabels[LabelSandbox] = name
+	podLabels[LabelStart] = secretName
+	command := defaultCommand
+	if pol.Command != nil {
+		command = pol.Command
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Namespace:   m.cfg.Namespace,
-			Labels:      labels(req),
+			Labels:      podLabels,
 			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{
@@ -270,9 +308,20 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request, pol pol
 			EnableServiceLinks:           &no,
 			NodeSelector:                 pol.NodeSelector,
 			Tolerations:                  pol.Tolerations,
+			// These settings are the "restricted" Pod Security Standard.
+			// They are the same for all sandboxes. A policy cannot make
+			// them weaker.
 			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot: &yes,
+				// The user and the group are numbers, thus they do not
+				// depend on the image. The group is not the group 0 of the
+				// node. A container runtime does not accept a group with no
+				// user.
+				RunAsUser:           &user,
+				RunAsGroup:          &group,
 				FSGroup:             &group,
 				FSGroupChangePolicy: &onMismatch,
+				SeccompProfile:      &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			Volumes: []corev1.Volume{
 				home,
@@ -284,6 +333,15 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request, pol pol
 				Name:            containerName,
 				Image:           image,
 				ImagePullPolicy: pol.ImagePullPolicy,
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &no,
+					Privileged:               &no,
+					// The sandbox can write only to its home directory and
+					// to the temporary directory.
+					ReadOnlyRootFilesystem: &yes,
+					Capabilities:           &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				},
+				Command: command,
 				// The address and the port are on the command line. If
 				// not, a configuration file in the home directory can
 				// change them (docs/open-terminal-api.md, section 2.1).
@@ -322,6 +380,10 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request, pol pol
 	if pol.RuntimeClassName != "" {
 		class := pol.RuntimeClassName
 		pod.Spec.RuntimeClassName = &class
+	}
+	if pol.UserNamespace != nil && *pol.UserNamespace {
+		// The pod gets its own range of user IDs on the node.
+		pod.Spec.HostUsers = &no
 	}
 	return pod
 }

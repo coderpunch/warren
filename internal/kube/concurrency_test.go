@@ -117,6 +117,8 @@ func TestStartPastItsTimeLimitRemovesItsVolume(t *testing.T) {
 			reply(http.StatusCreated, `{"kind":"PersistentVolumeClaim","apiVersion":"v1","metadata":{"name":"`+name+`","namespace":"`+testNamespace+`","uid":"volume-1"}}`)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/secrets"):
 			reply(http.StatusCreated, `{"kind":"Secret","apiVersion":"v1","metadata":{"name":"s","namespace":"`+testNamespace+`","uid":"secret-1"}}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/networkpolicies"):
+			reply(http.StatusCreated, `{"kind":"NetworkPolicy","apiVersion":"networking.k8s.io/v1","metadata":{"name":"s","namespace":"`+testNamespace+`","uid":"policy-1"}}`)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/pods"):
 			// An admission webhook that does not answer.
 			select {
@@ -139,6 +141,7 @@ func TestStartPastItsTimeLimitRemovesItsVolume(t *testing.T) {
 		Namespace: testNamespace,
 		Image:     "example.test/terminal:1",
 		Policies:  policy.NewStore(testPolicies(t)),
+		Network:   NetworkConfig{WarrenNamespace: "warren-system", WarrenPodLabels: map[string]string{"app": "warren"}},
 		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
@@ -163,6 +166,16 @@ func TestStartPastItsTimeLimitRemovesItsVolume(t *testing.T) {
 	}
 	if !deleted {
 		t.Errorf("the start passed its time limit and sent no delete request for the volume that it made: %v", calls)
+	}
+	// The Secret and the network policy of the start must also go away.
+	deletes := 0
+	for _, c := range calls {
+		if strings.HasPrefix(c, "DELETE ") && (strings.Contains(c, "/secrets/") || strings.Contains(c, "/networkpolicies/")) {
+			deletes++
+		}
+	}
+	if deletes != 2 {
+		t.Errorf("delete requests for the Secret and the network policy = %d, want 2: %v", deletes, calls)
 	}
 }
 

@@ -90,13 +90,20 @@ func newTestEnv(t *testing.T, mod func(*Config)) *testEnv {
 	e.client.PrependReactor("create", "pods", stamp)
 	e.client.PrependReactor("create", "secrets", stamp)
 	e.client.PrependReactor("create", "persistentvolumeclaims", stamp)
+	e.client.PrependReactor("create", "networkpolicies", stamp)
 	e.strictVolumes()
 
 	cfg := Config{
-		Client:       e.client,
-		Namespace:    testNamespace,
-		Image:        "example.test/terminal:1",
-		Policies:     policy.NewStore(testPolicies(t)),
+		Client:    e.client,
+		Namespace: testNamespace,
+		Image:     "example.test/terminal:1",
+		Policies:  policy.NewStore(testPolicies(t)),
+		Network: NetworkConfig{
+			WarrenNamespace: "warren-system",
+			WarrenPodLabels: map[string]string{"app.kubernetes.io/name": "warren"},
+		},
+		CanaryPoll:   5 * time.Millisecond,
+		CanaryPause:  5 * time.Millisecond,
 		IdleTimeout:  30 * time.Minute,
 		StartTimeout: 5 * time.Minute,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -130,6 +137,14 @@ func (e *testEnv) newManager(cfg Config) *Manager {
 	e.t.Cleanup(cancel)
 	// Run the pod cache, but not the reaper timer. The tests call Reap.
 	m.factory.Start(ctx.Done())
+	// Run makes the network policy of the namespace before the first start.
+	if err := m.ensureDefaultDeny(ctx); err != nil {
+		e.t.Fatal(err)
+	}
+	// The tests of the pod lifecycle do not do the test of the network
+	// plugin. The canary tests do it.
+	m.enforcement.Store(enforcementProven)
+	m.otherPolicies.Store(0)
 	waitFor(e.t, "start of the pod cache", m.Ready)
 	// The simulated cluster does not keep events for a watch that starts
 	// later. Wait until the watch of this manager operates. A real API
@@ -176,6 +191,24 @@ policies:
   - {id: team, name: Team, scope: shared}
   - {id: quick, name: Quick, scope: user, idleTimeout: 2m, storage: {type: ephemeral}}
   - {id: never-idle, name: Never idle, scope: user, idleTimeout: 0, storage: {type: ephemeral}}
+  - {id: closed, name: Closed, scope: user, storage: {type: ephemeral}, network: {egress: none}}
+  - id: database
+    name: Database
+    scope: user
+    storage: {type: ephemeral}
+    network:
+      egress: none
+      dns: true
+      allow:
+        - {cidr: 10.30.1.0/24, ports: [5432]}
+        - {cidr: "2001:db8::/32"}
+  - id: other-image
+    name: Other image
+    scope: user
+    storage: {type: ephemeral}
+    command: ["/sbin/tini", "--", "/usr/local/bin/python3", "-m", "open_terminal"]
+    runAsUser: 1000
+    userNamespace: true
   - id: tuned
     name: Tuned
     scope: user

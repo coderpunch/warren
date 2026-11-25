@@ -97,13 +97,37 @@ func (m *Manager) lostVolume(pod *corev1.Pod, now time.Time) bool {
 // sandbox used for the retention time of their policy.
 func (m *Manager) Reap(ctx context.Context) {
 	now := m.now()
-	// live has the names of the Secrets that a pod uses.
+	// A person or a different program can delete or change the policy that
+	// refuses all connections in the sandbox namespace.
+	if err := m.ensureDefaultDeny(ctx); err != nil {
+		m.cfg.Logger.Error("warren cannot examine the network policy of the sandbox namespace", "error", err.Error())
+	}
+	// live has the names of the Secrets that a pod uses. The network policy
+	// of a pod has the same name.
 	live := map[string]bool{}
+	var pods []*corev1.Pod
+	previous := 0
+	defer func() {
+		if previous > 0 {
+			m.cfg.Logger.Warn("warren stopped sandboxes that a previous version of warren started. They had no network policy and not the security settings of this version. "+
+				"Their volumes stay. Files that were not on a volume are lost.", "sandboxes", previous)
+		}
+	}()
 	for _, obj := range m.informer.GetStore().List() {
 		pod := obj.(*corev1.Pod)
+		pods = append(pods, pod)
 		live[podSecretName(pod)] = true
 		if pod.DeletionTimestamp != nil {
 			m.forceDelete(ctx, pod, now)
+			continue
+		}
+		if pod.Labels[LabelStart] == "" {
+			// A previous version of warren made this pod. It has no network
+			// policy of its own, thus the policy of the namespace refuses
+			// all its connections, also the connections from warren.
+			if m.deletePod(ctx, pod, "no_network_policy", false) == nil {
+				previous++
+			}
 			continue
 		}
 
@@ -126,6 +150,7 @@ func (m *Manager) Reap(ctx context.Context) {
 		m.mu.Unlock()
 
 		m.warnUnschedulable(pod, now)
+		startError := m.startError(pod, now)
 		switch {
 		case podTerminal(pod):
 			_ = m.deletePod(ctx, pod, "failed", false)
@@ -134,10 +159,15 @@ func (m *Manager) Reap(ctx context.Context) {
 			// the user writes now is lost. Stop the pod, thus the next
 			// start makes a new volume.
 			_ = m.deletePod(ctx, pod, "volume_gone", false)
-		case leases == 0 && m.orphan(pod.Labels):
+		case m.orphan(pod.Labels):
 			// The policy of the pod is not in the file, or it has a
-			// different scope. No request can get to the pod.
-			_ = m.deletePod(ctx, pod, "no_policy", true)
+			// different scope. No new request can get to the pod. An open
+			// terminal would keep the pod and its network connections, thus
+			// warren does not wait for the end of the connections: the
+			// removal of a policy must stop its sandboxes.
+			_ = m.deletePod(ctx, pod, "no_policy", false)
+		case startError:
+			_ = m.deletePod(ctx, pod, "start_error", false)
 		case !podReady(pod) && now.Sub(notReadySince(pod)) > m.cfg.StartTimeout:
 			_ = m.deletePod(ctx, pod, "not_ready", false)
 		case podReady(pod) && leases == 0 && m.idleTimeout(pod) > 0 && now.Sub(last) > m.idleTimeout(pod):
@@ -148,6 +178,7 @@ func (m *Manager) Reap(ctx context.Context) {
 		}
 	}
 	m.deleteOrphanSecrets(ctx, live, now)
+	m.reconcileNetworkPolicies(ctx, pods, live)
 	m.reapVolumes(ctx, now)
 
 	// Remove the records that have nothing behind them.
@@ -272,6 +303,48 @@ func (m *Manager) warnUnschedulable(pod *corev1.Pod, now time.Time) {
 				"template", pod.Labels[LabelTemplate], "message", c.Message)
 		}
 	}
+}
+
+// startErrorAfter is the time after which warren stops a pod whose container
+// cannot start.
+const startErrorAfter = 2 * time.Minute
+
+// waitingErrors are the causes for which a container does not start, and
+// which do not go away. The usual cause is an image that does not agree with
+// the start command or the user ID of the policy. The second value tells if
+// warren stops the pod early: an image that Kubernetes cannot pull at this
+// time can come later.
+var waitingErrors = map[string]bool{
+	"CreateContainerConfigError": true, "CreateContainerError": true, "RunContainerError": true,
+	"CrashLoopBackOff": true, "InvalidImageName": true, "ErrImageNeverPull": true,
+	"ErrImagePull": false, "ImagePullBackOff": false,
+}
+
+// startError writes one log record for a pod whose container cannot start.
+// Without the record, an administrator sees only a sandbox that is not
+// ready. It reports true when warren must stop the pod.
+func (m *Manager) startError(pod *corev1.Pod, now time.Time) bool {
+	for _, c := range pod.Status.ContainerStatuses {
+		w := c.State.Waiting
+		if c.Name != containerName || w == nil {
+			continue
+		}
+		stop, known := waitingErrors[w.Reason]
+		if !known {
+			continue
+		}
+		m.mu.Lock()
+		st := m.stateLocked(pod.Name)
+		logged := st.waiting == pod.UID
+		st.waiting = pod.UID
+		m.mu.Unlock()
+		if !logged {
+			m.cfg.Logger.Warn("the container of a sandbox cannot start. Examine the image, the command, and the user ID of the policy.",
+				"sandbox", pod.Name, "template", pod.Labels[LabelTemplate], "reason", w.Reason, "message", w.Message)
+		}
+		return stop && now.Sub(pod.CreationTimestamp.Time) > startErrorAfter
+	}
+	return false
 }
 
 // reapVolumes marks the volumes that no sandbox uses, and deletes a volume

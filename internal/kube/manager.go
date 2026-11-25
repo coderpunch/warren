@@ -14,10 +14,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -46,6 +48,8 @@ type Config struct {
 	Image string
 	// Policies gives the settings of a sandbox for its template ID.
 	Policies Policies
+	// Network has the data for the network policies of the sandboxes.
+	Network NetworkConfig
 	// IdleTimeout is the time after which warren stops a sandbox that had
 	// no use. Zero means that warren never stops an idle sandbox.
 	IdleTimeout time.Duration
@@ -76,6 +80,12 @@ type Config struct {
 
 	// Port is the port of Open Terminal in a pod. Tests change it.
 	Port int
+	// Dial opens one TCP connection, for the test of the network policies.
+	// Tests change it.
+	Dial func(ctx context.Context, address string) error
+	// CanaryInterval is the time between two tests of the network policies.
+	// CanaryPoll and CanaryPause are the wait times in one test.
+	CanaryInterval, CanaryPoll, CanaryPause time.Duration
 	// Verify makes sure that a key operates on a target. Tests change it.
 	Verify func(ctx context.Context, target backend.Target) error
 	// Now gives the time. Tests change it.
@@ -127,6 +137,11 @@ type state struct {
 	// request. It is empty when no delete is in progress.
 	deleting types.UID
 
+	// unreachable is the UID of a ready pod that warren could not use, and
+	// unreachableSince is the time of the first failure.
+	unreachable      types.UID
+	unreachableSince time.Time
+
 	// volumePending is true from a start request that makes a volume until
 	// the cache shows the volume. volumeScope is the scope of that start.
 	volumePending bool
@@ -137,6 +152,9 @@ type state struct {
 	// in deletion.
 	unschedulable types.UID
 	stuck         types.UID
+	// waiting is the UID of the pod for which warren wrote a log record,
+	// because its container cannot start.
+	waiting types.UID
 	// resetting is true while a reset operation runs. No start and no
 	// lease is possible in that time.
 	resetting bool
@@ -168,6 +186,21 @@ type Manager struct {
 	// volumesReported is the policy time for which warren wrote the log
 	// record about the volumes.
 	volumesReported time.Time
+	// networkReady is true after warren made sure one time that the sandbox
+	// namespace has the policy that refuses all connections.
+	networkReady atomic.Bool
+	// otherPolicies is the number of network policies in the sandbox
+	// namespace that warren did not make and that the configuration does
+	// not accept. It is -1 until warren examined the namespace.
+	otherPolicies atomic.Int32
+	// networkProblem is the text of the last problem with the network
+	// policies, for the readiness report.
+	networkProblem atomic.Value
+	// enforcement is the result of the test that shows whether the cluster
+	// applies network policies.
+	enforcement atomic.Int32
+	// lastCanary is the time of the last test.
+	lastCanary time.Time
 }
 
 // badKey is the record of pods of one sandbox that refused their key.
@@ -175,6 +208,10 @@ type badKey struct {
 	count int
 	last  time.Time
 }
+
+// unreachableLimit is the time after which warren stops a ready pod that it
+// cannot connect to.
+const unreachableLimit = 60 * time.Second
 
 // maxBadKeys is the number of pods in sequence that can refuse their key
 // before warren reports an error to the caller and waits before the next
@@ -195,6 +232,9 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.Client == nil || cfg.Namespace == "" || cfg.Image == "" || cfg.Policies == nil {
 		return nil, errors.New("kube: client, namespace, image, and policies are necessary")
 	}
+	if err := cfg.Network.validate(cfg.Namespace); err != nil {
+		return nil, err
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -206,6 +246,18 @@ func New(cfg Config) (*Manager, error) {
 	}
 	if cfg.Port == 0 {
 		cfg.Port = terminalPort
+	}
+	if cfg.Dial == nil {
+		cfg.Dial = dialTCP
+	}
+	if cfg.CanaryInterval <= 0 {
+		cfg.CanaryInterval = time.Hour
+	}
+	if cfg.CanaryPoll <= 0 {
+		cfg.CanaryPoll = time.Second
+	}
+	if cfg.CanaryPause <= 0 {
+		cfg.CanaryPause = canaryPause
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -231,6 +283,7 @@ func New(cfg Config) (*Manager, error) {
 	}); err != nil {
 		return nil, err
 	}
+	m.otherPolicies.Store(-1)
 	m.volumes = m.factory.Core().V1().PersistentVolumeClaims().Informer()
 	if _, err := m.volumes.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { m.volumeChanged(obj) },
@@ -264,6 +317,39 @@ func (m *Manager) Run(ctx context.Context) error {
 	if !cache.WaitForCacheSync(ctx.Done(), m.informer.HasSynced, m.volumes.HasSynced) {
 		return errors.New("kube: the cache of the pods and the volumes did not start")
 	}
+	// No sandbox starts before the namespace refuses all connections that
+	// the policy of a sandbox does not permit.
+	for {
+		err := m.ensureDefaultDeny(ctx)
+		if err == nil {
+			break
+		}
+		m.networkProblem.Store(err.Error())
+		m.cfg.Logger.Error("warren cannot make the network policy of the sandbox namespace. No sandbox can start.", "error", err.Error())
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(10 * time.Second):
+		}
+	}
+	// One run of the reaper before the first sandbox: it examines the
+	// network policies of the namespace and of the pods that exist.
+	m.Reap(ctx)
+	// No sandbox starts before warren saw that the cluster applies the
+	// policy. If the test shows that it does not, warren does the test again
+	// and again: an administrator can correct the network plugin.
+	for {
+		m.examineEnforcement(ctx)
+		m.lastCanary = time.Now()
+		if m.enforcement.Load() == enforcementProven || ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(30 * time.Second):
+		}
+	}
 	m.cfg.Logger.Info("sandbox backend ready", "namespace", m.cfg.Namespace,
 		"sandboxes", len(m.informer.GetStore().List()), "volumes", len(m.volumes.GetStore().List()))
 	ticker := time.NewTicker(m.cfg.ReapInterval)
@@ -274,12 +360,41 @@ func (m *Manager) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			m.Reap(ctx)
+			// A network plugin can stop or change while warren operates.
+			interval := m.cfg.CanaryInterval
+			if m.enforcement.Load() != enforcementProven {
+				interval = time.Minute
+			}
+			if time.Since(m.lastCanary) >= interval {
+				m.examineEnforcement(ctx)
+				m.lastCanary = time.Now()
+			}
 		}
 	}
 }
 
-// Ready reports whether the cache has the current state of the cluster.
-func (m *Manager) Ready() bool { return m.informer.HasSynced() && m.volumes.HasSynced() }
+// Ready reports whether the cache has the current state of the cluster, and
+// the sandbox namespace refuses the connections that no policy permits.
+func (m *Manager) Ready() bool { return m.NotReadyReason() == "" }
+
+// NotReadyReason returns the cause for which no sandbox can start, or an
+// empty text.
+func (m *Manager) NotReadyReason() string {
+	problem, _ := m.networkProblem.Load().(string)
+	switch {
+	case !m.informer.HasSynced() || !m.volumes.HasSynced():
+		return "the cache of the pods and the volumes is not ready"
+	case !m.networkReady.Load():
+		return "the sandbox namespace has no network policy that refuses all connections: " + problem
+	case m.otherPolicies.Load() < 0:
+		return "warren did not examine the network policies of the sandbox namespace"
+	case m.enforcement.Load() == enforcementAbsent:
+		return "the cluster does not apply network policies"
+	case m.enforcement.Load() != enforcementProven:
+		return "the test of the network policies is not complete: " + problem
+	}
+	return ""
+}
 
 // podChanged is the handler for each pod event.
 func (m *Manager) podChanged(obj any, deleted bool) {
@@ -487,6 +602,15 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 		// the pod, and the next start makes a new volume.
 		return nil, nil
 	}
+	// The "internet" mode permits public addresses. If the pods of the
+	// cluster have public addresses, a sandbox could connect to them.
+	if addr, err := netip.ParseAddr(pod.Status.PodIP); err == nil && !m.cfg.Network.Blocked(addr) {
+		_ = m.deletePod(ctx, pod, "public_address", false)
+		m.cfg.Logger.Error("a sandbox has an address that the internet mode does not refuse. Warren stopped it. "+
+			"Add the pod network of the cluster to the blocked networks of the configuration (--egress-blocked-cidrs).",
+			"sandbox", name, "address", addr.String())
+		return nil, fmt.Errorf("the pod network of the cluster has the public address %s", addr)
+	}
 
 	target, err := m.target(ctx, pod)
 	if errors.Is(err, errBadKey) {
@@ -508,6 +632,23 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 	}
 	if err != nil {
 		m.cfg.Logger.Debug("sandbox not usable at this time", "sandbox", name, "error", err.Error())
+		// The pod is ready for Kubernetes, but warren cannot use it. The
+		// usual cause is a network policy that does not permit warren. Such
+		// a pod would stay with no end.
+		m.mu.Lock()
+		st := m.stateLocked(name)
+		if st.unreachable != pod.UID {
+			st.unreachable, st.unreachableSince = pod.UID, m.now()
+		}
+		tooLong := m.now().Sub(st.unreachableSince) > unreachableLimit
+		m.mu.Unlock()
+		if tooLong {
+			m.cfg.Logger.Error("warren cannot connect to a sandbox that is ready. Warren stops it. Examine the network policies: "+
+				"the pod labels in the configuration of warren must be the labels of the warren pods.",
+				"sandbox", name, "error", err.Error())
+			_ = m.deletePod(ctx, pod, "unreachable", false)
+			return nil, fmt.Errorf("warren cannot connect to the sandbox: %w", err)
+		}
 		return nil, nil
 	}
 
@@ -573,6 +714,16 @@ func (m *Manager) start(ctx context.Context, req backend.Request, exempt bool) e
 	if st.starting || (st.creating && m.now().Sub(st.createStart) < createStale) {
 		m.mu.Unlock()
 		return nil
+	}
+	// A network policy of a different owner can permit what the policies of
+	// warren refuse.
+	if n := m.otherPolicies.Load(); n != 0 {
+		m.dropLocked(name)
+		m.mu.Unlock()
+		if n < 0 {
+			return errors.New("warren cannot examine the network policies of the sandbox namespace")
+		}
+		return fmt.Errorf("the sandbox namespace has %d network policies that warren did not make", n)
 	}
 	// A reset or the reaper works on the volume. The caller must wait.
 	if st.resetting || st.volumeBusy {
@@ -938,11 +1089,34 @@ func (m *Manager) createObjects(ctx context.Context, name string, req backend.Re
 		removeNewVolume()
 		return false, err
 	}
+	// removeStartObjects deletes the Secret and the network policy of this
+	// start request only.
+	networkPolicies := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace)
+	var policyUID types.UID
+	removeStartObjects := func() {
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = secrets.Delete(c, secretName, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &made.UID}})
+		if policyUID != "" {
+			_ = networkPolicies.Delete(c, secretName, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &policyUID}})
+		}
+	}
 
-	pod, err := pods.Create(ctx, m.buildPod(name, secretName, req, pol), metav1.CreateOptions{})
+	// The network policy comes before the pod. The pod must not operate at
+	// a time when only the policy of the namespace applies to it: it would
+	// not be wrong, but warren could not connect to the sandbox.
+	podSpec := m.buildPod(name, secretName, req, pol)
+	madePolicy, err := networkPolicies.Create(ctx, m.buildNetworkPolicy(secretName, podSpec.Labels, pol, m.hostAddresses()), metav1.CreateOptions{})
 	if err != nil {
-		// Delete only the Secret of this start request.
-		_ = secrets.Delete(ctx, secretName, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &made.UID}})
+		removeStartObjects()
+		removeNewVolume()
+		return false, fmt.Errorf("make the network policy: %w", err)
+	}
+	policyUID = madePolicy.UID
+
+	pod, err := pods.Create(ctx, podSpec, metav1.CreateOptions{})
+	if err != nil {
+		removeStartObjects()
 		if apierrors.IsAlreadyExists(err) {
 			// A different process made the pod at the same time. That
 			// pod has the Secret of its own start, and it uses the volume.
@@ -958,6 +1132,9 @@ func (m *Manager) createObjects(ctx context.Context, name string, req backend.Re
 	}}}})
 	if _, err := secrets.Patch(ctx, secretName, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 		m.cfg.Logger.Warn("cannot set the owner of a Secret. The reaper deletes it later.", "sandbox", name, "error", err.Error())
+	}
+	if _, err := networkPolicies.Patch(ctx, secretName, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		m.cfg.Logger.Warn("cannot set the owner of a network policy. The reaper sets it later.", "sandbox", name, "error", err.Error())
 	}
 
 	m.mu.Lock()
@@ -1032,6 +1209,7 @@ func (m *Manager) target(ctx context.Context, pod *corev1.Pod) (backend.Target, 
 	m.mu.Lock()
 	st = m.stateLocked(pod.Name)
 	st.key, st.keyUID, st.verified, st.restarts = key, pod.UID, pod.UID, restarts
+	st.unreachable = ""
 	delete(m.badKeys, pod.Name)
 	m.mu.Unlock()
 	return target, nil
