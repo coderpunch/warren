@@ -158,6 +158,26 @@ func duration(v *yaml.Node, key string) (time.Duration, error) {
 	return d, nil
 }
 
+// boolean reads true or false.
+func boolean(v *yaml.Node, key string) (bool, error) {
+	if v.Kind != yaml.ScalarNode || v.Tag != "!!bool" || (v.Value != "true" && v.Value != "false") {
+		return false, lineError(v, "%q must be true or false", key)
+	}
+	return v.Value == "true", nil
+}
+
+// integer reads a whole number with no sign.
+func integer(v *yaml.Node, key string) (int64, error) {
+	if v.Kind != yaml.ScalarNode || v.Tag != "!!int" || !plainNumber.MatchString(v.Value) {
+		return 0, lineError(v, "%q must be a whole number", key)
+	}
+	n, err := strconv.ParseInt(v.Value, 10, 64)
+	if err != nil {
+		return 0, lineError(v, "%q must be a whole number", key)
+	}
+	return n, nil
+}
+
 // textList reads a list of strings.
 func textList(v *yaml.Node, key string) ([]string, error) {
 	if v.Kind != yaml.SequenceNode {
@@ -340,6 +360,83 @@ func specFields(s *Spec) map[string]field {
 			m, err := textMap(v, "nodeSelector")
 			s.NodeSelector = m
 			return err
+		},
+		"command": func(v *yaml.Node) error {
+			list, err := textList(v, "command")
+			s.Command = list
+			return err
+		},
+		"runAsUser": func(v *yaml.Node) error {
+			n, err := integer(v, "runAsUser")
+			s.RunAsUser = &n
+			return err
+		},
+		"userNamespace": func(v *yaml.Node) error {
+			b, err := boolean(v, "userNamespace")
+			s.UserNamespace = &b
+			return err
+		},
+		"network": func(v *yaml.Node) error {
+			if v.Kind == yaml.MappingNode && len(v.Content) == 0 {
+				return lineError(v, "\"network\" is empty (remove the key to use the default)")
+			}
+			return mapping(v, "\"network\"", map[string]field{
+				"egress": func(v *yaml.Node) error {
+					mode, err := text(v, "network.egress")
+					s.Network.Egress = EgressMode(mode)
+					return err
+				},
+				"dns": func(v *yaml.Node) error {
+					b, err := boolean(v, "network.dns")
+					s.Network.DNS = &b
+					return err
+				},
+				"allow": func(v *yaml.Node) error {
+					if v.Kind != yaml.SequenceNode {
+						return lineError(v, "\"network.allow\" must be a list")
+					}
+					s.Network.Allow = []Destination{}
+					for _, item := range v.Content {
+						var d Destination
+						err := mapping(item, "an item of \"network.allow\"", map[string]field{
+							"cidr":      textInto(&d.CIDR, "cidr"),
+							"namespace": textInto(&d.Namespace, "namespace"),
+							"podLabels": func(v *yaml.Node) error {
+								m, err := textMap(v, "podLabels")
+								d.PodLabels = m
+								return err
+							},
+							"ports": func(v *yaml.Node) error {
+								if v.Kind != yaml.SequenceNode || len(v.Content) == 0 {
+									return lineError(v, "\"ports\" must be a list of port numbers (remove the key to permit all ports)")
+								}
+								for _, p := range v.Content {
+									if err := plain(p); err != nil {
+										return err
+									}
+									n, err := integer(p, "an item of ports")
+									if err != nil {
+										return err
+									}
+									if n > 65535 {
+										return lineError(p, "%d is not a port number", n)
+									}
+									d.Ports = append(d.Ports, int32(n))
+								}
+								return nil
+							},
+						})
+						if err != nil {
+							return err
+						}
+						if d.CIDR == "" && d.Namespace == "" {
+							return lineError(item, "an item of \"network.allow\" must have the key \"cidr\", or the keys \"namespace\" and \"podLabels\"")
+						}
+						s.Network.Allow = append(s.Network.Allow, d)
+					}
+					return nil
+				},
+			})
 		},
 		"tolerations": func(v *yaml.Node) error {
 			if v.Kind != yaml.SequenceNode {

@@ -8,6 +8,8 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"math"
+	"net/netip"
 	"os"
 	"regexp"
 	"slices"
@@ -57,6 +59,83 @@ type Spec struct {
 	IdleTimeout  *time.Duration
 	NodeSelector map[string]string
 	Tolerations  []corev1.Toleration
+	// Network has the network connections that the sandbox can open.
+	Network Network
+	// Command is the start command of the sandbox. Nil means the default
+	// command of warren, which is correct for the default image.
+	Command []string
+	// RunAsUser is the user ID of the processes in the sandbox. Nil means
+	// the default of warren.
+	RunAsUser *int64
+	// UserNamespace gives the sandbox its own user namespace: the user IDs
+	// of the sandbox are then different user IDs on the node, and different
+	// for each sandbox. The cluster must support it. Nil means no.
+	UserNamespace *bool
+}
+
+// EgressMode says which connections a sandbox can open by default.
+type EgressMode string
+
+const (
+	// EgressInternet permits public addresses. Private addresses and the
+	// addresses of the cluster stay blocked.
+	EgressInternet EgressMode = "internet"
+	// EgressNone permits no connection.
+	EgressNone EgressMode = "none"
+)
+
+// Network has the settings for the outgoing connections of a sandbox. A
+// sandbox never accepts a connection, except from warren.
+type Network struct {
+	Egress EgressMode
+	// DNS permits name lookups with the DNS service of the cluster. Nil
+	// means the default: yes for EgressInternet, no for EgressNone.
+	DNS *bool
+	// Allow has more destinations. A destination can be a private address.
+	Allow []Destination
+}
+
+// Destination is one destination that a sandbox can connect to: a network,
+// or the pods of the cluster that have some labels. It has the CIDR, or the
+// Namespace and the PodLabels.
+type Destination struct {
+	// CIDR is the network, for example 10.20.0.0/16 or 2001:db8::/32. Use
+	// it for a destination that is not in the cluster.
+	CIDR string
+	// Namespace and PodLabels select pods of the cluster.
+	Namespace string
+	PodLabels map[string]string
+	// Ports limits the connection to these TCP and UDP ports. An empty
+	// list permits all ports.
+	Ports []int32
+}
+
+// AllowsDNS reports whether the sandbox can use the DNS service of the
+// cluster.
+func (n Network) AllowsDNS() bool {
+	if n.DNS != nil {
+		return *n.DNS
+	}
+	return n.Egress != EgressNone
+}
+
+// Profile returns the name of the network settings that Open WebUI shows.
+// "none" means no connection at all, also no DNS.
+func (n Network) Profile() string {
+	switch {
+	case len(n.Allow) > 0:
+		return "custom"
+	case n.Egress == EgressNone && !n.AllowsDNS():
+		return string(EgressNone)
+	case n.Egress != EgressNone && n.AllowsDNS():
+		return string(EgressInternet)
+	}
+	return "custom"
+}
+
+// set reports whether the network settings have a value.
+func (n Network) set() bool {
+	return n.Egress != "" || n.DNS != nil || n.Allow != nil
 }
 
 // StorageType is the type of the home directory of a sandbox.
@@ -190,6 +269,9 @@ func (p *Policy) complete() {
 		q := defaultStorageSize.DeepCopy()
 		p.Storage.Size = &q
 	}
+	if p.Network.Egress == "" {
+		p.Network.Egress = EgressInternet
+	}
 	if p.Resources.Requests == nil {
 		p.Resources.Requests = corev1.ResourceList{}
 	}
@@ -240,6 +322,25 @@ func (s Spec) clone() Spec {
 		out.IdleTimeout = &d
 	}
 	out.NodeSelector = cloneMap(s.NodeSelector)
+	if s.Network.DNS != nil {
+		b := *s.Network.DNS
+		out.Network.DNS = &b
+	}
+	if s.Network.Allow != nil {
+		out.Network.Allow = make([]Destination, len(s.Network.Allow))
+		for i, d := range s.Network.Allow {
+			out.Network.Allow[i] = Destination{CIDR: d.CIDR, Namespace: d.Namespace, PodLabels: cloneMap(d.PodLabels), Ports: slices.Clone(d.Ports)}
+		}
+	}
+	out.Command = slices.Clone(s.Command)
+	if s.RunAsUser != nil {
+		u := *s.RunAsUser
+		out.RunAsUser = &u
+	}
+	if s.UserNamespace != nil {
+		b := *s.UserNamespace
+		out.UserNamespace = &b
+	}
 	if s.Tolerations != nil {
 		out.Tolerations = make([]corev1.Toleration, len(s.Tolerations))
 		for i := range s.Tolerations {
@@ -316,6 +417,31 @@ func (s *Spec) overlay(src Spec) {
 	}
 	if src.Tolerations != nil {
 		s.Tolerations = src.Tolerations
+	}
+	// A policy that sets "egress" itself replaces all network settings: a
+	// policy with "egress: none" must not get a permitted destination or DNS
+	// from the defaults. A policy that does not set "egress" keeps the mode
+	// of the defaults: a strict default must not become "internet" because
+	// a policy adds one destination.
+	switch {
+	case src.Network.Egress != "":
+		s.Network = src.Network
+	case src.Network.set():
+		if src.Network.DNS != nil {
+			s.Network.DNS = src.Network.DNS
+		}
+		if src.Network.Allow != nil {
+			s.Network.Allow = src.Network.Allow
+		}
+	}
+	if src.Command != nil {
+		s.Command = src.Command
+	}
+	if src.RunAsUser != nil {
+		s.RunAsUser = src.RunAsUser
+	}
+	if src.UserNamespace != nil {
+		s.UserNamespace = src.UserNamespace
 	}
 }
 
@@ -471,6 +597,90 @@ func (s Spec) validate() error {
 	for i, t := range s.Tolerations {
 		if err := validateToleration(t); err != nil {
 			return fmt.Errorf("tolerations: item %d: %w", i+1, err)
+		}
+	}
+	if err := s.Network.validate(); err != nil {
+		return err
+	}
+	if s.Command != nil {
+		if len(s.Command) == 0 || len(s.Command) > maxCommandItems {
+			return fmt.Errorf("command must have from 1 to %d items", maxCommandItems)
+		}
+		// A name with no path would be found through PATH, and the home
+		// directory of the sandbox can be in PATH.
+		if !strings.HasPrefix(s.Command[0], "/") {
+			return fmt.Errorf("command: the program %q must be an absolute path", s.Command[0])
+		}
+		for _, item := range s.Command {
+			if item == "" || len(item) > maxEnvValue || strings.ContainsRune(item, 0) {
+				return errors.New("command: an item is empty, too long, or contains a NUL character")
+			}
+		}
+	}
+	if s.RunAsUser != nil && (*s.RunAsUser < 1 || *s.RunAsUser > math.MaxInt32) {
+		return errors.New("runAsUser must be a user ID from 1 to 2147483647: the user 0 is root")
+	}
+	return nil
+}
+
+const (
+	maxCommandItems = 32
+	maxDestinations = 32
+	maxPorts        = 16
+)
+
+func (n Network) validate() error {
+	switch n.Egress {
+	case "", EgressInternet, EgressNone:
+	default:
+		return fmt.Errorf("network.egress must be internet or none, not %q", n.Egress)
+	}
+	if len(n.Allow) > maxDestinations {
+		return fmt.Errorf("network.allow has more than %d items", maxDestinations)
+	}
+	for i, d := range n.Allow {
+		switch {
+		case d.CIDR != "" && (d.Namespace != "" || d.PodLabels != nil):
+			return fmt.Errorf("network.allow: item %d has a cidr and pods. Use two items", i+1)
+		case d.CIDR != "":
+			prefix, err := netip.ParsePrefix(d.CIDR)
+			// Kubernetes does not accept an IPv4 address in IPv6 form.
+			if err != nil || prefix.Addr().Is4In6() {
+				return fmt.Errorf("network.allow: item %d: %q is not a network, for example 10.20.0.0/16", i+1, d.CIDR)
+			}
+			if prefix.Masked() != prefix {
+				return fmt.Errorf("network.allow: item %d: %q has bits after the prefix (the network is %s)", i+1, d.CIDR, prefix.Masked())
+			}
+			// All addresses include the Kubernetes API, the nodes, and warren.
+			if prefix.Bits() == 0 {
+				return fmt.Errorf("network.allow: item %d: %q is all addresses; give the networks that the sandbox needs", i+1, d.CIDR)
+			}
+		default:
+			// An empty selector selects all namespaces or all pods.
+			if msgs := validation.IsDNS1123Label(d.Namespace); len(msgs) > 0 {
+				return fmt.Errorf("network.allow: item %d must have a cidr, or a namespace and podLabels", i+1)
+			}
+			if len(d.PodLabels) == 0 {
+				return fmt.Errorf("network.allow: item %d: podLabels is necessary with a namespace. Without it, the item selects all pods of the namespace", i+1)
+			}
+			for k, v := range d.PodLabels {
+				if len(validation.IsQualifiedName(k)) > 0 || v == "" || len(validation.IsValidLabelValue(v)) > 0 {
+					return fmt.Errorf("network.allow: item %d: %q=%q is not a pod label", i+1, k, v)
+				}
+			}
+		}
+		if len(d.Ports) > maxPorts {
+			return fmt.Errorf("network.allow: item %d has more than %d ports", i+1, maxPorts)
+		}
+		seen := map[int32]bool{}
+		for _, port := range d.Ports {
+			if port < 1 || port > 65535 {
+				return fmt.Errorf("network.allow: item %d: %d is not a port number", i+1, port)
+			}
+			if seen[port] {
+				return fmt.Errorf("network.allow: item %d: the port %d occurs two times", i+1, port)
+			}
+			seen[port] = true
 		}
 	}
 	return nil
@@ -662,17 +872,28 @@ func (s *Store) Get(id string) (Policy, bool) { return s.set.Load().Get(id) }
 // List returns all policies of the current set, sorted by ID.
 func (s *Store) List() []Policy { return s.set.Load().List() }
 
-// Get returns the policy with the given ID.
+// Get returns the policy with the given ID. The result is a copy: a caller
+// can change it, and many callers can read it at the same time.
 func (s *Set) Get(id string) (Policy, bool) {
 	p, ok := s.byID[id]
-	return p, ok
+	if !ok {
+		return Policy{}, false
+	}
+	return p.copy(), true
+}
+
+// copy returns a policy that shares no data with p.
+func (p Policy) copy() Policy {
+	p.Users = slices.Clone(p.Users)
+	p.Spec = p.Spec.clone()
+	return p
 }
 
 // List returns all policies, sorted by ID.
 func (s *Set) List() []Policy {
 	out := make([]Policy, 0, len(s.order))
 	for _, id := range s.order {
-		out = append(out, s.byID[id])
+		out = append(out, s.byID[id].copy())
 	}
 	return out
 }

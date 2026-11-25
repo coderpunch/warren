@@ -501,3 +501,174 @@ func TestDaysInATime(t *testing.T) {
 		t.Errorf("retention = %v, idle time = %v", *p.Storage.Retention, *p.IdleTimeout)
 	}
 }
+
+func TestNetworkCommandAndUser(t *testing.T) {
+	set, err := Parse([]byte(`
+defaults:
+  network:
+    allow:
+      - {cidr: 10.20.0.0/16}
+policies:
+  - {id: usual, name: Usual, scope: user}
+  - id: closed
+    name: Closed
+    scope: user
+    network: {egress: none}
+  - id: database
+    name: Database
+    scope: user
+    network:
+      egress: none
+      dns: true
+      allow:
+        - cidr: 10.30.1.0/24
+          ports: [5432, 6379]
+        - cidr: "2001:db8::/32"
+  - id: other-image
+    name: Other image
+    scope: user
+    command: ["/sbin/tini", "--", "/usr/local/bin/python3", "-m", "open_terminal"]
+    runAsUser: 1000
+    network: {dns: false}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	usual := mustGet(t, set, "usual")
+	if usual.Network.Egress != EgressInternet || !usual.Network.AllowsDNS() || usual.Command != nil || usual.RunAsUser != nil {
+		t.Errorf("defaults of warren = %+v, command %v, user %v", usual.Network, usual.Command, usual.RunAsUser)
+	}
+	// The list of the defaults is in each policy that sets no list.
+	if len(usual.Network.Allow) != 1 || usual.Network.Allow[0].CIDR != "10.20.0.0/16" || usual.Network.Profile() != "custom" {
+		t.Errorf("allow list from the defaults = %+v, profile %q", usual.Network.Allow, usual.Network.Profile())
+	}
+	closed := mustGet(t, set, "closed")
+	if closed.Network.Egress != EgressNone || closed.Network.AllowsDNS() {
+		t.Errorf("closed policy = %+v, DNS %v", closed.Network, closed.Network.AllowsDNS())
+	}
+	db := mustGet(t, set, "database")
+	// The list of a policy replaces the list of the defaults.
+	if len(db.Network.Allow) != 2 || db.Network.Allow[0].CIDR != "10.30.1.0/24" || len(db.Network.Allow[0].Ports) != 2 ||
+		db.Network.Allow[0].Ports[1] != 6379 || len(db.Network.Allow[1].Ports) != 0 || !db.Network.AllowsDNS() {
+		t.Errorf("database policy = %+v", db.Network)
+	}
+	other := mustGet(t, set, "other-image")
+	if len(other.Command) != 5 || other.Command[0] != "/sbin/tini" || other.RunAsUser == nil || *other.RunAsUser != 1000 {
+		t.Errorf("command = %v, user = %v", other.Command, other.RunAsUser)
+	}
+	// This policy sets only "dns". It keeps the mode and the destinations
+	// of the defaults.
+	if other.Network.Egress != EgressInternet || other.Network.AllowsDNS() || len(other.Network.Allow) != 1 || other.Network.Profile() != "custom" {
+		t.Errorf("internet with no DNS = %+v, DNS %v, profile %q", other.Network, other.Network.AllowsDNS(), other.Network.Profile())
+	}
+	// "egress: none" in a policy means none: no destination and no DNS from
+	// the defaults.
+	if len(closed.Network.Allow) != 0 || closed.Network.Profile() != "none" {
+		t.Errorf("closed policy has data from the defaults: %+v, profile %q", closed.Network, closed.Network.Profile())
+	}
+	if db.Network.Profile() != "custom" {
+		t.Errorf("profile of a policy with destinations = %q", db.Network.Profile())
+	}
+	// A policy with no list of its own shows the profile of its mode.
+	plain, err := Parse([]byte("policies:\n  - {id: a, name: A, scope: user}\n  - {id: b, name: B, scope: user, network: {egress: none}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := mustGet(t, plain, "a").Network.Profile(), mustGet(t, plain, "b").Network.Profile(); a != "internet" || b != "none" {
+		t.Errorf("profiles = %q and %q", a, b)
+	}
+	// A change of one policy must not change a different policy.
+	usual.Network.Allow[0].CIDR = "changed"
+	if got := mustGet(t, set, "usual").Network.Allow[0].CIDR; got != "10.20.0.0/16" {
+		t.Errorf("a copy of the policy shares its allow list: %q", got)
+	}
+}
+
+func TestParseRejectsBadNetworkSettings(t *testing.T) {
+	policy := func(extra string) string {
+		return "policies:\n  - id: a\n    name: A\n    scope: user\n" + extra
+	}
+	cases := map[string]string{
+		"unknown egress mode":      policy("    network: {egress: all}\n"),
+		"egress is a boolean":      policy("    network: {egress: true}\n"),
+		"dns is text":              policy("    network: {dns: \"true\"}\n"),
+		"dns is yes":               policy("    network: {dns: yes}\n"),
+		"dns is a number":          policy("    network: {dns: 1}\n"),
+		"unknown network key":      policy("    network: {ingress: all}\n"),
+		"empty network":            policy("    network: {}\n"),
+		"IPv4 in IPv6 form":        policy("    network: {allow: [{cidr: \"::ffff:10.0.0.0/104\"}]}\n"),
+		"network is text":          policy("    network: internet\n"),
+		"allow is a mapping":       policy("    network: {allow: {cidr: 10.0.0.0/8}}\n"),
+		"allow item is text":       policy("    network: {allow: [10.0.0.0/8]}\n"),
+		"allow with no cidr":       policy("    network: {allow: [{ports: [80]}]}\n"),
+		"allow unknown key":        policy("    network: {allow: [{cidr: 10.0.0.0/8, protocol: TCP}]}\n"),
+		"address with no mask":     policy("    network: {allow: [{cidr: 10.1.2.3}]}\n"),
+		"host name":                policy("    network: {allow: [{cidr: example.com}]}\n"),
+		"bits after the prefix":    policy("    network: {allow: [{cidr: 10.1.2.3/16}]}\n"),
+		"all IPv4 addresses":       policy("    network: {allow: [{cidr: 0.0.0.0/0}]}\n"),
+		"all IPv6 addresses":       policy("    network: {allow: [{cidr: \"::/0\"}]}\n"),
+		"port zero":                policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [0]}]}\n"),
+		"port too large":           policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [65536]}]}\n"),
+		"port as text":             policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [\"80\"]}]}\n"),
+		"negative port":            policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [-1]}]}\n"),
+		"duplicate port":           policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [80, 80]}]}\n"),
+		"empty port list":          policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: []}]}\n"),
+		"port range as text":       policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [8000-9000]}]}\n"),
+		"cidr and pods together":   policy("    network: {allow: [{cidr: 10.0.0.0/8, namespace: db, podLabels: {app: x}}]}\n"),
+		"namespace with no labels": policy("    network: {allow: [{namespace: db}]}\n"),
+		"labels with no namespace": policy("    network: {allow: [{podLabels: {app: x}}]}\n"),
+		"empty pod labels":         policy("    network: {allow: [{namespace: db, podLabels: {}}]}\n"),
+		"empty label value":        policy("    network: {allow: [{namespace: db, podLabels: {app: \"\"}}]}\n"),
+		"bad namespace":            policy("    network: {allow: [{namespace: \"All Namespaces\", podLabels: {app: x}}]}\n"),
+		"command is text":          policy("    command: /bin/sh\n"),
+		"empty command":            policy("    command: []\n"),
+		"command with no path":     policy("    command: [python3, -m, open_terminal]\n"),
+		"relative command":         policy("    command: [./start]\n"),
+		"empty command item":       policy("    command: [/bin/sh, \"\"]\n"),
+		"number in command":        policy("    command: [/bin/sleep, 5]\n"),
+		"user root":                policy("    runAsUser: 0\n"),
+		"negative user":            policy("    runAsUser: -1\n"),
+		"user as text":             policy("    runAsUser: \"1000\"\n"),
+		"user name":                policy("    runAsUser: user\n"),
+		"user too large":           policy("    runAsUser: 4294967296\n"),
+		"octal user":               policy("    runAsUser: 01750\n"),
+	}
+	for name, content := range cases {
+		if _, err := Parse([]byte(content)); err == nil {
+			t.Errorf("%s: Parse gave no error", name)
+		}
+	}
+	if _, err := Parse([]byte(policy("    network: {egress: none, dns: false, allow: [{cidr: 10.0.0.0/8, ports: [80]}, {namespace: db, podLabels: {app: postgres}, ports: [5432]}]}\n    runAsUser: 1000\n    command: [/bin/sh]\n"))); err != nil {
+		t.Fatalf("the base file is not valid: %v", err)
+	}
+}
+
+// The defaults of a file can be strict. A policy that adds one destination
+// must not get the "internet" mode by that.
+func TestStrictNetworkDefaultsStayStrict(t *testing.T) {
+	set, err := Parse([]byte(`
+defaults:
+  network: {egress: none}
+policies:
+  - {id: plain, name: Plain, scope: user}
+  - id: database
+    name: Database
+    scope: user
+    network:
+      allow:
+        - {cidr: 10.30.1.0/24, ports: [5432]}
+  - {id: open, name: Open, scope: user, network: {egress: internet}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := mustGet(t, set, "plain"); p.Network.Egress != EgressNone || p.Network.AllowsDNS() || p.Network.Profile() != "none" {
+		t.Errorf("policy with no network key = %+v", p.Network)
+	}
+	if p := mustGet(t, set, "database"); p.Network.Egress != EgressNone || p.Network.AllowsDNS() || len(p.Network.Allow) != 1 {
+		t.Errorf("a policy that adds a destination changed the mode of the defaults: %+v", p.Network)
+	}
+	if p := mustGet(t, set, "open"); p.Network.Egress != EgressInternet || !p.Network.AllowsDNS() {
+		t.Errorf("a policy that sets the mode = %+v", p.Network)
+	}
+}
