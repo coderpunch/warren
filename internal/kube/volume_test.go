@@ -1066,3 +1066,88 @@ func TestStartStopsWhenTheVolumeChangesUnderIt(t *testing.T) {
 		t.Errorf("volume after the start = %+v", v)
 	}
 }
+
+// A reset clears the files and keeps the instance: the sandbox has a new,
+// empty volume and no pod, and it stays in the instance list. A delete
+// removes the instance.
+func TestResetKeepsTheInstance(t *testing.T) {
+	e := newTestEnv(t, func(c *Config) { c.MaxVolumesPerUser = 1 })
+	req := chatKeptRef("alice", "c1")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	old := e.volumeFromAPI(name).UID
+
+	if err := e.m.Reset(context.Background(), req.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(e.pods()); n != 0 {
+		t.Errorf("pods after the reset = %d, want 0: a reset does not start the sandbox", n)
+	}
+	v := e.volumeFromAPI(name)
+	if v == nil || v.UID == old {
+		t.Fatalf("volume after the reset = %+v, want a new volume", v)
+	}
+	// The new volume stays on the account of the same user, also when a
+	// manager sent the reset.
+	if v.Annotations[AnnotationCreatedBy] != "alice" || v.Labels[LabelOwner] != ownerDigest("alice") ||
+		v.Annotations[AnnotationContext] != "chat:c1" || v.Labels[LabelTemplate] != "chat-kept" {
+		t.Errorf("metadata of the new volume = %+v", v.ObjectMeta)
+	}
+	waitFor(t, "new volume in the cache", func() bool { c := e.m.volume(name); return c != nil && c.UID == v.UID })
+	list := e.m.Instances("chat-kept")
+	if len(list) != 1 || list[0].Status != StatusStopped || list[0].ContextID != "chat:c1" {
+		t.Errorf("instances after the reset = %+v, want one stopped instance", list)
+	}
+	// The instance keeps its place in the limit of the user.
+	if _, err := e.m.Acquire(context.Background(), chatKeptRef("alice", "c2")); !errors.Is(err, backend.ErrVolumeLimit) {
+		t.Errorf("second chat volume after a reset: %v, want ErrVolumeLimit", err)
+	}
+	// The next request uses the empty volume.
+	e.acquire(req).Release()
+	if got := e.volumeFromAPI(name); got == nil || got.UID != v.UID {
+		t.Errorf("the start after the reset did not use the new volume")
+	}
+
+	// A delete removes the instance and gives the volume back.
+	if err := e.m.Delete(context.Background(), req.Ref); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "volume gone from the cache", func() bool { return e.m.volume(name) == nil })
+	if len(e.volumes()) != 0 || len(e.m.Instances("chat-kept")) != 0 {
+		t.Errorf("after the delete: volumes = %d, instances = %d, want 0 and 0", len(e.volumes()), len(e.m.Instances("chat-kept")))
+	}
+	e.acquire(chatKeptRef("alice", "c2")).Release()
+}
+
+// A reset makes no volume for a sandbox that had none.
+func TestResetMakesNoVolumeForASandboxThatHadNone(t *testing.T) {
+	e := newTestEnv(t, nil)
+	// A sandbox that does not exist.
+	if err := e.m.Reset(context.Background(), templateRef("kept", "nobody").Ref); err != nil {
+		t.Fatal(err)
+	}
+	// A sandbox whose policy keeps no files.
+	plain := userRef("carol")
+	e.acquire(plain).Release()
+	if err := e.m.Reset(context.Background(), plain.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.volumes()) != 0 || len(e.pods()) != 0 {
+		t.Errorf("after the resets: volumes = %d, pods = %d, want 0 and 0", len(e.volumes()), len(e.pods()))
+	}
+	// A sandbox whose policy changed to ephemeral storage: the old volume
+	// goes away, and warren makes no new volume.
+	req := templateRef("kept", "alice")
+	e.acquire(req).Release()
+	e.stop(req)
+	e.usePolicies("policies:\n  - {id: kept, name: Kept, scope: user, storage: {type: ephemeral}}\n")
+	if err := e.m.Reset(context.Background(), req.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(e.volumes()); n != 0 {
+		t.Errorf("volumes after the reset of a sandbox with an ephemeral policy = %d, want 0", n)
+	}
+	if n := e.recordCount(); n != 0 {
+		t.Errorf("records = %d, want 0", n)
+	}
+}

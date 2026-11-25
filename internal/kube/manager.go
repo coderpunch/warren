@@ -1266,10 +1266,24 @@ func (m *Manager) Restart(ctx context.Context, req backend.Request) error {
 	return m.startBy(ctx, req, by)
 }
 
-// Delete stops a sandbox and deletes its volume. The next request starts
-// the sandbox again with an empty home directory. Delete is also the
-// operation that gives a volume back.
+// Delete stops a sandbox and deletes its volume. The sandbox is then not in
+// the instance list. The next request starts it again with an empty home
+// directory. Delete is the operation that gives a volume back.
 func (m *Manager) Delete(ctx context.Context, ref scope.Ref) error {
+	return m.clear(ctx, ref, false)
+}
+
+// Reset stops a sandbox and clears its files. It does not start the sandbox
+// again. The sandbox stays in the instance list as a stopped sandbox: warren
+// gives it a new, empty volume. Warren has no database, thus the volume is
+// the record of a sandbox that has no pod.
+func (m *Manager) Reset(ctx context.Context, ref scope.Ref) error {
+	return m.clear(ctx, ref, true)
+}
+
+// clear removes the pod and the volume of a sandbox. With keep, it then
+// makes a new volume for a sandbox that had one.
+func (m *Manager) clear(ctx context.Context, ref scope.Ref, keep bool) error {
 	if !m.Ready() {
 		return backend.ErrNotReady
 	}
@@ -1280,11 +1294,15 @@ func (m *Manager) Delete(ctx context.Context, ref scope.Ref) error {
 		m.mu.Unlock()
 		return errors.New("a reset of this sandbox is in progress")
 	}
-	// From here, no request can start the sandbox or get a lease on it.
+	// From here, no request can start the sandbox or get a lease on it, and
+	// the reaper does not change its volume.
 	st.resetting = true
 	m.mu.Unlock()
 
-	err := m.remove(ctx, name)
+	old, err := m.remove(ctx, name)
+	if err == nil && keep && old != nil {
+		err = m.emptyVolume(ctx, ref, old)
+	}
 
 	m.mu.Lock()
 	st.resetting = false
@@ -1294,9 +1312,35 @@ func (m *Manager) Delete(ctx context.Context, ref scope.Ref) error {
 	return err
 }
 
-// remove deletes the pod and the volume of a sandbox. The caller must set
-// the resetting mark first.
-func (m *Manager) remove(ctx context.Context, name string) error {
+// emptyVolume makes a new volume in place of the volume that a reset
+// deleted. The new volume stays on the account of the same user. If the
+// policy of the sandbox keeps no files at this time, there is nothing to
+// make.
+func (m *Manager) emptyVolume(ctx context.Context, ref scope.Ref, old *corev1.PersistentVolumeClaim) error {
+	pol, ok := m.cfg.Policies.Get(ref.TemplateID)
+	if !ok || !pol.Persistent() || pol.Scope != ref.Kind {
+		return nil
+	}
+	req := backend.Request{Ref: ref, UserID: old.Annotations[AnnotationCreatedBy]}
+	pvcs := m.cfg.Client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace)
+	_, err := pvcs.Create(ctx, m.buildVolume(ref.Name(), req, pol), metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		// A different process made the volume. It is empty.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("make the empty volume: %w", err)
+	}
+	size := pol.Storage.Size.DeepCopy()
+	m.cfg.Logger.Info("volume created", "log", "audit", "user", req.UserID, "template", ref.TemplateID,
+		"context", ref.ContextID(), "sandbox", ref.Name(), "size", size.String(), "reason", "reset")
+	return nil
+}
+
+// remove deletes the pod and the volume of a sandbox. It returns the volume
+// that it deleted or found in deletion, or nil if the sandbox had none. The
+// caller must set the resetting mark first.
+func (m *Manager) remove(ctx context.Context, name string) (*corev1.PersistentVolumeClaim, error) {
 	wait := func(wake <-chan struct{}) error {
 		timer := time.NewTimer(pollInterval)
 		defer timer.Stop()
@@ -1322,11 +1366,11 @@ func (m *Manager) remove(ctx context.Context, name string) error {
 		}
 		if pod != nil && pod.DeletionTimestamp == nil {
 			if err := m.deletePod(ctx, pod, "api", false); err != nil {
-				return fmt.Errorf("stop sandbox: %w", err)
+				return nil, fmt.Errorf("stop sandbox: %w", err)
 			}
 		}
 		if err := wait(wake); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -1334,6 +1378,7 @@ func (m *Manager) remove(ctx context.Context, name string) error {
 	// gone is the UID of the volume for which this function sent the delete
 	// request, or which it found in deletion.
 	var gone types.UID
+	var old *corev1.PersistentVolumeClaim
 	for {
 		wake := m.waiter()
 		if gone != "" {
@@ -1342,38 +1387,38 @@ func (m *Manager) remove(ctx context.Context, name string) error {
 			if v := m.volume(name); v != nil {
 				if v.UID != gone {
 					// A different process made a new volume. It is empty.
-					return nil
+					return nil, nil
 				}
 				// A different warren process can make a pod in this time.
 				// The volume cannot go away while a pod uses it.
 				if pod := m.pod(name); pod != nil && pod.DeletionTimestamp == nil {
 					if err := m.deletePod(ctx, pod, "api", false); err != nil {
-						return fmt.Errorf("stop sandbox: %w", err)
+						return nil, fmt.Errorf("stop sandbox: %w", err)
 					}
 				}
 				if err := wait(wake); err != nil {
-					return err
+					return nil, err
 				}
 				continue
 			}
 		}
 		cur, err := pvcs.Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
-			return nil
+			return old, nil
 		}
 		if err != nil {
-			return fmt.Errorf("read the volume: %w", err)
+			return nil, fmt.Errorf("read the volume: %w", err)
 		}
 		if cur.Labels[LabelManagedBy] != ManagedByValue {
-			return fmt.Errorf("a volume with the name %s exists, and warren did not make it", name)
+			return nil, fmt.Errorf("a volume with the name %s exists, and warren did not make it", name)
 		}
 		if gone != "" && cur.UID != gone {
-			return nil
+			return nil, nil
 		}
 		if cur.DeletionTimestamp == nil {
 			err := pvcs.Delete(ctx, name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &cur.UID}})
 			if err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("delete the volume: %w", err)
+				return nil, fmt.Errorf("delete the volume: %w", err)
 			}
 			if err == nil {
 				m.cfg.Metrics.VolumeDelete("api")
@@ -1381,10 +1426,10 @@ func (m *Manager) remove(ctx context.Context, name string) error {
 					"template", cur.Labels[LabelTemplate], "context", cur.Annotations[AnnotationContext])
 			}
 		}
-		gone = cur.UID
+		gone, old = cur.UID, cur
 		// Kubernetes removes the volume when no pod uses it.
 		if err := wait(wake); err != nil {
-			return err
+			return nil, err
 		}
 	}
 }

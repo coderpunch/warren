@@ -41,9 +41,12 @@ type Instances interface {
 	Start(ctx context.Context, req backend.Request) error
 	Stop(ctx context.Context, ref scope.Ref) error
 	Restart(ctx context.Context, req backend.Request) error
-	// Delete stops a sandbox and deletes its data. The next request of a
-	// user starts the sandbox again.
+	// Delete stops a sandbox and deletes its data. The sandbox is then not
+	// in the instance list.
 	Delete(ctx context.Context, ref scope.Ref) error
+	// Reset stops a sandbox and clears its files. The sandbox stays in the
+	// instance list, and it does not start again.
+	Reset(ctx context.Context, ref scope.Ref) error
 	// WaitReady waits until the sandbox is ready, or until it is clear
 	// that it does not start.
 	WaitReady(ctx context.Context, ref scope.Ref)
@@ -325,10 +328,12 @@ func (h *Handler) instanceOperation(w http.ResponseWriter, r *http.Request, p po
 	case "stop":
 		// The files of the sandbox stay.
 		err = h.Instances.Stop(r.Context(), ref)
-	default: // "reset", and "instance" with DELETE
+	case "reset":
+		// The files go away, and the instance stays as a stopped instance.
+		err = h.Instances.Reset(r.Context(), ref)
+	default: // "instance" with DELETE
 		// Open WebUI tells the person that a delete removes the instance
-		// and its files (docs/protocol.md, section 4.6). Open WebUI 0.13.4
-		// does not send a reset. Warren gives it the same function.
+		// and its files (docs/protocol.md, section 4.6).
 		err = h.Instances.Delete(r.Context(), ref)
 	}
 	switch {

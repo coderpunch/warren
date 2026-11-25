@@ -48,6 +48,10 @@ func (f *fakeInstances) Delete(_ context.Context, ref scope.Ref) error {
 	f.calls, f.requests = append(f.calls, "delete"), append(f.requests, backend.Request{Ref: ref})
 	return f.err
 }
+func (f *fakeInstances) Reset(_ context.Context, ref scope.Ref) error {
+	f.calls, f.requests = append(f.calls, "reset"), append(f.requests, backend.Request{Ref: ref})
+	return f.err
+}
 func (f *fakeInstances) WaitReady(context.Context, scope.Ref) { f.waited = true }
 func (f *fakeInstances) Ready() bool                          { return f.ready }
 
@@ -185,7 +189,7 @@ func TestResetOperation(t *testing.T) {
 	if rec.Code != 200 || out["status"] != "stopped" || inst.waited {
 		t.Errorf("reset = %d %v, waited = %v", rec.Code, out, inst.waited)
 	}
-	if len(inst.calls) != 1 || inst.calls[0] != "delete" || inst.requests[0].Ref.ContextID() != "user:alice" {
+	if len(inst.calls) != 1 || inst.calls[0] != "reset" || inst.requests[0].Ref.ContextID() != "user:alice" {
 		t.Errorf("calls = %v, requests = %+v", inst.calls, inst.requests)
 	}
 }
@@ -209,7 +213,7 @@ func TestUserListOnInstanceOperations(t *testing.T) {
 	if rec, _ := do(h, "POST", base+"limited/reset", `{"user_id":"mallory"}`); rec.Code != 200 {
 		t.Errorf("reset for a user that is not in the list = %d, want 200", rec.Code)
 	}
-	if got := strings.Join(inst.calls, ","); got != "start,stop,delete" {
+	if got := strings.Join(inst.calls, ","); got != "start,stop,reset" {
 		t.Errorf("calls = %s", got)
 	}
 }

@@ -271,10 +271,16 @@ A person who manages a terminal in Open WebUI can see its instances and send ope
 | Restart | Deleted, then started again | Kept |
 | Start | Started | Kept |
 | Delete | Deleted | Deleted |
-| Reset | Deleted | Deleted |
+| Reset | Deleted | Deleted. Warren then makes a new, empty volume. |
 
 After a delete or a reset, the next request of a user starts the sandbox again with an empty home directory.
-Open WebUI 0.13.4 has no control for the reset operation. Warren gives it the same function as the delete operation.
+The two operations do not start the sandbox.
+
+- After a reset, the sandbox stays in the instance list as a stopped instance. Its empty volume counts for the limits. Warren has no database, thus the volume is the record of an instance that has no pod.
+- After a delete, the sandbox is not in the instance list, and its volume does not count for the limits.
+- A sandbox with ephemeral storage has no volume. After a stop, a reset, or a delete, it is not in the instance list.
+
+Open WebUI 0.13.4 has no control for the reset operation. A client of the management API can send it.
 
 The instance list shows a sandbox that has a volume and no pod as stopped.
 A sandbox stays on the account of the user that started it first, also when a different person starts it again.
