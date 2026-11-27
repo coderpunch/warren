@@ -161,8 +161,33 @@ for _ in range(20):
 check("after a restart of warren, the sandbox of alice works with the same pod", ok and "alice-private-data" in out and {x["metadata"]["name"]: x["metadata"]["uid"] for x in pods()} == uid_before, out)
 
 # ---- stop and start by the API ----
-s, _, b = call("POST", "/api/v1/terminals/templates/personal/stop", user=None, body={"user_id": "bob", "chat_id": None, "model_id": None})
+# A stop operation closes the open WebSockets of the sandbox with the code 1012 and a text of warren.
+# The pod gets its stop signal only after that, thus the code and the text do not come from the pod.
+async def ws_stop():
+    hdr = {"X-User-Id": "bob", "X-Terminal-Template-Id": "personal", "X-Session-Id": "chat-1"}
+    s, _, b = call("POST", "/api/terminals", user="bob")
+    sid = json.loads(b)["id"]
+    async with websockets.connect(f"ws://{NODE}:30080/api/terminals/{sid}?user_id=bob", additional_headers=hdr, proxy=None) as c:
+        await c.send(json.dumps({"type": "auth", "token": KEY, "chat_id": "chat-1"}))
+        await c.send(b"echo open-$((1+1))\n")
+        buf = b""
+        try:
+            while b"open-2" not in buf:
+                m = await asyncio.wait_for(c.recv(), 10); buf += m if isinstance(m, bytes) else m.encode()
+        except Exception as e: pass
+        check("terminal WebSocket of bob is open before the stop", b"open-2" in buf, buf[-120:])
+        t0 = time.time()
+        stop = await asyncio.to_thread(call, "POST", "/api/v1/terminals/templates/personal/stop", None, {"user_id": "bob", "chat_id": None, "model_id": None})
+        code, reason = None, None
+        try:
+            while True: await asyncio.wait_for(c.recv(), 10)
+        except websockets.exceptions.ConnectionClosed as e:
+            if e.rcvd is not None: code, reason = e.rcvd.code, e.rcvd.reason
+        except Exception as e: pass
+        return stop, code, reason, time.time() - t0
+(s, _, b), code, reason, dt = asyncio.run(ws_stop())
 check("stop operation", s == 200, b)
+check("the stop operation closes an open terminal WebSocket with the code 1012", code == 1012 and reason == "An operation stopped or restarted the terminal" and dt < 5, (code, reason, round(dt, 1)))
 gone = False
 for _ in range(30):
     if not any(x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] == "user:bob" and "deletionTimestamp" not in x["metadata"] for x in pods()): gone = True; break

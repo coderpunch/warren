@@ -315,6 +315,21 @@ After a delete or a reset, the next request of a user starts the sandbox again w
 The two operations do not start the sandbox.
 A request for the system information is not such a request. Refer to section 10.1.
 
+A stop, restart, reset, or delete operation closes the open WebSockets of the sandbox with the close code 1012. Refer to section 10.2.
+
+A stop, a reset, or a delete does not keep the sandbox in the stopped condition. Open WebUI sends requests for the selected terminal by itself, immediately after each instance operation. They come from each open page of the manager, and of each user that has access to the terminal (`protocol.md`, section 4.1.3). Warren cannot tell these requests from the requests of a person, and the first one starts the sandbox again. The close code of the WebSockets has no effect on this. Thus, while a page has the terminal selected:
+
+- A stopped instance usually operates again after some seconds.
+- A deleted instance usually comes back with a new, empty volume. The delete operation then gives no volume back.
+- An instance after a reset usually operates again after some seconds, with its empty volume.
+- One instance operation, or one change of a template in Open WebUI, can start the stopped sandboxes of many users at the same time: one for each user that has access, an open page, and the terminal selected. Each of these sandboxes then operates for its idle time. Set `--max-sandboxes` with this in mind.
+
+Warren has no time after an operation in which it refuses requests.
+To keep the sandbox of a user stopped, remove the user from the user list of the policy first (section 9). Warren then refuses each request of that user before it starts a sandbox.
+
+During a restart operation, a request waits for the start of the operation, and it does not start the sandbox itself. Thus the sandbox stays on the account of the user that started it first, and the sandbox limit of the user of the request does not apply.
+If the operation ends with no start, for example because warren has no capacity, the requests that wait start the sandbox as usual.
+
 - After a reset, the sandbox stays in the instance list as a stopped instance. Its empty volume counts for the limits. Warren has no database, thus the volume is the record of an instance that has no pod.
 - The retention time of the policy applies to the empty volume, as to each volume that no sandbox uses (section 7.1). When warren deletes the volume, the sandbox is not in the instance list.
 - After a delete, the sandbox is not in the instance list, and its volume does not count for the limits.
@@ -339,10 +354,47 @@ Warren has a special rule for this request. Without the rule, a view that stays 
 - The request does not start a sandbox. For a stopped sandbox, the reply is status 409 with the text "The terminal is stopped. It starts when you use it." Open WebUI shows this text and stops its timer.
 - The request is not a use of the sandbox. It does not start the idle time again, and warren can stop the sandbox while the request is in progress.
 - When a different request or operation started the sandbox, the request waits until the pod is ready, for a maximum of 50 seconds. After that time the reply is status 503.
+- While a restart operation is in progress, the request also waits: the operation starts the sandbox again.
 - The limits on the number of sandboxes and volumes do not apply to this request.
-- A sandbox is stopped for this rule in these conditions: it has no pod and no start is in progress, its pod is in deletion, its pod failed, or a reset or a delete operation is in progress.
+- A sandbox is stopped for this rule in these conditions: it has no pod and no start is in progress, its pod is in deletion, its pod failed, or a reset or a delete operation is in progress. A pod that a restart operation deletes is not such a condition.
 
-Each other request for a sandbox, also each other request that Open WebUI sends with no action of a person, is a use of the sandbox (`protocol.md`, section 4.1.2).
+Each other request for a sandbox, also each other request that Open WebUI sends with no action of a person, is a use of the sandbox (`protocol.md`, sections 4.1.2 and 4.1.3).
+
+### 10.2 Open WebSockets when a sandbox stops
+
+When warren stops a sandbox, it closes each open WebSocket of that sandbox: the terminals, the watchers of files and ports, the process streams, the desktop, the browser view, and the agent sessions.
+Warren also does this when it sees that a different actor deletes the pod.
+The client gets a close code and a reason text that agree with the reason of the stop:
+
+| Reason of the stop | Close code | Reason text |
+|---|---|---|
+| `api`: a stop, restart, reset, or delete operation (section 10) | 1012 | `An operation stopped or restarted the terminal` |
+| `idle`: the idle time | 4004 | `The terminal stopped after its idle time` |
+| `no_policy`: the policy is not in the file, or it has a different scope (section 11) | 4004 | `Template not found` |
+| `network_changed`: the policy file removed a network permission (section 11) | 1012 | `The terminal restarts` |
+| `volume_gone`: the volume of the sandbox is absent or in deletion | 1012 | `The terminal restarts` |
+| `external`: a different actor deletes the pod, for example a person with kubectl, or Kubernetes when it drains a node | 1012 | `The terminal restarts` |
+| Each other reason, for example `failed`, `not_ready`, `start_error`, and `unreachable` ([isolation.md](isolation.md), section 7) | 1011 | `The terminal failed` |
+
+Rules:
+
+- The sandbox side of the WebSocket gets the close code 1001.
+- Warren tells the WebSockets before it sends the delete request for the pod to Kubernetes. A sandbox that stops closes its WebSockets itself, usually with the code 1012 and no text (`open-terminal-api.md`, section 4.3). The client gets the code and the text of warren also when the close of the sandbox comes first.
+- If Kubernetes refuses the delete request, the WebSockets are closed, and the pod continues.
+- Warren sees a delete by a different actor only in its pod cache. If the sandbox closes its WebSockets before that time, the client gets the code of the sandbox, or the code 1011 when the connection breaks.
+- The reason `external` is only for the close of the WebSockets. It is not in the metrics.
+- In this version, an open WebSocket is a use of the sandbox. Warren does not stop a sandbox with an open WebSocket for its idle time, thus the row for the idle time does not occur.
+- An HTTP request in progress gets no signal. It completes in the termination time of the pod, which is 10 seconds, or it gets the status 502 or 504.
+- A WebSocket that is not connected to its pod at the time of the stop gets no signal. If its connection to the pod then fails, the client gets the code 1011.
+
+What the clients of Open WebUI do with the code (`protocol.md`, sections 4.2.1 and 4.2.3):
+
+- Open WebUI sends the close code to the browser with no change, but it does not send the reason text. The text is for other clients. The audit record has the reason of the stop (section 13).
+- After the codes 1012 and 1011, each client connects again after 1 or 2 seconds. The desktop audio is the only exception. Open WebUI has no special rule for the code 1012.
+- Each new connection is a usual request, and it starts the sandbox again. The interactive terminal sends an HTTP request before it connects again. A new pod does not know the terminal session of the previous pod, thus the tab then shows "Session no longer available" and the control "Start new terminal".
+- After the code 4004, the clients in the browser do not connect again. The terminal tab shows "Session no longer available". The watchers and the process streams stay stopped until the user changes the chat or opens the tab again.
+
+The close code does not make a stop hold. Refer to section 10.
 
 ## 11. Changes of the policy file
 
@@ -354,12 +406,12 @@ If the new file is not valid, warren writes an error to its log and continues wi
 |---|---|
 | Image, resources, storage, environment, runtime class, node selector, tolerations, command, user ID, user namespace | Applies to pods that start after the change. A pod that operates keeps its settings. Send a restart operation to apply the change. |
 | Network: a new permission. This is a new item of `allow`, `egress` from `none` to `internet`, or `dns` from `false` to `true`. | Applies a maximum of 30 seconds after warren reads the file, also to the pods that operate. |
-| Network: a removed permission. This is `egress` from `internet` to `none`, `dns` from `true` to `false`, or an item of `allow` that you remove or change. | Warren stops the sandboxes of the policy. The next request starts them again with the new settings. A network plugin can let an open connection continue after a change, thus only a stop closes it. Warren compares complete items of `allow`. Thus each change of `ports`, `cidr`, `namespace`, or `podLabels` of an item stops the sandboxes, also a change that makes the item wider. To add a port or a network with no stop, add a second item. Refer to [isolation.md](isolation.md), section 7.1. |
+| Network: a removed permission. This is `egress` from `internet` to `none`, `dns` from `true` to `false`, or an item of `allow` that you remove or change. | Warren stops the sandboxes of the policy. An open WebSocket gets the close code 1012 (section 10.2). The next request starts them again with the new settings. A network plugin can let an open connection continue after a change, thus only a stop closes it. Warren compares complete items of `allow`. Thus each change of `ports`, `cidr`, `namespace`, or `podLabels` of an item stops the sandboxes, also a change that makes the item wider. To add a port or a network with no stop, add a second item. Refer to [isolation.md](isolation.md), section 7.1. |
 | Idle time | Applies immediately, also to the pods that operate. |
 | Retention time | Applies immediately, also to the volumes that exist. Refer to section 7.1. |
 | User list | Applies to the next request. A terminal that is open stays open. Refer to section 9. |
 | Storage type from persistent to ephemeral | New pods do not use the volume. The volume stays until its retention time, or until a person deletes the instance. |
-| You remove a policy | Each chat that uses the terminal gets an error. Warren stops the pods of the policy a maximum of 30 seconds after it reads the file, also a pod with an open terminal. Warren keeps the volumes. |
+| You remove a policy | Each chat that uses the terminal gets an error. Warren stops the pods of the policy a maximum of 30 seconds after it reads the file, also a pod with an open terminal. An open WebSocket gets the close code 4004 (section 10.2). Warren keeps the volumes. |
 | The scope of a policy changes | Warren does the same as for a removed policy, for the pods and volumes of the previous scope. The retention time of the policy does not apply to the volumes of the previous scope. |
 
 ### 11.1 Volumes of a removed policy
@@ -415,6 +467,15 @@ The network policies and the test pod of warren are in [isolation.md](isolation.
 
 Warren writes an audit record (`"log":"audit"`) when it makes a volume and when it deletes a volume. The record has the sandbox name, the policy, and the context.
 The record of a new volume also has the user and the size. The record of a deleted volume also has the reason.
+
+The audit record of a WebSocket (`"msg":"access"`, `"websocket":true`) has the cause of its end in the field `detail`:
+
+| Text of `detail` | Meaning |
+|---|---|
+| `closed by client, code N` | The client closed the WebSocket. `N` is the close code of the client. The value 1006 means a connection that broke. |
+| `closed by sandbox, code N` | The sandbox closed the WebSocket, and warren did not stop the sandbox. `N` is the close code of the sandbox. The value 1006 means a connection that broke: the client then got the code 1011. |
+| `closed by warren, code N, reason R` | Warren stopped the sandbox, or a different actor deleted its pod. `N` is the close code that the client got, and `R` is the reason of the stop (section 10.2). |
+| `closed by warren, code 1012` | The warren process stopped. |
 
 ## 14. Network
 

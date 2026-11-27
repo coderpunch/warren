@@ -158,6 +158,7 @@ Facts about the terminal WebSocket:
 
 - Terminal input and terminal output are binary messages. Control data is JSON text messages (`main.py:2681-2709`).
 - The session ID is the first 8 characters of a random UUID (`main.py:2232`). It has 32 bits. It is an identifier and not a secret.
+- The server keeps the sessions in the memory of its process (`main.py:2157`). Thus a new pod knows no session of the previous pod. For an unknown session ID, `GET /api/terminals/{session_id}` replies with status 404 and the body `{"error":"Session not found"}` (`main.py:2467-2472`).
 - If the session ID is unknown, the server closes with code 4004 before it accepts the WebSocket (`main.py:2532-2540`).
 - Test result: the client then gets HTTP status 403 with an empty body. The client does not see the code 4004.
 - After authentication, the server compares `X-User-Id` and the chat ID with the values of the session. If they are different, it closes with code 4004 (`main.py:2545-2550`).
@@ -320,10 +321,18 @@ Close codes for each WebSocket:
 | `/desktop/stream`, `/desktop/audio` | 4001 bad token, 4004 no audio, 1012 desktop closes, 1011 all other causes. A late or bad first message gives 1011. | `open_terminal/desktop/router.py:640-665` |
 | `/browser/view/.../ws`, `/stream`, `/vnc` | HTTP status 403 for a bad token. 4000 a different viewer took the stream. 4004 session closed. 1011 failure. | `open_terminal/browser/router.py:408-510` |
 
+What the WebSockets get when the server stops:
+
+- The server starts uvicorn with no WebSocket option (`cli.py:210-225`). It needs uvicorn 0.34.0 or later (`pyproject.toml:13`).
+- When uvicorn stops, it closes each open WebSocket with the code 1012 and with no reason text. This is in the source of the library, and not in the repository of Open Terminal: version 0.34.0, `uvicorn/protocols/websockets/websockets_impl.py:147-153`; version 0.54.0, `uvicorn/protocols/websockets/websockets_sansio_impl.py:185-192` and `uvicorn/protocols/websockets/wsproto_impl.py:214-220`.
+- Inference: Kubernetes sends the signal SIGTERM to the container when it deletes a pod. The start command of warren uses `tini`, which sends the signal to the server (`isolation.md`, section 2.1). The server then closes its WebSockets with the code 1012. No test on a cluster examined this.
+- A server that gets no signal, or that does not stop in the termination time of the pod, sends no close message. Its peer then sees a connection that broke.
+
 Results for warren:
 
 1. A key in the header of the upgrade request has no effect. To hide the key of a pod from the client, warren must replace the `token` value in the first message.
 2. Warren must send a correct close code to its client when the pod replies with status 403 to an upgrade request.
+3. The close code that a sandbox sends when it stops is not a reliable signal: it has no text, and it depends on the start command and on the signal. Warren closes the WebSockets of a sandbox itself before it stops the pod, with its own code and text (`policies.md`, section 10.2).
 
 ## 5. Identity inputs
 

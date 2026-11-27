@@ -18,3 +18,21 @@ func TestStaticBackendIgnoresPassive(t *testing.T) {
 		lease.Release()
 	}
 }
+
+// The development backend stops nothing, thus its lease never gets a stop
+// signal.
+func TestStaticLeaseHasNoStopSignal(t *testing.T) {
+	lease, err := Static{}.Acquire(context.Background(), Request{WebSocket: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	select {
+	case <-lease.Stopped():
+		t.Error("the lease of the development backend has a stop signal")
+	default:
+	}
+	if got := lease.StopReason(); got != "" {
+		t.Errorf("stop reason = %q, want no reason", got)
+	}
+}

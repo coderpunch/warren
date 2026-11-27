@@ -10,6 +10,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/coderpunch/warren/internal/backend"
 )
 
 const (
@@ -178,21 +180,21 @@ func (m *Manager) Reap(ctx context.Context) {
 			// A different process or a person deleted the volume. All that
 			// the user writes now is lost. Stop the pod, thus the next
 			// start makes a new volume.
-			_ = m.deletePod(ctx, pod, "volume_gone", false)
+			_ = m.deletePod(ctx, pod, backend.StopVolumeGone, false)
 		case m.orphan(pod.Labels):
 			// The policy of the pod is not in the file, or it has a
 			// different scope. No new request can get to the pod. An open
 			// terminal would keep the pod and its network connections, thus
 			// warren does not wait for the end of the connections: the
 			// removal of a policy must stop its sandboxes.
-			_ = m.deletePod(ctx, pod, "no_policy", false)
+			_ = m.deletePod(ctx, pod, backend.StopNoPolicy, false)
 		case startError:
 			_ = m.deletePod(ctx, pod, "start_error", false)
 		case !podReady(pod) && now.Sub(notReadySince(pod)) > m.cfg.StartTimeout:
 			_ = m.deletePod(ctx, pod, "not_ready", false)
 		case podReady(pod) && leases == 0 && m.idleTimeout(pod) > 0 && now.Sub(last) > m.idleTimeout(pod):
 			// deletePod looks at the leases again, together with its mark.
-			_ = m.deletePod(ctx, pod, "idle", true)
+			_ = m.deletePod(ctx, pod, backend.StopIdle, true)
 		case persist:
 			m.persistActivity(ctx, pod, last)
 		}

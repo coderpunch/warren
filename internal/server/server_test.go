@@ -41,6 +41,9 @@ type fakeTerminal struct {
 	// openAPI is the document that the terminal sends. The default is
 	// hostileOpenAPI.
 	openAPI string
+	// beforeEnd, if not nil, runs before the terminal ends a WebSocket
+	// because of the text message "close-1012" or "cut".
+	beforeEnd func()
 }
 
 func (f *fakeTerminal) setOpenAPI(doc string) {
@@ -268,6 +271,25 @@ func (f *fakeTerminal) handleWS(w http.ResponseWriter, r *http.Request) {
 			f.mu.Unlock()
 			return
 		}
+		if mt == websocket.TextMessage && (string(data) == "close-1012" || string(data) == "cut") {
+			f.mu.Lock()
+			beforeEnd := f.beforeEnd
+			f.mu.Unlock()
+			if beforeEnd != nil {
+				beforeEnd()
+			}
+			if string(data) == "cut" {
+				// A process that stops with no close message.
+				conn.NetConn().Close()
+				return
+			}
+			// The server of Open Terminal closes each WebSocket with this
+			// code, and with no text, when it stops
+			// (docs/open-terminal-api.md, section 4.3).
+			_ = conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseServiceRestart, ""), time.Now().Add(time.Second))
+			return
+		}
 		if err := conn.WriteMessage(mt, append([]byte("echo:"), data...)); err != nil {
 			return
 		}
@@ -285,19 +307,43 @@ type mapBackend struct {
 	block chan struct{}
 	// errors has the error that Acquire returns for a sandbox name.
 	errors map[string]error
+	// leases has each lease that Acquire gave, in the sequence of the calls.
+	leases []*mapLease
 }
 
 type mapLease struct {
 	m      *mapBackend
 	target backend.Target
+	// stopped closes when a test stops the sandbox of the lease. reason is
+	// the cause. The lock of the backend guards the two fields.
+	stopped chan struct{}
+	reason  string
 }
 
-func (l *mapLease) Target() backend.Target { return l.target }
+func (l *mapLease) Target() backend.Target   { return l.target }
+func (l *mapLease) Stopped() <-chan struct{} { return l.stopped }
+func (l *mapLease) StopReason() string {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	return l.reason
+}
 func (l *mapLease) Release() {
 	l.m.mu.Lock()
 	defer l.m.mu.Unlock()
 	l.m.open--
 	l.m.released++
+}
+
+// stop gives the lease the stop signal, as the backend does when it stops
+// the sandbox. A second call has no effect: the first reason stays.
+func (l *mapLease) stop(reason string) {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	if l.reason != "" {
+		return
+	}
+	l.reason = reason
+	close(l.stopped)
 }
 
 func (m *mapBackend) Acquire(ctx context.Context, req backend.Request) (backend.Lease, error) {
@@ -324,10 +370,30 @@ func (m *mapBackend) Acquire(ctx context.Context, req backend.Request) (backend.
 		}
 		return nil, backend.ErrNotReady
 	}
+	l := &mapLease{m: m, target: t, stopped: make(chan struct{})}
 	m.mu.Lock()
 	m.open++
+	m.leases = append(m.leases, l)
 	m.mu.Unlock()
-	return &mapLease{m: m, target: t}, nil
+	return l, nil
+}
+
+// lastLease returns the lease of the last call that got one.
+func (m *mapBackend) lastLease(t *testing.T) *mapLease {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.leases) == 0 {
+		t.Fatal("the backend gave no lease")
+	}
+	return m.leases[len(m.leases)-1]
+}
+
+// releases returns the number of leases that ended.
+func (m *mapBackend) releases() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.released
 }
 
 func (m *mapBackend) callCount() int {
@@ -828,6 +894,14 @@ func (e *env) dial(path, user string, header http.Header) (*websocket.Conn, *htt
 
 func closeCode(t *testing.T, conn *websocket.Conn) int {
 	t.Helper()
+	code, _ := closeMessage(t, conn)
+	return code
+}
+
+// closeMessage reads until the close message and returns its code and its
+// reason text.
+func closeMessage(t *testing.T, conn *websocket.Conn) (int, string) {
+	t.Helper()
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	for {
 		_, _, err := conn.ReadMessage()
@@ -835,7 +909,7 @@ func closeCode(t *testing.T, conn *websocket.Conn) int {
 			continue
 		}
 		if ce, ok := err.(*websocket.CloseError); ok {
-			return ce.Code
+			return ce.Code, ce.Text
 		}
 		t.Fatalf("no close message: %v", err)
 	}

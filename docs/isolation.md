@@ -303,6 +303,10 @@ Warren stops a pod in these conditions, in addition to the conditions of [polici
 | `public_address` | An address of the pod is not in a blocked network. |
 | `no_network_policy` | A version of warren before the network policies started the pod. Warren uses this reason only in the conditions of section 8. |
 
+Before warren sends the delete request for a pod, it closes each open WebSocket of that sandbox. The client gets a close code that agrees with the reason: 1012 for `network_changed`, 4004 for `no_policy`, and 1011 for the other reasons of this table.
+The client of Open WebUI connects again after the codes 1012 and 1011, and the new connection starts the sandbox again. After `network_changed`, the new pod has the new network settings. After `no_policy`, a new connection gets the code 4004 again.
+Refer to [policies.md](policies.md), section 10.2.
+
 ### 7.1 Changes of the network settings
 
 Warren compares the network settings that a sandbox has with the settings of the new policy file.

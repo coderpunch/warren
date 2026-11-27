@@ -264,6 +264,7 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 		return
 	}
 	defer lease.Release()
+	s.lease = lease
 	target := lease.Target()
 
 	up, code, err := p.dialSandbox(ctx, r, rt, target)
@@ -453,6 +454,59 @@ type closeInfo struct {
 	// writeFailed: a write to this side failed. The reader of this side
 	// can have the real close code.
 	writeFailed bool
+	// reason is the stop reason of the backend, when the backend stopped
+	// the sandbox. It is empty in all other conditions.
+	reason string
+}
+
+// stopClose gives the close code and the reason text that the client gets
+// when the backend stops the sandbox of a WebSocket (docs/policies.md,
+// section 10.2). The client of Open WebUI connects again after the codes
+// 1011 and 1012, and it does not connect again after a code from 4000 to
+// 4999 (docs/protocol.md, section 4.2.3). Open WebUI does not send the text
+// to the browser. The text is for other clients.
+func stopClose(reason string) (code int, text string) {
+	switch reason {
+	case backend.StopAPI:
+		return websocket.CloseServiceRestart, "An operation stopped or restarted the terminal"
+	case backend.StopIdle:
+		return closeNotFound, "The terminal stopped after its idle time"
+	case backend.StopNoPolicy:
+		// A new connection gets the same code and text from the route check.
+		return closeNotFound, "Template not found"
+	case backend.StopNetworkChanged, backend.StopVolumeGone, backend.StopExternal:
+		return websocket.CloseServiceRestart, "The terminal restarts"
+	}
+	return websocket.CloseInternalServerErr, "The terminal failed"
+}
+
+// backendStop returns the close data for a stop of the sandbox by the
+// backend. It reports false if the lease does not have the stop signal.
+func backendStop(lease backend.Lease) (closeInfo, bool) {
+	select {
+	case <-lease.Stopped():
+	default:
+		return closeInfo{}, false
+	}
+	reason := lease.StopReason()
+	code, text := stopClose(reason)
+	return closeInfo{side: sideWarren, code: code, text: text, reason: reason}, true
+}
+
+// cause returns the close data for the end of a relay, from the data of the
+// side that stopped first. When the sandbox side stopped and the lease has
+// the stop signal, the stop by the backend is the cause: a sandbox that stops
+// sends its own close code, or it breaks the connection. The client then gets
+// the code of warren, thus the result does not depend on the sequence of the
+// two events.
+func (s *session) cause(first closeInfo) closeInfo {
+	if first.side != sideSandbox {
+		return first
+	}
+	if stop, ok := backendStop(s.lease); ok {
+		return stop
+	}
+	return first
 }
 
 // session is one WebSocket relay.
@@ -460,6 +514,9 @@ type session struct {
 	proxy   *Proxy
 	client  *websocket.Conn
 	sandbox *websocket.Conn
+	// lease is the lease on the sandbox. It is nil until the backend gives
+	// it.
+	lease backend.Lease
 	// closing is true after warren sent a close message. The copy loops
 	// then read and discard, until the reply to the close message comes.
 	closing atomic.Bool
@@ -563,9 +620,15 @@ func (s *session) copyMessages(dst, src *websocket.Conn, fromClient bool, mt int
 	}
 }
 
-// finish waits until one side of a relay stops. It then sends the close
-// code to the other side, waits for the reply, and closes the connections.
-// It returns a text for the audit record.
+// finish waits until one side of a relay stops, until the backend stops the
+// sandbox, or until warren stops. It then sends the close code to the other
+// side, or to the two sides, waits for the reply, and closes the
+// connections. It returns a text for the audit record.
+//
+// When the backend stops the sandbox, the client gets the code of
+// stopClose, and the sandbox gets the code 1001. This is also the result when
+// the sandbox side ends first and the lease has the stop signal at that time:
+// refer to cause.
 func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 	var first closeInfo
 	clientRunning, sandboxRunning := true, true
@@ -582,8 +645,10 @@ func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 		take(info, true)
 	case info := <-sandboxDone:
 		take(info, false)
+	case <-s.lease.Stopped():
+		first, _ = backendStop(s.lease)
 	case <-s.proxy.closing:
-		first = closeInfo{side: sideWarren}
+		first = closeInfo{side: sideWarren, code: websocket.CloseServiceRestart, text: "The server restarts"}
 	}
 
 	// A failed write says only that a side is gone. The reader of that
@@ -605,6 +670,7 @@ func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 		}
 		timer.Stop()
 	}
+	first = s.cause(first)
 
 	s.closing.Store(true)
 	switch first.side {
@@ -613,7 +679,7 @@ func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 	case sideSandbox:
 		closeConn(s.client, sandboxCloseCode(first.code), first.text)
 	default:
-		closeConn(s.client, websocket.CloseServiceRestart, "The server restarts")
+		closeConn(s.client, first.code, first.text)
 		closeConn(s.sandbox, websocket.CloseGoingAway, "")
 	}
 
@@ -643,7 +709,11 @@ func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 			clientRunning, sandboxRunning = false, false
 		}
 	}
-	return fmt.Sprintf("closed by %s, code %d", first.side, first.code)
+	detail := fmt.Sprintf("closed by %s, code %d", first.side, first.code)
+	if first.reason != "" {
+		detail += ", reason " + first.reason
+	}
+	return detail
 }
 
 // reserved reports whether a close code must not be in a close message.

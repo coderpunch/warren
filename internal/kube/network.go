@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/coderpunch/warren/internal/backend"
 	"github.com/coderpunch/warren/internal/policy"
 )
 
@@ -555,7 +556,7 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 					"template", pod.Labels[LabelTemplate], "restart", removed)
 			}
 			if removed {
-				_ = m.deletePod(ctx, pod, "network_changed", false)
+				_ = m.deletePod(ctx, pod, backend.StopNetworkChanged, false)
 			}
 		}
 	}

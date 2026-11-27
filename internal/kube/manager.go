@@ -114,6 +114,10 @@ type state struct {
 	// leases is the number of open requests and WebSockets. A passive
 	// request does not count.
 	leases int
+	// sockets has the open leases of the WebSocket requests. Each one is
+	// for one pod, and it gets a signal when that pod stops: refer to
+	// stopLeasesLocked. Each one is also in the number of leases.
+	sockets map[*lease]struct{}
 	// lastActivity is the time of the last start or end of a lease that
 	// counts.
 	lastActivity time.Time
@@ -174,6 +178,11 @@ type state struct {
 	// resetting is true while a reset operation runs. No start and no
 	// lease is possible in that time.
 	resetting bool
+	// restarting is the number of restart operations that are in progress.
+	// While it is not zero, only a restart operation starts the sandbox: a
+	// request waits for that start, and it does not send its own. It is a
+	// number because two operations can run at the same time.
+	restarting int
 	// volumeBusy is true while the reaper changes or deletes the volume.
 	// No start is possible in that time.
 	volumeBusy bool
@@ -487,6 +496,12 @@ func (m *Manager) podChanged(obj any, deleted bool) {
 	}
 	m.mu.Lock()
 	if st := m.sandboxes[pod.Name]; st != nil {
+		if deleted || pod.DeletionTimestamp != nil {
+			// The pod stops. If warren sent the delete request, the leases
+			// have their signal and its reason. If not, a different actor
+			// deletes the pod.
+			m.stopLeasesLocked(st, pod.UID, backend.StopExternal)
+		}
 		if deleted {
 			if st.deleting == pod.UID {
 				st.deleting = ""
@@ -570,8 +585,8 @@ func (m *Manager) stateLocked(name string) *state {
 // no operation in progress. The caller must hold m.mu.
 func (m *Manager) dropLocked(name string) {
 	st := m.sandboxes[name]
-	if st != nil && st.leases == 0 && !st.starting && !st.creating && st.deleting == "" &&
-		!st.resetting && !st.volumeBusy && m.pod(name) == nil {
+	if st != nil && st.leases == 0 && len(st.sockets) == 0 && !st.starting && !st.creating && st.deleting == "" &&
+		!st.resetting && st.restarting == 0 && !st.volumeBusy && m.pod(name) == nil {
 		delete(m.sandboxes, name)
 	}
 }
@@ -625,10 +640,17 @@ const pollInterval = time.Second
 // that waits at that time. A lease that a caller has stays.
 //
 // A passive request (backend.Request.Passive) never starts the sandbox. It
-// waits only while a start that a different caller began is in progress, or
-// while a pod is not ready or not usable. In all other conditions with no
-// usable pod it gets ErrStopped immediately, also in the middle of the wait.
-// Its lease is not a use of the sandbox: refer to tryAcquire.
+// waits only while a start that a different caller began is in progress,
+// while a restart operation is in progress, or while a pod is not ready or
+// not usable. In all other conditions with no usable pod it gets ErrStopped
+// immediately, also in the middle of the wait. Its lease is not a use of the
+// sandbox: refer to tryAcquire.
+//
+// While a restart operation is in progress, no request starts the sandbox.
+// Each request waits for the start of that operation: refer to Restart.
+//
+// The lease of a WebSocket request (backend.Request.WebSocket) is for one
+// pod. Its Stopped channel closes when that pod stops.
 func (m *Manager) Acquire(ctx context.Context, req backend.Request) (backend.Lease, error) {
 	name := req.Ref.Name()
 	for {
@@ -674,6 +696,7 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 	pod := m.pod(name)
 	deleting := pod != nil && st != nil && st.deleting == pod.UID
 	resetting := st != nil && st.resetting
+	restarting := st != nil && st.restarting > 0
 	starting := st != nil && st.startInProgress(m.now())
 	bad := m.badKeys[name]
 	m.mu.Unlock()
@@ -681,19 +704,27 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 	if req.Passive {
 		// A passive request does not start a sandbox, does not delete a pod,
 		// and does not wait for the end of a stop or a reset. It waits only
-		// for a start that is in progress, and for a pod that is not ready
-		// or not usable: the switch and the checks below are the same for
-		// each request in these conditions.
+		// for a start that is in progress, for the start of a restart
+		// operation, and for a pod that is not ready or not usable: the
+		// switch and the checks below are the same for each request in these
+		// conditions.
 		switch {
 		case resetting:
 			return nil, backend.ErrStopped
-		case pod == nil && starting:
-			// A different caller began the start. Wait for its pod.
+		case pod == nil && (starting || restarting):
+			// A different caller began the start, or a restart operation
+			// starts the sandbox after the end of the previous pod. Wait for
+			// the pod.
 			return nil, nil
 		case pod == nil:
 			return nil, backend.ErrStopped
 		case pod.Labels[LabelManagedBy] != ManagedByValue:
 			// The switch below gives the error.
+		case restarting && (pod.DeletionTimestamp != nil || deleting || podTerminal(pod)):
+			// A restart operation removes this pod and starts the sandbox
+			// again. Wait for the new pod. If the operation ends with no
+			// start, the next step gives the reply of a stopped sandbox.
+			return nil, nil
 		case pod.DeletionTimestamp != nil || deleting || podTerminal(pod):
 			// The reaper deletes a pod in a final phase.
 			return nil, backend.ErrStopped
@@ -703,6 +734,13 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 	switch {
 	case resetting:
 		// A reset deletes the pod and the volume. Wait for its end.
+		return nil, nil
+	case restarting && pod == nil:
+		// A restart operation starts the sandbox, on the account of the user
+		// that started it first, and with no limit for that user. The start
+		// of a request uses the user of the request and the limit of that
+		// user. Thus the request does not start the sandbox at this time: it
+		// waits for the start of the operation.
 		return nil, nil
 	case pod == nil:
 		if bad.count > 0 && m.now().Sub(bad.last) < bad.backoff() {
@@ -829,7 +867,18 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 		st.coldStart = false
 		m.cfg.Metrics.ColdStart(m.now().Sub(st.createStart))
 	}
-	return &lease{m: m, name: name, target: target}, nil
+	l := &lease{m: m, name: name, target: target}
+	if req.WebSocket {
+		// The lease is for this pod. The checks above made sure, with the
+		// lock, that the pod is not in deletion. Thus each stop of the pod
+		// comes after this point and finds the lease.
+		l.uid, l.stopped = pod.UID, make(chan struct{})
+		if st.sockets == nil {
+			st.sockets = map[*lease]struct{}{}
+		}
+		st.sockets[l] = struct{}{}
+	}
+	return l, nil
 }
 
 type lease struct {
@@ -840,9 +889,29 @@ type lease struct {
 	// only the target.
 	passive bool
 	once    sync.Once
+
+	// The fields below are only for the lease of a WebSocket request. uid is
+	// the pod of the lease. stopped closes when warren stops that pod, or
+	// sees that a different actor deletes it.
+	uid     types.UID
+	stopped chan struct{}
+	// over is true after stopped closed, and reason is the cause. The lock
+	// of the Manager guards the two fields.
+	over   bool
+	reason string
 }
 
 func (l *lease) Target() backend.Target { return l.target }
+
+// Stopped returns the channel of the stop signal. For a lease that is not
+// the lease of a WebSocket request, the channel is nil: it never closes.
+func (l *lease) Stopped() <-chan struct{} { return l.stopped }
+
+func (l *lease) StopReason() string {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	return l.reason
+}
 
 func (l *lease) Release() {
 	if l.passive {
@@ -855,10 +924,25 @@ func (l *lease) Release() {
 		if st == nil {
 			return
 		}
+		delete(st.sockets, l)
 		st.leases--
 		st.lastActivity = l.m.now()
 		l.m.dropLocked(l.name)
 	})
+}
+
+// stopLeasesLocked gives the stop signal to each WebSocket lease on the pod
+// with this UID. A lease that has the signal keeps its first reason. A lease
+// on a different pod of the same sandbox gets no signal. The caller must
+// hold m.mu.
+func (m *Manager) stopLeasesLocked(st *state, uid types.UID, reason string) {
+	for l := range st.sockets {
+		if l.uid != uid || l.over {
+			continue
+		}
+		l.over, l.reason = true, reason
+		close(l.stopped)
+	}
 }
 
 // createStale is the time after which warren does not wait for the pod of
@@ -1445,6 +1529,13 @@ func verifyKey(ctx context.Context, target backend.Target) error {
 
 // deletePod deletes a pod and records the reason. With idleOnly, it does
 // nothing if the sandbox has a lease.
+//
+// The WebSocket leases on the pod get the stop signal with the reason before
+// the delete request. The pod gets its stop signal from Kubernetes only after
+// that request. Thus the proxy closes each WebSocket with the code of warren,
+// and not with a code that the sandbox sends when it stops. If the delete
+// request fails, the signal stays: the WebSockets close, and the pod
+// continues.
 func (m *Manager) deletePod(ctx context.Context, pod *corev1.Pod, reason string, idleOnly bool) error {
 	m.mu.Lock()
 	st := m.stateLocked(pod.Name)
@@ -1453,6 +1544,7 @@ func (m *Manager) deletePod(ctx context.Context, pod *corev1.Pod, reason string,
 		return nil
 	}
 	st.deleting = pod.UID
+	m.stopLeasesLocked(st, pod.UID, reason)
 	m.mu.Unlock()
 
 	// Delete only the pod that warren examined, and not a new pod with the
@@ -1648,7 +1740,7 @@ func (m *Manager) Stop(ctx context.Context, ref scope.Ref) error {
 		return backend.ErrNotReady
 	}
 	if pod := m.pod(ref.Name()); pod != nil && pod.DeletionTimestamp == nil {
-		return m.deletePod(ctx, pod, "api", false)
+		return m.deletePod(ctx, pod, backend.StopAPI, false)
 	}
 	return nil
 }
@@ -1674,18 +1766,39 @@ func (m *Manager) waitGone(ctx context.Context, name string, uid types.UID) erro
 
 // Restart stops a sandbox, waits until its pod is gone, and starts it again.
 // The sandbox stays on the account of the user that started it.
+//
+// While the operation is in progress, only the operation starts the sandbox.
+// The clients of the WebSockets that the stop closed connect again in a short
+// time, and they wait in Acquire when the pod goes away. Without the mark,
+// one of them can send the start request first, with its own user and with
+// the limit of that user. If the operation ends with no start, for example
+// when its context ends or when warren has no capacity, the requests that
+// wait start the sandbox as usual.
 func (m *Manager) Restart(ctx context.Context, req backend.Request) error {
 	if !m.Ready() {
 		return backend.ErrNotReady
 	}
 	name := req.Ref.Name()
+	m.mu.Lock()
+	m.stateLocked(name).restarting++
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		// The state stays while the mark is set: refer to dropLocked.
+		if st := m.sandboxes[name]; st != nil && st.restarting > 0 {
+			st.restarting--
+		}
+		m.dropLocked(name)
+		m.wakeLocked()
+		m.mu.Unlock()
+	}()
 	by := ""
 	if pod := m.pod(name); pod != nil {
 		// For the sandbox of a chat, a model, or a template, Open WebUI
 		// sends the ID of the manager (docs/protocol.md, section 4.6).
 		by = pod.Annotations[AnnotationCreatedBy]
 		if pod.DeletionTimestamp == nil {
-			if err := m.deletePod(ctx, pod, "api", false); err != nil {
+			if err := m.deletePod(ctx, pod, backend.StopAPI, false); err != nil {
 				return fmt.Errorf("stop sandbox: %w", err)
 			}
 		}
@@ -1835,7 +1948,7 @@ func (m *Manager) remove(ctx context.Context, name string, keep bool) (*corev1.P
 			break
 		}
 		if pod != nil && pod.DeletionTimestamp == nil {
-			if err := m.deletePod(ctx, pod, "api", false); err != nil {
+			if err := m.deletePod(ctx, pod, backend.StopAPI, false); err != nil {
 				return nil, fmt.Errorf("stop sandbox: %w", err)
 			}
 		}
@@ -1862,7 +1975,7 @@ func (m *Manager) remove(ctx context.Context, name string, keep bool) (*corev1.P
 				// A different warren process can make a pod in this time.
 				// The volume cannot go away while a pod uses it.
 				if pod := m.pod(name); pod != nil && pod.DeletionTimestamp == nil {
-					if err := m.deletePod(ctx, pod, "api", false); err != nil {
+					if err := m.deletePod(ctx, pod, backend.StopAPI, false); err != nil {
 						return nil, fmt.Errorf("stop sandbox: %w", err)
 					}
 				}

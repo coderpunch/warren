@@ -36,13 +36,47 @@ type Request struct {
 }
 
 // Lease is the permission to use a sandbox for one request or connection.
-// While a lease is open, the backend must not stop the sandbox. The lease of
-// a passive request is different: it does not keep the sandbox.
+// While a lease is open, the backend does not stop the sandbox because of
+// its idle time. Each other stop reason applies also to a sandbox with an
+// open lease. The lease of a passive request is different: it does not keep
+// the sandbox.
 type Lease interface {
 	Target() Target
+	// Stopped returns a channel that closes when the backend stops the
+	// sandbox of this lease, or when it sees that a different actor deletes
+	// it. The caller must then close its connection to the sandbox and call
+	// Release. Only the lease of a WebSocket request gets this signal. For
+	// each other lease, the channel never closes.
+	Stopped() <-chan struct{}
+	// StopReason returns the cause of the stop: one of the Stop values, or a
+	// different text of the backend. It is empty until Stopped closes.
+	StopReason() string
 	// Release ends the lease. The caller must call it one time.
 	Release()
 }
+
+// Stop reasons for which the proxy has a special close code. A backend can
+// give more reasons. The proxy uses one code for each reason that is not in
+// this list.
+const (
+	// StopAPI is a stop, restart, reset, or delete operation of the
+	// management API.
+	StopAPI = "api"
+	// StopIdle is the stop of a sandbox that had no use for its idle time.
+	StopIdle = "idle"
+	// StopNoPolicy means that the policy of the sandbox is not in the
+	// policy file, or that it has a different scope.
+	StopNoPolicy = "no_policy"
+	// StopNetworkChanged means that the policy file removed a network
+	// permission of the sandbox.
+	StopNetworkChanged = "network_changed"
+	// StopVolumeGone means that the volume of the sandbox is absent or in
+	// deletion.
+	StopVolumeGone = "volume_gone"
+	// StopExternal means that a different actor deletes the sandbox, for
+	// example a person with kubectl, or Kubernetes when it drains a node.
+	StopExternal = "external"
+)
 
 // Errors that a backend can return. The proxy changes them into an HTTP
 // status or a WebSocket close code.
@@ -79,7 +113,11 @@ type Static struct {
 type staticLease struct{ target Target }
 
 func (l staticLease) Target() Target { return l.target }
-func (staticLease) Release()         {}
+
+// Stopped returns a channel that never closes: this backend stops nothing.
+func (staticLease) Stopped() <-chan struct{} { return nil }
+func (staticLease) StopReason() string       { return "" }
+func (staticLease) Release()                 {}
 
 // Acquire returns a lease on the one server. The one server always operates,
 // thus a passive request gets the same lease.

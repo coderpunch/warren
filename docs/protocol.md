@@ -198,11 +198,50 @@ These requests come one time for an event, with no action of the user in the ter
 
 Results for warren:
 
-1. Warren has no special rule for the requests of the last list. Each one is a use of the sandbox, and it starts a stopped sandbox.
+1. Warren has no special rule for the requests of the last list. Each one is a use of the sandbox, and it starts a stopped sandbox. The browser sends some of them again after an event of Open WebUI, with no person (section 4.1.3), and before a WebSocket connects again (section 4.2.3).
 2. The system information is different: a view that stays open sends requests with no end, and the data are not proof that a person uses the sandbox. Decision 8 of section 9.5 is the rule of warren for it.
 3. Warren has no rule for the timer of the Browser tab. Each such request is a use of the sandbox, and it starts a stopped sandbox. A forgotten Browser tab thus keeps its sandbox with no end.
 4. A new sandbox does not know the browser session of the previous pod, thus the reply to the timer is then status 404 (`open-terminal-api.md`, section 3.7). The browser ignores the reply, and the timer continues.
 5. A rule for the method and the path cannot be the remedy: the same method and path carry the actions of the user. A rule must read the body. Open WebUI sends the body as a stream (`routers/terminals.py:424-425`), thus the `Content-Length` header is not a sufficient test.
+
+#### 4.1.3 Requests after the event `terminals:changed`
+
+Open WebUI sends the event `terminals:changed` to the browsers when the terminals change. Each page that gets the event sends requests for its selected terminal, with no action of a person.
+
+When Open WebUI sends the event:
+
+- After each instance operation: restart, stop, start, reset, and delete. Open WebUI waits for the reply of the orchestrator, and then it sends the event (`routers/templates.py:194-204`, `:207-229`). Only a user with write access to the terminal can send an instance operation (`routers/templates.py:195`).
+- After the create, the update, and the delete of a template, and after a change of the access grants of a template (`routers/templates.py:93`, `:107`, `:117`, `:144`).
+- After a change of a tether device, to the user of that device only (`routers/tether.py:25-31`).
+
+Who gets the event:
+
+- The user that made the change, and each user that has a read grant for the terminal (`routers/templates.py:45-51`).
+- A grant for a group gives the event to each member of the group. A grant for all users gives it to each user that is not pending (`models/access_grants.py:684-712`).
+- The event goes to each open page of these users (`socket/main.py:523-534`).
+
+What a page does with the event:
+
+- The handler is in the layout of all application pages. It reads the terminal list, the model list, and the tool list again (`src/routes/(app)/+layout.svelte:166-171`). The handler does not examine the visibility of the document, thus a hidden page does the same.
+- The read of the terminal list goes to the orchestrator only (section 4.6).
+- The store of the terminal list gets a new list at each read (`+layout.svelte:110-116`). The chat page sends `GET /skills` for the selected terminal when that store changes (section 4.1.2). Inference: a new list with the same content is also a change. No person read the source of the Svelte library for this document.
+- The read of the model list sends `GET /api/models` to Open WebUI. The request has the parameter `terminal_id` when the page has a selected terminal, and `chat_id` when a chat is open (`src/lib/apis/index.ts:7-31`). The selection is in the storage of the browser, thus each page of the user has it (`+layout.svelte:273-278`, `:415-423`).
+- For each such request, the Open WebUI backend sends `GET /files/cwd` and then `GET /agents` to the terminal server on path D, for the user of the page (`main.py:933-941`, `utils/agents/discovery.py:36-48`, `utils/terminals.py:408`). It keeps no result of an earlier request.
+- A reply with an error status gives no data and no error (`utils/terminals.py:476`). Thus Open WebUI sends `GET /agents` also when `GET /files/cwd` fails. The time limit of each request is 60 seconds by default (`env.py:662-665`, `utils/terminals.py:457`). Open WebUI ignores each failure (`main.py:940-941`).
+- For a template with chat scope and no saved chat, Open WebUI sends no request to the terminal server (`utils/terminals.py:215-216`, `utils/agents/discovery.py:49-50`).
+
+Two more events have a part of this effect:
+
+- When the socket of a page connects again, the page reads the terminal list again (`+layout.svelte:175`). It does not read the model list.
+- The event `access:updated` goes to all pages when an administrator saves the default permissions (`routers/users.py:442-449`). Each page then reads the model list and the terminal list again (`+layout.svelte:129-157`, `:172`).
+
+Results for warren:
+
+1. `GET /skills`, `GET /files/cwd`, and `GET /agents` are usual requests in warren. Each one is a use of the sandbox, and it starts a stopped sandbox. Warren cannot tell such a request from a request that a person caused.
+2. Thus a stop, a reset, or a delete of an instance does not hold while a page has the terminal selected. Open WebUI sends the event immediately after the operation. A request that comes in the termination time of the pod waits for the end of the pod, and then it starts a new pod. After a delete, the new pod gets a new, empty volume.
+3. No close code of a WebSocket can change this: the requests are HTTP requests, and they need no open WebSocket. This was also the behaviour of warren before decision 9 of section 9.5.
+4. One operation of a manager, or one change of a template, makes each page of each user with a read grant send the requests. For a template with user scope, each such user with an open page and a selected terminal gets a sandbox that starts. Only a person who manages the terminal can cause this. The limits on the number of sandboxes are the only protection of warren against it.
+5. Warren has no time after a stop in which it refuses requests. Such a time is a possible later change. It needs a decision of the owner of the project, because warren then also refuses the request of a person in that time.
 
 ### 4.2 Path B: WebSocket proxy for the browser
 
@@ -251,6 +290,13 @@ Close codes that Open WebUI sends to the browser on these six routes:
 | 1013 | A tether connection is offline | `routers/terminals.py:582` |
 
 When the handshake with the terminal server fails with status 401, 403, or 404, Open WebUI sends the close code 4001, 4003, or 4004 (`routers/terminals.py:762-763`).
+For each other handshake status, and when Open WebUI cannot connect, the close code is 1011 (`routers/terminals.py:760-765`).
+
+When the terminal server closes the WebSocket, Open WebUI closes the WebSocket of the browser with the close code of the terminal server (`routers/terminals.py:728-729`):
+
+- Open WebUI changes only the codes 1005, 1006, and 1015 to 1011. A close with no code also gives 1011.
+- Each other code goes to the browser with no change, for example 1000, 1011, 1012, 1013, and each code from 4000 to 4999.
+- Open WebUI does not send the reason text of the terminal server to the browser.
 
 #### 4.2.2 The browser view route
 
@@ -265,12 +311,35 @@ The `Authorization` value is the value of the path A request that made the brows
 In `bearer` mode it is the connection key. In `session` mode it is the credential of the caller at that time.
 
 Close codes on this route: 4001 for each failure before Open WebUI accepts the WebSocket, 4004 for a handshake status of 401, 403, or 404, and 1011 for all other failures (`routers/terminals.py:223-233`, `:261-270`).
+When the terminal server closes the WebSocket, the rule of section 4.2.1 applies: the close code goes to the browser with no reason text, and the codes 1005, 1006, and 1015 become 1011 (`routers/terminals.py:197-206`).
 
 #### 4.2.3 Browser retry rules
 
-- All browser WebSockets stop after the close codes 4001, 4003, and 4004. They try again after 1011 and 1013.
-- The `execute` streams also stop after code 1000 and after each code from 4000 to 4999. The delay increases from 1 second to 30 seconds (`src/lib/apis/terminal/socket.ts:95-107`).
-- The interactive terminal stops after 1000, 4001, 4003, and 4004 only. The maximum delay is 10 seconds (`src/lib/components/chat/XTerminal.svelte:206`, `:222-223`).
+Each client of a WebSocket has its own rule for the close code. No client has a limit for the number of attempts, unless the table gives one.
+
+| Client | Route | Close codes after which it stops | What it does after each other close code | Reference |
+|---|---|---|---|---|
+| Interactive terminal | `/api/terminals/{session_id}` | 1000, 4001, 4003, 4004 | It connects again after 1 second. The delay becomes two times as long after each attempt, to a maximum of 10 seconds. Before each attempt it sends `GET /api/terminals/{session_id}` on path A. | `src/lib/components/chat/XTerminal.svelte:40`, `:109-113`, `:202-224` |
+| File browser, git bar, and port list | `/events` | 4000 to 4999 | It connects again after 1 second, also after the code 1000. The delay becomes two times as long after each attempt, to a maximum of 30 seconds. It sends no HTTP request before an attempt. | `src/lib/apis/terminal/events.ts:13`, `:29-35` |
+| Process list and process output | `/execute`, `/execute/{process_id}/status` | 1000, and 4000 to 4999 | The same delays as for `/events`. | `src/lib/apis/terminal/socket.ts:76`, `:95-107` |
+| Desktop | `/desktop/stream` | 4000 to 4999 | It connects again after 2 seconds, while the tab is active. Before each attempt it sends `GET /desktop` on path A. | `src/lib/components/chat/Tabs/Desktop.svelte:63-80`, `:126-147` |
+| Desktop audio | `/desktop/audio` | Each code | It does not connect again. | `src/lib/components/chat/Tabs/DesktopAudio.svelte:40-43`, `:94` |
+| Browser view | `/browser/view/{sid}/{token}/stream` | 4000 to 4999 | It connects again after 1 second, and then after 2 seconds. The third close in sequence stops it. | `src/lib/components/chat/Tabs/ChromeBrowser.svelte:252-274` |
+| Agent session (the Open WebUI backend, path G) | `/agents/sessions/{id}/connect` | None: it does not read the code. | It connects again after 1 second. It stops when it got no message for more than 60 seconds. | `utils/agents/transport.py:73-135` |
+
+More facts:
+
+- Open WebUI has no special rule for the code 1012: the code does not occur in its source. Each client uses it as each other code that is not 1000 and not from 4000 to 4999.
+- When the HTTP request of the interactive terminal fails, the terminal does not try again (`XTerminal.svelte:229-237`). For status 404, the tab shows the text "Session no longer available" and the control "Start new terminal". For each other status, the tab shows the error text and the control "Retry" (`src/lib/components/chat/Tabs.svelte:2145-2176`).
+- A new pod does not know the terminal sessions of the previous pod, thus its reply to that HTTP request is status 404 (`open-terminal-api.md`, section 3.4).
+- When the HTTP request of the desktop fails, the desktop does not try again. The tab shows the error text (`Tabs/Desktop.svelte:139-143`).
+- The process list has one more rule. If its WebSocket closes before the first message, with a code that is not 4001 or 4003, the client does not connect again. It then sends HTTP requests each second (section 4.1.2).
+
+Results for warren:
+
+1. Each attempt is a new WebSocket upgrade or a new HTTP request at warren. Each one is a usual request: it starts a stopped sandbox.
+2. Thus after a close with the code 1011, 1012, or 1013, a page that has the terminal open starts the sandbox again after 1 or 2 seconds. Only a code from 4000 to 4999 stops the clients of the `/events` and `/execute` routes.
+3. After a code from 4000 to 4999, these clients stay stopped until the page makes them again, for example when the user changes the chat or opens the tab again.
 
 ### 4.3 Path C: tool calls from the Open WebUI backend
 
@@ -625,7 +694,7 @@ These are conclusions from the facts above. They are inputs to the design. They 
 
 ### 9.5 Decisions
 
-The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 7 and 8 are from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
+The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 7 to 9 are from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
 
 | No. | Subject | Decision |
 |---|---|---|
@@ -637,6 +706,7 @@ The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 
 | 6 | Management API | Warren implements the template read calls, the status call, and the instance calls. Templates are read-only. An administrator defines them in the warren configuration. |
 | 7 | Limit variables | Warren sets four variables on the container of each sandbox, from the limits of the policy. `OPEN_TERMINAL_CPU_LIMIT` and `OPEN_TERMINAL_MEMORY_LIMIT` have the form in which Kubernetes shows a quantity, for example `500m` and `2Gi`. `OPEN_TERMINAL_CPU_COUNT` is the CPU limit as a whole number, rounded up, with a minimum of 1. `OPEN_TERMINAL_MEMORY_BYTES` is the memory limit as a whole number of bytes. A policy cannot set these variables. The note below the table gives the source. |
 | 8 | System information | Warren sends `GET /system/info` only to a sandbox that operates. For a stopped sandbox, the reply is status 409, and the sandbox does not start. The request is not activity: it does not change the idle time of the sandbox. The note below the table gives the details. |
+| 9 | WebSockets of a sandbox that stops | When warren stops a sandbox, it closes each open WebSocket of that sandbox. For a stop, restart, reset, or delete operation of the management API, the client gets the close code 1012. The note below the table gives the codes for the other reasons, and the details. |
 
 Because the identity is in headers, warren must have these protections:
 
@@ -663,8 +733,21 @@ Note for decision 8: the owner of the project asked for the three rules of the t
 - Open Terminal has only the GET method on this path. For each other method, warren replies with status 405 and the header `Allow: GET`. No method on this path starts a sandbox.
 - The checks of the key, the path, the identity, the policy, the context, and the user list come first, with their usual replies. The status 409 is thus also the reply for a chat scope with no saved chat. The `detail` text is different.
 - A stopped sandbox has no pod and no start in progress, or its pod is in deletion or in a final phase, or a reset or a delete operation is in progress. The reply is status 409 with the body `{"detail":"The terminal is stopped. It starts when you use it."}`. Open WebUI shows this text to the user (section 4.1.1).
-- The request waits when a different request or operation started the sandbox and the pod is not ready. It waits a maximum of 50 seconds, as each request. At the end of that time, and while warren is not ready, the reply is status 503 with the header `Retry-After: 5`. An immediate error is not correct here: it stops the timer of the view, and the error stays on the screen after the sandbox is ready.
+- The request waits when a different request or operation started the sandbox and the pod is not ready. It also waits while a restart operation is in progress, from the stop of the old pod to the start of the new pod: the operation starts the sandbox again (decision 9). It waits a maximum of 50 seconds, as each request. At the end of that time, and while warren is not ready, the reply is status 503 with the header `Retry-After: 5`. An immediate error is not correct here: it stops the timer of the view, and the error stays on the screen after the sandbox is ready.
 - If the sandbox stops in that time, the reply is status 409 immediately.
 - In the full time of the wait and of the relay, the request is not a use of the sandbox. Warren can stop the sandbox, also for the idle time, while the request is in progress. The reply is then status 502 or 504.
 - The limits on the number of sandboxes do not apply: the request starts nothing.
 - The first request for a pod makes the checks of `isolation.md`, section 7, before warren sends data to the pod. This request makes them also. They can stop a pod, with the same reasons as for each request.
+
+Note for decision 9: the owner of the project asked for the close code 1012 at a stop, a restart, a reset, and a delete of the management API, so that the client connects again. Before this decision, warren closed no WebSocket because of a stop. The client got the close code that the sandbox sent when it stopped, or the code 1011 when the connection broke. A sandbox that stops usually sends the code 1012 with no text (`open-terminal-api.md`, section 4.3). The details are decisions of warren:
+
+- The table of `policies.md`, section 10.2, gives the close code and the reason text for each stop reason. The code is 4004 for a removed policy, because a new connection gets that code from the route check. It is 1012 for a removed network permission, for a volume that is gone, and for a pod that a different actor deletes: the sandbox can start again. It is 1011 for each other reason.
+- Warren also closes the WebSockets of a pod that a different actor deletes, for example a person with kubectl. Warren sees that in its pod cache.
+- Warren tells the WebSockets before it sends the delete request to Kubernetes. If the sandbox side closes first, and warren stopped the sandbox, the client gets the code of warren and not the code of the sandbox. If Kubernetes refuses the delete request, the WebSockets are closed, and the pod continues.
+- The sandbox side of the WebSocket gets the code 1001, as at a stop of the warren process.
+- Open WebUI does not send the reason text to the browser (section 4.2.1). The text is for other clients.
+- The audit record of the WebSocket has the code and the stop reason. The record for a stop of the warren process has the code 1012.
+- An HTTP request in progress gets no signal. A WebSocket that has no connection to its pod at the time of the stop gets the usual code for a connection that fails.
+- In this version, an open WebSocket is a use of the sandbox. Thus warren does not stop a sandbox with an open WebSocket for its idle time, and the code for the idle time does not occur. Each route gets the same codes.
+- The close code does not make a stop hold. After the code 1012, the clients connect again (section 4.2.3), and Open WebUI sends requests by itself after each instance operation (section 4.1.3). Each such request starts the sandbox again.
+- While a restart operation is in progress, only the operation starts the sandbox. A request in that time waits for the start of the operation. Without this rule, a client that connects again can send the start request before the operation. The sandbox then goes on the account of the user of that client, or that user gets the error of the sandbox limit. A request for the system information also waits in that time (decision 8).
