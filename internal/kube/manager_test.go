@@ -21,10 +21,21 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/h3xcat/warren/internal/backend"
+	"github.com/h3xcat/warren/internal/policy"
 	"github.com/h3xcat/warren/internal/scope"
 )
 
 const testNamespace = "sandboxes"
+
+// usePolicies replaces the policy file of the test.
+func (e *testEnv) usePolicies(file string) {
+	e.t.Helper()
+	set, err := policy.Parse([]byte(file))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.m.cfg.Policies.(*policy.Store).Replace(set)
+}
 
 type testEnv struct {
 	t      *testing.T
@@ -39,6 +50,12 @@ type testEnv struct {
 	uid     atomic.Int64
 	// watchers is the number of managers that started a pod watch.
 	watchers int
+	// version is the last resource version that the simulated API server
+	// gave to a volume.
+	version atomic.Int64
+	// conflicts is the number of volume requests that the simulated API
+	// server refused with the status 409.
+	conflicts atomic.Int64
 }
 
 type fakeClock struct {
@@ -72,11 +89,21 @@ func newTestEnv(t *testing.T, mod func(*Config)) *testEnv {
 	}
 	e.client.PrependReactor("create", "pods", stamp)
 	e.client.PrependReactor("create", "secrets", stamp)
+	e.client.PrependReactor("create", "persistentvolumeclaims", stamp)
+	e.client.PrependReactor("create", "networkpolicies", stamp)
+	e.strictVolumes()
 
 	cfg := Config{
-		Client:       e.client,
-		Namespace:    testNamespace,
-		Image:        "example.test/terminal:1",
+		Client:    e.client,
+		Namespace: testNamespace,
+		Image:     "example.test/terminal:1",
+		Policies:  policy.NewStore(testPolicies(t)),
+		Network: NetworkConfig{
+			WarrenNamespace: "warren-system",
+			WarrenPodLabels: map[string]string{"app.kubernetes.io/name": "warren"},
+		},
+		CanaryPoll:   5 * time.Millisecond,
+		CanaryPause:  5 * time.Millisecond,
 		IdleTimeout:  30 * time.Minute,
 		StartTimeout: 5 * time.Minute,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -110,6 +137,14 @@ func (e *testEnv) newManager(cfg Config) *Manager {
 	e.t.Cleanup(cancel)
 	// Run the pod cache, but not the reaper timer. The tests call Reap.
 	m.factory.Start(ctx.Done())
+	// Run makes the network policy of the namespace before the first start.
+	if err := m.ensureDefaultDeny(ctx); err != nil {
+		e.t.Fatal(err)
+	}
+	// The tests of the pod lifecycle do not do the test of the network
+	// plugin. The canary tests do it.
+	m.enforcement.Store(enforcementProven)
+	m.otherPolicies.Store(0)
 	waitFor(e.t, "start of the pod cache", m.Ready)
 	// The simulated cluster does not keep events for a watch that starts
 	// later. Wait until the watch of this manager operates. A real API
@@ -118,11 +153,11 @@ func (e *testEnv) newManager(cfg Config) *Manager {
 	waitFor(e.t, "start of the pod watch", func() bool {
 		n := 0
 		for _, a := range e.client.Actions() {
-			if a.Matches("watch", "pods") {
+			if a.Matches("watch", "pods") || a.Matches("watch", "persistentvolumeclaims") {
 				n++
 			}
 		}
-		return n >= e.watchers
+		return n >= 2*e.watchers
 	})
 	time.Sleep(20 * time.Millisecond)
 	return m
@@ -138,6 +173,77 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timeout: %s", what)
+}
+
+// testPolicies returns the policies of the tests. The policies "personal"
+// and "by-chat" keep no data, thus a test of the pod lifecycle makes no
+// volume.
+func testPolicies(t *testing.T) *policy.Set {
+	t.Helper()
+	set, err := policy.Parse([]byte(`
+policies:
+  - {id: personal, name: Personal, scope: user, storage: {type: ephemeral, size: 3Gi}}
+  - {id: by-chat, name: Chat, scope: chat}
+  - {id: kept, name: Kept, scope: user, storage: {size: 5Gi, storageClassName: fast, retention: 24h}}
+  - {id: kept-forever, name: Kept with no end, scope: user}
+  - {id: chat-kept, name: Chat with a volume, scope: chat, storage: {type: persistent, retention: 48h}}
+  - {id: model-kept, name: Model with a volume, scope: model, storage: {type: persistent, retention: 48h}}
+  - {id: team, name: Team, scope: shared}
+  - {id: quick, name: Quick, scope: user, idleTimeout: 2m, storage: {type: ephemeral}}
+  - {id: never-idle, name: Never idle, scope: user, idleTimeout: 0, storage: {type: ephemeral}}
+  - {id: closed, name: Closed, scope: user, storage: {type: ephemeral}, network: {egress: none}}
+  - id: database
+    name: Database
+    scope: user
+    storage: {type: ephemeral}
+    network:
+      egress: none
+      dns: true
+      allow:
+        - {cidr: 10.30.1.0/24, ports: [5432]}
+        - {cidr: "2001:db8::/32"}
+  - id: other-image
+    name: Other image
+    scope: user
+    storage: {type: ephemeral}
+    command: ["/sbin/tini", "--", "/usr/local/bin/python3", "-m", "open_terminal"]
+    runAsUser: 1000
+    userNamespace: true
+  - id: tuned
+    name: Tuned
+    scope: user
+    image: registry.example/tuned:2
+    imagePullPolicy: Always
+    imagePullSecrets: [pull-a, pull-b]
+    runtimeClassName: gvisor
+    resources:
+      requests: {cpu: 250m, memory: 512Mi}
+      limits: {cpu: 1500m, memory: 3Gi, ephemeral-storage: 1Gi}
+    storage: {type: ephemeral, size: 2Gi}
+    env: {ZED: last, ALPHA: first, OPEN_TERMINAL_EXECUTE_TIMEOUT: "60"}
+    nodeSelector: {pool: sandboxes}
+    tolerations:
+      - {key: dedicated, operator: Equal, value: sandboxes, effect: NoSchedule}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return set
+}
+
+// policy returns the policy of a request.
+func (e *testEnv) policy(req backend.Request) policy.Policy {
+	e.t.Helper()
+	p, ok := e.m.cfg.Policies.Get(req.Ref.TemplateID)
+	if !ok {
+		e.t.Fatalf("no policy %q", req.Ref.TemplateID)
+	}
+	return p
+}
+
+// templateRef returns a request for a user-scope template.
+func templateRef(template, user string) backend.Request {
+	return backend.Request{Ref: scope.Ref{TemplateID: template, Kind: scope.KindUser, Value: user}, UserID: user}
 }
 
 func userRef(user string) backend.Request {

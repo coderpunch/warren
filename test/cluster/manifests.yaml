@@ -1,0 +1,142 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: warren-system}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: warren-sandboxes
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: warren, namespace: warren-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: warren, namespace: warren-sandboxes}
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch, create, delete, patch]
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [get, list, create, delete, patch]
+- apiGroups: [""]
+  resources: [persistentvolumeclaims]
+  verbs: [get, list, watch, create, delete, patch]
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [get, list, create, delete, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: warren-self, namespace: warren-system}
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: warren-self, namespace: warren-system}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: warren-self}
+subjects:
+- {kind: ServiceAccount, name: warren, namespace: warren-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: warren, namespace: warren-sandboxes}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: warren}
+subjects:
+- {kind: ServiceAccount, name: warren, namespace: warren-system}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: warren-key, namespace: warren-system}
+stringData:
+  key: connection-key-0123456789abcdef0123456789
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: warren-policies, namespace: warren-system}
+data:
+  policies.yaml: |
+    defaults:
+      env:
+        SHARED_SETTING: from-defaults
+    policies:
+      - id: personal
+        name: Personal sandbox
+        scope: user
+        storage: {size: 1Gi, retention: 2m}
+      - id: by-chat
+        name: Chat sandbox
+        scope: chat
+      - id: team
+        name: Team sandbox
+        scope: shared
+      - id: chat-kept
+        name: Chat sandbox with files
+        scope: chat
+        storage: {type: persistent, size: 100Mi, retention: 1h}
+      - id: tuned
+        name: Tuned sandbox
+        scope: user
+        users: ["alice"]
+        idleTimeout: 45s
+        resources:
+          requests: {cpu: 50m, memory: 128Mi}
+          limits: {cpu: 0.5, memory: 512Mi, ephemeral-storage: 500Mi}
+        storage: {type: ephemeral, size: 200Mi}
+        env:
+          GREETING: "hello from the policy"
+          LITERAL: "$(OPEN_TERMINAL_API_KEY) $HOME"
+          OPEN_TERMINAL_EXECUTE_TIMEOUT: "120"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: warren, namespace: warren-system}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: warren}}
+  template:
+    metadata: {labels: {app: warren}}
+    spec:
+      serviceAccountName: warren
+      containers:
+      - name: warren
+        image: warren:dev
+        imagePullPolicy: Never
+        args:
+        - --api-key-file=/etc/warren/key/key
+        - --policy-file=/etc/warren/policies/policies.yaml
+        - --sandbox-namespace=warren-sandboxes
+        - --idle-timeout=90s
+        - --max-sandboxes-per-user=4
+        - --max-volumes-per-user=2
+        - --warren-pod-labels=app=warren
+        - --volume-delete-delay=45s
+        - --log-level=debug
+        env:
+        - {name: WARREN_POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        ports: [{containerPort: 8080}, {containerPort: 9090}]
+        readinessProbe: {httpGet: {path: /readyz, port: 9090}, periodSeconds: 2}
+        volumeMounts:
+        - {name: key, mountPath: /etc/warren/key, readOnly: true}
+        - {name: policies, mountPath: /etc/warren/policies, readOnly: true}
+      volumes:
+      - {name: key, secret: {secretName: warren-key}}
+      - {name: policies, configMap: {name: warren-policies}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: warren, namespace: warren-system}
+spec:
+  type: NodePort
+  selector: {app: warren}
+  ports:
+  - {name: http, port: 8080, targetPort: 8080, nodePort: 30080}
+  - {name: admin, port: 9090, targetPort: 9090, nodePort: 30090}

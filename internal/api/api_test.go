@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	"github.com/h3xcat/warren/internal/backend"
 	"github.com/h3xcat/warren/internal/kube"
 	"github.com/h3xcat/warren/internal/policy"
@@ -41,8 +44,16 @@ func (f *fakeInstances) Restart(_ context.Context, req backend.Request) error {
 	f.calls, f.requests = append(f.calls, "restart"), append(f.requests, req)
 	return f.err
 }
+func (f *fakeInstances) Delete(_ context.Context, ref scope.Ref) error {
+	f.calls, f.requests = append(f.calls, "delete"), append(f.requests, backend.Request{Ref: ref})
+	return f.err
+}
+func (f *fakeInstances) Reset(_ context.Context, ref scope.Ref) error {
+	f.calls, f.requests = append(f.calls, "reset"), append(f.requests, backend.Request{Ref: ref})
+	return f.err
+}
 func (f *fakeInstances) WaitReady(context.Context, scope.Ref) { f.waited = true }
-func (f *fakeInstances) Ready() bool                          { return f.ready }
+func (f *fakeInstances) Synced() bool                         { return f.ready }
 
 func newHandler(t *testing.T, inst *fakeInstances) *Handler {
 	t.Helper()
@@ -50,11 +61,20 @@ func newHandler(t *testing.T, inst *fakeInstances) *Handler {
 		{ID: "personal", Name: "Personal", Scope: scope.KindUser},
 		{ID: "by-chat", Name: "Chat", Scope: scope.KindChat},
 		{ID: "team", Name: "Team", Scope: scope.KindShared},
+		{ID: "limited", Name: "Limited", Scope: scope.KindUser, Users: []string{"alice"}},
+		{ID: "tuned", Name: "Tuned", Scope: scope.KindChat, Spec: policy.Spec{
+			Image: "registry.example/tuned:2",
+			Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("3Gi"),
+			}},
+			Env: map[string]string{"SECRET_LOOKING": "value-that-must-not-show"},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Handler{Policies: set, Instances: inst}
+	return &Handler{Policies: set, Instances: inst, DefaultImage: "registry.example/default:1"}
 }
 
 func do(h *Handler, method, path, body string) (*httptest.ResponseRecorder, map[string]any) {
@@ -88,7 +108,8 @@ func TestInstanceOperations(t *testing.T) {
 	}
 	do(h, "POST", base+"by-chat/stop", `{"user_id":"manager","chat_id":"c1"}`)
 	do(h, "DELETE", base+"by-chat/instance", `{"user_id":"manager","chat_id":"c1"}`)
-	if got := strings.Join(inst.calls, ","); got != "start,restart,stop,stop" {
+	// A stop keeps the files. A delete removes them.
+	if got := strings.Join(inst.calls, ","); got != "start,restart,stop,delete" {
 		t.Errorf("calls = %s", got)
 	}
 	if got := inst.requests[2].Ref.ContextID(); got != "chat:c1" {
@@ -126,7 +147,11 @@ func TestInstanceOperationErrors(t *testing.T) {
 		{"no user", fakeInstances{ready: true}, "POST", "personal/start", `{}`, 409},
 		{"body is not JSON", fakeInstances{ready: true}, "POST", "personal/start", `user_id=a`, 400},
 		{"control character", fakeInstances{ready: true}, "POST", "personal/start", `{"user_id":"a\u0000b"}`, 400},
-		{"reset", fakeInstances{ready: true}, "POST", "personal/reset", `{"user_id":"a"}`, 501},
+		{"volume limit", fakeInstances{ready: true, err: backend.ErrVolumeLimit}, "POST", "personal/start", `{"user_id":"a"}`, 429},
+		{"reset that Kubernetes refuses", fakeInstances{ready: true, err: errors.New("forbidden")}, "POST", "personal/reset", `{"user_id":"a"}`, 502},
+		{"reset with the wrong method", fakeInstances{ready: true}, "GET", "personal/reset", "", 405},
+		{"start for a user that the policy does not permit", fakeInstances{ready: true}, "POST", "limited/start", `{"user_id":"mallory"}`, 403},
+		{"restart for a user that the policy does not permit", fakeInstances{ready: true}, "POST", "limited/restart", `{"user_id":"mallory"}`, 403},
 		{"wrong method", fakeInstances{ready: true}, "PUT", "personal/start", `{"user_id":"a"}`, 405},
 	}
 	for _, c := range cases {
@@ -152,6 +177,86 @@ func TestTemplateReadsNeedNoSandboxData(t *testing.T) {
 	for _, path := range []string{"/api/v1/terminals/templates", base + "personal", "/api/v1/terminals/status"} {
 		if rec, _ := do(h, http.MethodGet, path, ""); rec.Code != 200 {
 			t.Errorf("%s: status = %d, want 200", path, rec.Code)
+		}
+	}
+}
+
+func TestResetOperation(t *testing.T) {
+	inst := &fakeInstances{ready: true, status: "stopped"}
+	h := newHandler(t, inst)
+	// A reset starts nothing, thus the handler does not wait for a sandbox.
+	rec, out := do(h, "POST", base+"personal/reset", `{"user_id":"alice"}`)
+	if rec.Code != 200 || out["status"] != "stopped" || inst.waited {
+		t.Errorf("reset = %d %v, waited = %v", rec.Code, out, inst.waited)
+	}
+	if len(inst.calls) != 1 || inst.calls[0] != "reset" || inst.requests[0].Ref.ContextID() != "user:alice" {
+		t.Errorf("calls = %v, requests = %+v", inst.calls, inst.requests)
+	}
+}
+
+// A policy with a user list gives a sandbox of the user scope only to the
+// users of the list. The stop and status operations stay possible, because
+// they give no access.
+func TestUserListOnInstanceOperations(t *testing.T) {
+	inst := &fakeInstances{ready: true, status: "running"}
+	h := newHandler(t, inst)
+	if rec, _ := do(h, "POST", base+"limited/start", `{"user_id":"alice"}`); rec.Code != 200 {
+		t.Errorf("start for a permitted user = %d", rec.Code)
+	}
+	if rec, _ := do(h, "POST", base+"limited/stop", `{"user_id":"mallory"}`); rec.Code != 200 {
+		t.Errorf("stop for a user that is not in the list = %d, want 200", rec.Code)
+	}
+	if rec, _ := do(h, "GET", base+"limited/instance?user_id=mallory", ""); rec.Code != 200 {
+		t.Errorf("status for a user that is not in the list = %d, want 200", rec.Code)
+	}
+	// A reset deletes the data of a user that was in the list before.
+	if rec, _ := do(h, "POST", base+"limited/reset", `{"user_id":"mallory"}`); rec.Code != 200 {
+		t.Errorf("reset for a user that is not in the list = %d, want 200", rec.Code)
+	}
+	if got := strings.Join(inst.calls, ","); got != "start,stop,reset" {
+		t.Errorf("calls = %s", got)
+	}
+}
+
+func TestTemplateShowsThePolicySettings(t *testing.T) {
+	h := newHandler(t, &fakeInstances{ready: true})
+	rec, out := do(h, "GET", base+"tuned", "")
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	data, _ := out["data"].(map[string]any)
+	want := map[string]any{
+		"name": "Tuned", "scope": "chat", "image": "registry.example/tuned:2",
+		// Open WebUI reads the CPU limit as a decimal number.
+		"cpu_limit": "0.5", "memory_limit": "3Gi", "storage": "1Gi",
+		"network_profile": "internet", "env": nil,
+	}
+	for key, w := range want {
+		if got, ok := data[key]; !ok || got != w {
+			t.Errorf("%s = %v (present: %v), want %v", key, got, ok, w)
+		}
+	}
+	if strings.Contains(rec.Body.String(), "value-that-must-not-show") || strings.Contains(rec.Body.String(), "SECRET_LOOKING") {
+		t.Errorf("the template shows the environment variables: %s", rec.Body)
+	}
+	// A policy with no image shows the default image of warren, and the
+	// built-in limits.
+	_, out = do(h, "GET", base+"personal", "")
+	data, _ = out["data"].(map[string]any)
+	if data["image"] != "registry.example/default:1" || data["cpu_limit"] != "2" || data["memory_limit"] != "2Gi" {
+		t.Errorf("defaults = %v", data)
+	}
+	// The list has the same data.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/terminals/templates", nil))
+	var list []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || len(list) != 5 {
+		t.Fatalf("list = %s (%v)", rec.Body, err)
+	}
+	for _, item := range list {
+		data, _ := item["data"].(map[string]any)
+		if data["image"] == nil || data["cpu_limit"] == nil || data["memory_limit"] == nil {
+			t.Errorf("list item %v has no image or limits", item["id"])
 		}
 	}
 }

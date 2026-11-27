@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,7 +104,8 @@ func TestRefusedRequestsLeaveNoRecords(t *testing.T) {
 	}
 	// The record of a sandbox goes away with its pod.
 	_ = e.m.Stop(context.Background(), chatRef("alice", "c0").Ref)
-	waitFor(t, "stop", func() bool { return len(e.pods()) == 0 })
+	// Wait for the cache, not only for the API server.
+	waitFor(t, "stop", func() bool { return e.m.pod(chatRef("alice", "c0").Ref.Name()) == nil })
 	e.m.Reap(context.Background())
 	if n := e.recordCount(); n != 0 {
 		t.Errorf("records with no sandbox = %d, want 0", n)
@@ -332,7 +334,7 @@ func TestPodThatStaysInDeletion(t *testing.T) {
 	req := userRef("alice")
 	name := req.Ref.Name()
 	deleted := metav1.NewTime(e.clock.Now())
-	stuck := e.m.buildPod(name, name+"-00000000", req)
+	stuck := e.m.buildPod(name, name+"-00000000", req, e.policy(req))
 	stuck.DeletionTimestamp = &deleted
 	stuck.Finalizers = []string{"example.test/never"}
 	if _, err := e.client.CoreV1().Pods(testNamespace).Create(context.Background(), stuck, metav1.CreateOptions{}); err != nil {
@@ -417,4 +419,49 @@ func TestStopReportsAnError(t *testing.T) {
 
 func forbidden(k8stesting.Action) (bool, runtime.Object, error) {
 	return true, nil, apierrors.NewForbidden(corev1.Resource("pods"), "x", errors.New("not permitted"))
+}
+
+// An API server that does not support user namespaces removes the setting
+// hostUsers and accepts the pod. The sandbox would then use the user IDs of
+// the node, with no message. Warren must not keep such a pod.
+func TestClusterThatIgnoresTheUserNamespace(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.client.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		a.(k8stesting.CreateAction).GetObject().(*corev1.Pod).Spec.HostUsers = nil
+		return false, nil, nil
+	})
+	// The policy "other-image" has "userNamespace: true".
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err := e.m.Acquire(ctx, templateRef("other-image", "alice"))
+	if err == nil || errors.Is(err, backend.ErrNotReady) || !strings.Contains(err.Error(), "user namespace") {
+		t.Fatalf("Acquire = %v, want an error that names the user namespace", err)
+	}
+	waitFor(t, "removal of the pod", func() bool { return len(e.pods()) == 0 })
+	if n := len(e.secrets()); n != 0 {
+		t.Errorf("secrets = %d, want 0", n)
+	}
+	if got := e.networkPolicies(); len(got) != 1 {
+		t.Errorf("network policies = %d, want only the policy of the namespace", len(got))
+	}
+	// A policy with no user namespace is not changed by this check.
+	e.acquire(userRef("alice")).Release()
+}
+
+// Kubernetes replaces "$(NAME)" and "$$" in the items of a command, as in
+// the value of a variable. The program must get each item as the policy file
+// has it, and the key of the pod must not go onto the command line.
+func TestCommandOfAPolicyIsLiteral(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := templateRef("other-image", "alice")
+	pol := e.policy(req)
+	pol.Command = []string{"/bin/sh", "-c", `echo $$ > /tmp/pid; echo $(OPEN_TERMINAL_API_KEY) $HOME; exec "$@"`, "sh"}
+	got := e.m.buildPod(req.Ref.Name(), "secret", req, pol).Spec.Containers[0].Command
+	want := `echo $$$$ > /tmp/pid; echo $$(OPEN_TERMINAL_API_KEY) $$HOME; exec "$$@"`
+	if len(got) != 4 || got[0] != "/bin/sh" || got[2] != want {
+		t.Errorf("command = %q, want the item %q", got, want)
+	}
+	if pol.Command[2] == want {
+		t.Error("buildPod changed the command of the policy")
+	}
 }

@@ -21,6 +21,7 @@ type Metrics struct {
 	proxyErrors *prometheus.CounterVec
 	requests    *prometheus.CounterVec
 	websockets  prometheus.Gauge
+	volumeDels  *prometheus.CounterVec
 }
 
 // New makes the metrics and their registry.
@@ -53,7 +54,11 @@ func New() *Metrics {
 			Help: "WebSockets that are open at this time.",
 		}),
 	}
-	m.registry.MustRegister(m.coldStart, m.reaps, m.creates, m.proxyErrors, m.requests, m.websockets,
+	m.volumeDels = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "warren_volume_deletes_total",
+		Help: "Volumes that warren deleted, by reason.",
+	}, []string{"reason"})
+	m.registry.MustRegister(m.coldStart, m.reaps, m.creates, m.proxyErrors, m.requests, m.websockets, m.volumeDels,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }
@@ -75,6 +80,24 @@ func (m *Metrics) SetSandboxCounts(count func() (ready, starting int)) {
 		prometheus.NewGaugeFunc(ready, func() float64 { r, _ := count(); return float64(r) }),
 		prometheus.NewGaugeFunc(starting, func() float64 { _, s := count(); return float64(s) }),
 	)
+}
+
+// SetVolumeCount registers the function that counts the volumes.
+func (m *Metrics) SetVolumeCount(count func() int) {
+	if m == nil {
+		return
+	}
+	m.registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "warren_volumes",
+		Help: "Volumes with the home directory of a sandbox that exist at this time.",
+	}, func() float64 { return float64(count()) }))
+}
+
+// VolumeDelete counts one volume that warren deleted.
+func (m *Metrics) VolumeDelete(reason string) {
+	if m != nil {
+		m.volumeDels.WithLabelValues(reason).Inc()
+	}
 }
 
 // Handler serves the metrics in the Prometheus text format.

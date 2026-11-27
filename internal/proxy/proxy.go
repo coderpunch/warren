@@ -229,6 +229,11 @@ func (p *Proxy) resolveRoute(id scope.Identity, sessionID string) (route, *route
 	default:
 		return route{}, &routeError{http.StatusBadRequest, closeBad, capitalize(err.Error())}
 	}
+	// Open WebUI selects the users of a terminal with its access grants. A
+	// policy can also have a list of users. This is a second protection.
+	if !pol.Allows(id.UserID) {
+		return route{}, &routeError{http.StatusForbidden, closeForbidden, "The policy of this terminal does not permit this user"}
+	}
 	return route{id: id, sessionID: sessionID, ref: ref}, nil
 }
 
@@ -333,6 +338,10 @@ func (p *Proxy) acquireFailed(w http.ResponseWriter, r *http.Request, err error)
 		info.Detail = "sandbox limit"
 		p.opts.Metrics.ProxyError("limit")
 		httpx.Error(w, http.StatusTooManyRequests, "You have too many terminals. Stop one, then try again.")
+	case errors.Is(err, backend.ErrVolumeLimit):
+		info.Detail = "volume limit"
+		p.opts.Metrics.ProxyError("limit")
+		httpx.Error(w, http.StatusTooManyRequests, "You have too many terminals with saved files. Ask an administrator to delete one.")
 	default:
 		info.Detail = "acquire: " + truncate(err.Error(), maxErrorText)
 		p.opts.Metrics.ProxyError("backend")

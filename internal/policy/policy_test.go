@@ -3,6 +3,10 @@ package policy
 import (
 	"strings"
 	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/h3xcat/warren/internal/scope"
 )
@@ -102,6 +106,587 @@ func TestParseRejectsBadFiles(t *testing.T) {
 	for name, content := range cases {
 		if _, err := Parse([]byte(content)); err == nil {
 			t.Errorf("%s: Parse gave no error", name)
+		}
+	}
+}
+
+const fullFile = `
+defaults:
+  image: registry.example/terminal:1
+  resources:
+    limits: {memory: 1Gi}
+  env:
+    A: from-defaults
+    B: from-defaults
+  nodeSelector: {pool: sandboxes}
+  storage: {size: 5Gi, retention: 30d}
+  idleTimeout: 10m
+policies:
+  - id: personal
+    name: Personal
+    scope: user
+    users: ["u-1", "u-2"]
+    image: registry.example/other@sha256:0123
+    imagePullPolicy: Always
+    imagePullSecrets: [pull-secret]
+    runtimeClassName: gvisor
+    resources:
+      requests: {cpu: 250m, memory: "512Mi"}
+      limits: {cpu: 0.5, ephemeral-storage: 4Gi}
+    storage: {storageClassName: fast, retention: 0}
+    env: {B: from-policy, OPEN_TERMINAL_EXECUTE_TIMEOUT: "120"}
+    idleTimeout: 0
+    tolerations:
+      - {key: dedicated, operator: Equal, value: sandboxes, effect: NoExecute, tolerationSeconds: 60}
+      - {operator: Exists}
+  - id: by-chat
+    name: Chat
+    scope: chat
+  - id: chat-kept
+    name: Chat with a volume
+    scope: chat
+    storage: {type: persistent}
+  - id: by-model
+    name: Model
+    scope: model
+  - id: shared
+    name: Shared
+    scope: shared
+    storage: {type: ephemeral}
+`
+
+func mustGet(t *testing.T, set *Set, id string) Policy {
+	t.Helper()
+	p, ok := set.Get(id)
+	if !ok {
+		t.Fatalf("no policy %q", id)
+	}
+	return p
+}
+
+func quantityOf(t *testing.T, list corev1.ResourceList, name corev1.ResourceName) string {
+	t.Helper()
+	q, ok := list[name]
+	if !ok {
+		return "<absent>"
+	}
+	return q.String()
+}
+
+func TestParseFullPolicy(t *testing.T) {
+	set, err := Parse([]byte(fullFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustGet(t, set, "personal")
+	if p.Image != "registry.example/other@sha256:0123" || p.ImagePullPolicy != corev1.PullAlways ||
+		len(p.ImagePullSecrets) != 1 || p.ImagePullSecrets[0] != "pull-secret" || p.RuntimeClassName != "gvisor" {
+		t.Errorf("image settings = %+v", p.Spec)
+	}
+	// The file gives the text 0.5 for the CPU limit. Kubernetes shows it as 500m.
+	want := map[string]string{
+		"requests.cpu": "250m", "requests.memory": "512Mi", "requests.ephemeral-storage": "100Mi",
+		"limits.cpu": "500m", "limits.memory": "1Gi", "limits.ephemeral-storage": "4Gi",
+	}
+	for key, w := range want {
+		kind, name, _ := strings.Cut(key, ".")
+		list := p.Resources.Requests
+		if kind == "limits" {
+			list = p.Resources.Limits
+		}
+		if got := quantityOf(t, list, corev1.ResourceName(name)); got != w {
+			t.Errorf("%s = %s, want %s", key, got, w)
+		}
+	}
+	if !p.Persistent() || p.Storage.Size.String() != "5Gi" || p.Storage.StorageClassName != "fast" {
+		t.Errorf("storage = %+v", p.Storage)
+	}
+	// The policy changes the retention of the defaults back to "keep".
+	if p.Storage.Retention == nil || *p.Storage.Retention != 0 {
+		t.Errorf("retention = %v, want 0", p.Storage.Retention)
+	}
+	if p.IdleTimeout == nil || *p.IdleTimeout != 0 {
+		t.Errorf("idleTimeout = %v, want 0", p.IdleTimeout)
+	}
+	if p.Env["A"] != "from-defaults" || p.Env["B"] != "from-policy" || p.Env["OPEN_TERMINAL_EXECUTE_TIMEOUT"] != "120" {
+		t.Errorf("env = %v", p.Env)
+	}
+	if p.NodeSelector["pool"] != "sandboxes" {
+		t.Errorf("nodeSelector = %v", p.NodeSelector)
+	}
+	if len(p.Tolerations) != 2 || p.Tolerations[0].TolerationSeconds == nil || *p.Tolerations[0].TolerationSeconds != 60 ||
+		p.Tolerations[1].Operator != corev1.TolerationOpExists {
+		t.Errorf("tolerations = %+v", p.Tolerations)
+	}
+	if !p.Allows("u-1") || !p.Allows("u-2") || p.Allows("u-3") || p.Allows("") || p.Allows("U-1") || p.Allows("u-1 ") {
+		t.Error("the user list does not select the correct users")
+	}
+
+	chat := mustGet(t, set, "by-chat")
+	if chat.Persistent() || chat.Storage.Size.String() != "5Gi" {
+		t.Errorf("chat storage = %+v, want ephemeral with the size of the defaults", chat.Storage)
+	}
+	if chat.Image != "registry.example/terminal:1" || chat.Env["B"] != "from-defaults" {
+		t.Errorf("chat policy did not get the defaults: %+v", chat.Spec)
+	}
+	if chat.Storage.Retention == nil || *chat.Storage.Retention != 720*time.Hour || *chat.IdleTimeout != 10*time.Minute {
+		t.Errorf("chat times = %v, %v", chat.Storage.Retention, chat.IdleTimeout)
+	}
+	if !chat.Allows("each-user") {
+		t.Error("a policy with no user list must permit all users")
+	}
+	if !mustGet(t, set, "chat-kept").Persistent() {
+		t.Error("a chat policy with storage.type persistent is not persistent")
+	}
+	if mustGet(t, set, "by-model").Persistent() {
+		t.Error("a model policy is persistent by default")
+	}
+	if mustGet(t, set, "shared").Persistent() {
+		t.Error("a shared policy with storage.type ephemeral is persistent")
+	}
+}
+
+func TestBuiltInDefaults(t *testing.T) {
+	set, err := Parse([]byte(validFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range set.List() {
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
+			if _, ok := p.Resources.Limits[name]; !ok {
+				t.Errorf("policy %s has no limit for %s", p.ID, name)
+			}
+			if _, ok := p.Resources.Requests[name]; !ok {
+				t.Errorf("policy %s has no request for %s", p.ID, name)
+			}
+		}
+		if p.Storage.Size == nil || p.Storage.Size.Sign() <= 0 {
+			t.Errorf("policy %s has no storage size", p.ID)
+		}
+		if p.Image != "" || p.IdleTimeout != nil {
+			t.Errorf("policy %s: image and idle time must stay empty for the defaults of warren", p.ID)
+		}
+		if want := p.Scope != scope.KindChat; p.Persistent() != want {
+			t.Errorf("policy %s (scope %s): persistent = %v", p.ID, p.Scope, p.Persistent())
+		}
+	}
+}
+
+// A user can make very many chats, and Open WebUI does not examine each
+// model ID. A volume for each of them is not the default, and it must have
+// an end.
+func TestVolumesOfChatsAndModelsNeedAnEnd(t *testing.T) {
+	file := func(scope, storage string) string {
+		return "policies:\n  - id: a\n    name: A\n    scope: " + scope + "\n" + storage
+	}
+	for _, kind := range []string{"chat", "model"} {
+		set, err := Parse([]byte(file(kind, "")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mustGet(t, set, "a").Persistent() {
+			t.Errorf("scope %s: persistent storage is the default", kind)
+		}
+		if _, err := Parse([]byte(file(kind, "    storage: {type: persistent}\n"))); err == nil {
+			t.Errorf("scope %s: persistent storage with no retention time gave no error", kind)
+		}
+		if _, err := Parse([]byte(file(kind, "    storage: {type: persistent, retention: 0}\n"))); err == nil {
+			t.Errorf("scope %s: persistent storage with the retention time 0 gave no error", kind)
+		}
+		set, err = Parse([]byte(file(kind, "    storage: {type: persistent, retention: 168h}\n")))
+		if err != nil || !mustGet(t, set, "a").Persistent() {
+			t.Errorf("scope %s: persistent storage with a retention time: %v", kind, err)
+		}
+	}
+	for _, kind := range []string{"user", "shared"} {
+		set, err := Parse([]byte(file(kind, "")))
+		if err != nil || !mustGet(t, set, "a").Persistent() {
+			t.Errorf("scope %s: persistent storage must be the default (%v)", kind, err)
+		}
+	}
+}
+
+func TestDefaultRequestIsNotMoreThanTheLimit(t *testing.T) {
+	set, err := Parse([]byte("policies:\n  - id: small\n    name: Small\n    scope: user\n    resources:\n      limits: {cpu: 50m, memory: 64Mi}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustGet(t, set, "small")
+	if got := quantityOf(t, p.Resources.Requests, corev1.ResourceCPU); got != "50m" {
+		t.Errorf("cpu request = %s, want 50m", got)
+	}
+	if got := quantityOf(t, p.Resources.Requests, corev1.ResourceMemory); got != "64Mi" {
+		t.Errorf("memory request = %s, want 64Mi", got)
+	}
+}
+
+func TestPoliciesDoNotShareData(t *testing.T) {
+	set, err := Parse([]byte("defaults:\n  env: {A: x}\n  nodeSelector: {k: v}\npolicies:\n  - {id: a, name: A, scope: user}\n  - {id: b, name: B, scope: user}\n  - {id: c, name: C, scope: user, nodeSelector: {gpu: \"true\"}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := mustGet(t, set, "a")
+	a.Env["A"] = "changed"
+	a.NodeSelector["k"] = "changed"
+	a.Resources.Limits[corev1.ResourceCPU] = resource.MustParse("64")
+	b := mustGet(t, set, "b")
+	if b.Env["A"] != "x" || b.NodeSelector["k"] != "v" || quantityOf(t, b.Resources.Limits, corev1.ResourceCPU) != "2" {
+		t.Errorf("a change of policy a changed policy b: %+v", b.Spec)
+	}
+	// The node selector of a policy replaces the selector of the defaults.
+	// With the two keys together, a pod could find no node.
+	if c := mustGet(t, set, "c"); len(c.NodeSelector) != 1 || c.NodeSelector["gpu"] != "true" {
+		t.Errorf("node selector of policy c = %v, want only the key of the policy", c.NodeSelector)
+	}
+}
+
+func TestParseRejectsBadSettings(t *testing.T) {
+	policy := func(extra string) string {
+		return "policies:\n  - id: a\n    name: A\n    scope: user\n" + extra
+	}
+	cases := map[string]string{
+		"unknown default key":      "defaults: {privileged: \"true\"}\n" + policy(""),
+		"id in defaults":           "defaults: {id: x}\n" + policy(""),
+		"users in defaults":        "defaults: {users: [u]}\n" + policy(""),
+		"defaults is a list":       "defaults: []\n" + policy(""),
+		"two defaults":             "defaults: {image: a}\ndefaults: {image: b}\n" + policy(""),
+		"empty users":              policy("    users: []\n"),
+		"users is text":            policy("    users: u-1\n"),
+		"empty user ID":            policy("    users: [\"\"]\n"),
+		"number as user ID":        policy("    users: [42]\n"),
+		"duplicate user":           policy("    users: [u, u]\n"),
+		"user with control":        policy("    users: [\"a\\nb\"]\n"),
+		"empty image":              policy("    image: \"\"\n"),
+		"image with space":         policy("    image: \"a b\"\n"),
+		"image with newline":       policy("    image: \"a\\nb\"\n"),
+		"bad pull policy":          policy("    imagePullPolicy: always\n"),
+		"bad pull secret":          policy("    imagePullSecrets: [Not_A_Name]\n"),
+		"bad runtime class":        policy("    runtimeClassName: Not_A_Name\n"),
+		"unknown resource":         policy("    resources:\n      limits: {nvidia.com/gpu: 1}\n"),
+		"unknown resource kind":    policy("    resources:\n      maximum: {cpu: 1}\n"),
+		"bad quantity":             policy("    resources:\n      limits: {memory: lots}\n"),
+		"zero quantity":            policy("    resources:\n      limits: {memory: 0}\n"),
+		"negative quantity":        policy("    resources:\n      limits: {cpu: -1}\n"),
+		"octal quantity":           policy("    resources:\n      limits: {cpu: 010}\n"),
+		"hex quantity":             policy("    resources:\n      limits: {cpu: 0x2}\n"),
+		"boolean quantity":         policy("    resources:\n      limits: {cpu: true}\n"),
+		"null quantity":            policy("    resources:\n      limits: {cpu: ~}\n"),
+		"request above limit":      policy("    resources:\n      requests: {cpu: 2}\n      limits: {cpu: 1}\n"),
+		"request above built-in":   policy("    resources:\n      requests: {memory: 64Gi}\n"),
+		"request above defaults":   "defaults:\n  resources:\n    limits: {cpu: 1}\n" + policy("    resources:\n      requests: {cpu: 2}\n"),
+		"bad storage type":         policy("    storage: {type: shared}\n"),
+		"zero storage size":        policy("    storage: {size: 0}\n"),
+		"bad storage size":         policy("    storage: {size: big}\n"),
+		"bad storage class":        policy("    storage: {storageClassName: Not_A_Name}\n"),
+		"empty storage class":      policy("    storage: {storageClassName: \"\"}\n"),
+		"negative retention":       policy("    storage: {retention: -1h}\n"),
+		"storage type in defaults": "defaults:\n  storage: {type: persistent}\n" + policy(""),
+		"size with an exponent":    policy("    storage: {size: 1e9}\n"),
+		"memory with an exponent":  policy("    resources:\n      limits: {memory: \"2e9\"}\n"),
+		"zero days":                policy("    storage: {retention: 0d}\n"),
+		"fraction of a day":        policy("    storage: {retention: 1.5d}\n"),
+		"very short retention":     policy("    storage: {retention: 30s}\n"),
+		"memory in milli-bytes":    policy("    resources:\n      limits: {memory: 512m}\n"),
+		"very small memory":        policy("    resources:\n      limits: {memory: 1Mi}\n      requests: {memory: 1Mi}\n"),
+		"very small CPU":           policy("    resources:\n      requests: {cpu: 0.0001}\n"),
+		"storage in milli-bytes":   policy("    storage: {size: 500m}\n"),
+		"very small storage":       policy("    storage: {size: 100}\n"),
+		"fraction of a byte":       policy("    resources:\n      limits: {ephemeral-storage: 1500000001m}\n"),
+		"env keep-alive":           policy("    env: {OPEN_TERMINAL_UVICORN_TIMEOUT_KEEP_ALIVE: \"1\"}\n"),
+		"env PATH":                 policy("    env: {PATH: /home/user/bin}\n"),
+		"env LD_PRELOAD":           policy("    env: {LD_PRELOAD: /home/user/x.so}\n"),
+		"env PYTHONPATH":           policy("    env: {PYTHONPATH: /home/user}\n"),
+		"env BASH_ENV":             policy("    env: {BASH_ENV: /home/user/.x}\n"),
+		"retention with no unit":   policy("    storage: {retention: 30}\n"),
+		"unknown storage key":      policy("    storage: {accessMode: ReadWriteMany}\n"),
+		"storage is text":          policy("    storage: persistent\n"),
+		"negative idle time":       policy("    idleTimeout: -5m\n"),
+		"idle time with no unit":   policy("    idleTimeout: 30\n"),
+		"env is a list":            policy("    env: [A=b]\n"),
+		"env number value":         policy("    env: {A: 1}\n"),
+		"env boolean value":        policy("    env: {A: true}\n"),
+		"env null value":           policy("    env: {A: ~}\n"),
+		"env bad name":             policy("    env: {\"A-B\": x}\n"),
+		"env name with equals":     policy("    env: {\"A=B\": x}\n"),
+		"env empty name":           policy("    env: {\"\": x}\n"),
+		"env duplicate name":       policy("    env: {A: x, A: y}\n"),
+		"env API key":              policy("    env: {OPEN_TERMINAL_API_KEY: x}\n"),
+		"env API key file":         policy("    env: {OPEN_TERMINAL_API_KEY_FILE: /tmp/k}\n"),
+		"env multi-user":           policy("    env: {OPEN_TERMINAL_MULTI_USER: \"true\"}\n"),
+		"env isolated":             policy("    env: {OPEN_TERMINAL_ISOLATED: \"false\"}\n"),
+		"env packages":             policy("    env: {OPEN_TERMINAL_PACKAGES: curl}\n"),
+		"env pip packages":         policy("    env: {OPEN_TERMINAL_PIP_PACKAGES: requests}\n"),
+		"env allowed domains":      policy("    env: {OPEN_TERMINAL_ALLOWED_DOMAINS: example.com}\n"),
+		"env HOME":                 policy("    env: {HOME: /tmp}\n"),
+		"env in defaults":          "defaults:\n  env: {OPEN_TERMINAL_API_KEY: x}\n" + policy(""),
+		"env long timeout":         policy("    env: {OPEN_TERMINAL_EXECUTE_TIMEOUT: \"301\"}\n"),
+		"env timeout not number":   policy("    env: {OPEN_TERMINAL_EXECUTE_TIMEOUT: \"5m\"}\n"),
+		"env timeout zero":         policy("    env: {OPEN_TERMINAL_EXECUTE_TIMEOUT: \"0\"}\n"),
+		"bad node selector key":    policy("    nodeSelector: {\"a b\": x}\n"),
+		"bad node selector value":  policy("    nodeSelector: {a: \"x y\"}\n"),
+		"toleration bad operator":  policy("    tolerations:\n      - {key: a, operator: In}\n"),
+		"toleration bad effect":    policy("    tolerations:\n      - {key: a, effect: Evict}\n"),
+		"toleration no key":        policy("    tolerations:\n      - {operator: Equal, value: x}\n"),
+		"toleration unknown key":   policy("    tolerations:\n      - {key: a, seconds: 5}\n"),
+		"toleration seconds":       policy("    tolerations:\n      - {key: a, effect: NoSchedule, tolerationSeconds: 5}\n"),
+		"toleration is text":       policy("    tolerations: [a]\n"),
+		"anchor":                   "defaults: &d {image: a}\n" + policy(""),
+		"alias":                    "defaults: {env: &e {A: x}}\n" + policy("    env: *e\n"),
+		"merge key":                "defaults: {env: &e {A: x}}\n" + policy("    <<: *e\n"),
+		"tagged value":             policy("    image: !!binary aGk=\n"),
+	}
+	for name, content := range cases {
+		if _, err := Parse([]byte(content)); err == nil {
+			t.Errorf("%s: Parse gave no error", name)
+		}
+	}
+	// The same file with no bad setting must be valid. If not, the cases
+	// above fail for a different cause.
+	if _, err := Parse([]byte(policy("    env: {A: x}\n"))); err != nil {
+		t.Fatalf("the base file is not valid: %v", err)
+	}
+}
+
+func TestErrorsHaveLineNumbers(t *testing.T) {
+	_, err := Parse([]byte("policies:\n  - id: a\n    name: A\n    scope: user\n    resources:\n      limits:\n        memory: lots\n"))
+	if err == nil || !strings.Contains(err.Error(), "line 7") {
+		t.Errorf("error = %v, want the line 7", err)
+	}
+	_, err = Parse([]byte("policies:\n  - id: a\n    name: A\n    scope: user\n    env:\n      HOME: /x\n"))
+	if err == nil || !strings.Contains(err.Error(), "line 2") || !strings.Contains(err.Error(), "HOME") {
+		t.Errorf("error = %v, want the line of the policy and the name of the variable", err)
+	}
+}
+
+func TestNewSetCompletesPoliciesFromCode(t *testing.T) {
+	set, err := NewSet([]Policy{{ID: "a", Name: "A", Scope: scope.KindUser}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustGet(t, set, "a")
+	if !p.Persistent() || p.Storage.Size == nil || len(p.Resources.Limits) != 3 {
+		t.Errorf("policy = %+v", p)
+	}
+}
+
+func TestStoreReplacesTheSet(t *testing.T) {
+	first, err := Parse([]byte("policies:\n  - {id: a, name: A, scope: user}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(first)
+	if _, ok := store.Get("a"); !ok || len(store.List()) != 1 {
+		t.Fatal("the store does not have the first set")
+	}
+	second, err := Parse([]byte("policies:\n  - {id: b, name: B, scope: chat}\n  - {id: c, name: C, scope: user}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Replace(second)
+	if _, ok := store.Get("a"); ok {
+		t.Error("the store has a policy of the previous set")
+	}
+	if _, ok := store.Get("b"); !ok || len(store.List()) != 2 {
+		t.Error("the store does not have the new set")
+	}
+}
+
+func TestDaysInATime(t *testing.T) {
+	set, err := Parse([]byte("policies:\n  - {id: a, name: A, scope: user, storage: {retention: 30d}, idleTimeout: 1d}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustGet(t, set, "a")
+	if *p.Storage.Retention != 720*time.Hour || *p.IdleTimeout != 24*time.Hour {
+		t.Errorf("retention = %v, idle time = %v", *p.Storage.Retention, *p.IdleTimeout)
+	}
+}
+
+func TestNetworkCommandAndUser(t *testing.T) {
+	set, err := Parse([]byte(`
+defaults:
+  network:
+    allow:
+      - {cidr: 10.20.0.0/16}
+policies:
+  - {id: usual, name: Usual, scope: user}
+  - id: closed
+    name: Closed
+    scope: user
+    network: {egress: none}
+  - id: database
+    name: Database
+    scope: user
+    network:
+      egress: none
+      dns: true
+      allow:
+        - cidr: 10.30.1.0/24
+          ports: [5432, 6379]
+        - cidr: "2001:db8::/32"
+  - id: other-image
+    name: Other image
+    scope: user
+    command: ["/sbin/tini", "--", "/usr/local/bin/python3", "-m", "open_terminal"]
+    runAsUser: 1000
+    network: {dns: false}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	usual := mustGet(t, set, "usual")
+	if usual.Network.Egress != EgressInternet || !usual.Network.AllowsDNS() || usual.Command != nil || usual.RunAsUser != nil {
+		t.Errorf("defaults of warren = %+v, command %v, user %v", usual.Network, usual.Command, usual.RunAsUser)
+	}
+	// The list of the defaults is in each policy that sets no list.
+	if len(usual.Network.Allow) != 1 || usual.Network.Allow[0].CIDR != "10.20.0.0/16" || usual.Network.Profile() != "custom" {
+		t.Errorf("allow list from the defaults = %+v, profile %q", usual.Network.Allow, usual.Network.Profile())
+	}
+	closed := mustGet(t, set, "closed")
+	if closed.Network.Egress != EgressNone || closed.Network.AllowsDNS() {
+		t.Errorf("closed policy = %+v, DNS %v", closed.Network, closed.Network.AllowsDNS())
+	}
+	db := mustGet(t, set, "database")
+	// The list of a policy replaces the list of the defaults.
+	if len(db.Network.Allow) != 2 || db.Network.Allow[0].CIDR != "10.30.1.0/24" || len(db.Network.Allow[0].Ports) != 2 ||
+		db.Network.Allow[0].Ports[1] != 6379 || len(db.Network.Allow[1].Ports) != 0 || !db.Network.AllowsDNS() {
+		t.Errorf("database policy = %+v", db.Network)
+	}
+	other := mustGet(t, set, "other-image")
+	if len(other.Command) != 5 || other.Command[0] != "/sbin/tini" || other.RunAsUser == nil || *other.RunAsUser != 1000 {
+		t.Errorf("command = %v, user = %v", other.Command, other.RunAsUser)
+	}
+	// This policy sets only "dns". It keeps the mode and the destinations
+	// of the defaults.
+	if other.Network.Egress != EgressInternet || other.Network.AllowsDNS() || len(other.Network.Allow) != 1 || other.Network.Profile() != "custom" {
+		t.Errorf("internet with no DNS = %+v, DNS %v, profile %q", other.Network, other.Network.AllowsDNS(), other.Network.Profile())
+	}
+	// "egress: none" in a policy means none: no destination and no DNS from
+	// the defaults.
+	if len(closed.Network.Allow) != 0 || closed.Network.Profile() != "none" {
+		t.Errorf("closed policy has data from the defaults: %+v, profile %q", closed.Network, closed.Network.Profile())
+	}
+	if db.Network.Profile() != "custom" {
+		t.Errorf("profile of a policy with destinations = %q", db.Network.Profile())
+	}
+	// A policy with no list of its own shows the profile of its mode.
+	plain, err := Parse([]byte("policies:\n  - {id: a, name: A, scope: user}\n  - {id: b, name: B, scope: user, network: {egress: none}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := mustGet(t, plain, "a").Network.Profile(), mustGet(t, plain, "b").Network.Profile(); a != "internet" || b != "none" {
+		t.Errorf("profiles = %q and %q", a, b)
+	}
+	// A change of one policy must not change a different policy.
+	usual.Network.Allow[0].CIDR = "changed"
+	if got := mustGet(t, set, "usual").Network.Allow[0].CIDR; got != "10.20.0.0/16" {
+		t.Errorf("a copy of the policy shares its allow list: %q", got)
+	}
+}
+
+func TestParseRejectsBadNetworkSettings(t *testing.T) {
+	policy := func(extra string) string {
+		return "policies:\n  - id: a\n    name: A\n    scope: user\n" + extra
+	}
+	cases := map[string]string{
+		"unknown egress mode":      policy("    network: {egress: all}\n"),
+		"egress is a boolean":      policy("    network: {egress: true}\n"),
+		"dns is text":              policy("    network: {dns: \"true\"}\n"),
+		"dns is yes":               policy("    network: {dns: yes}\n"),
+		"dns is a number":          policy("    network: {dns: 1}\n"),
+		"unknown network key":      policy("    network: {ingress: all}\n"),
+		"empty network":            policy("    network: {}\n"),
+		"IPv4 in IPv6 form":        policy("    network: {allow: [{cidr: \"::ffff:10.0.0.0/104\"}]}\n"),
+		"network is text":          policy("    network: internet\n"),
+		"allow is a mapping":       policy("    network: {allow: {cidr: 10.0.0.0/8}}\n"),
+		"allow item is text":       policy("    network: {allow: [10.0.0.0/8]}\n"),
+		"allow with no cidr":       policy("    network: {allow: [{ports: [80]}]}\n"),
+		"allow unknown key":        policy("    network: {allow: [{cidr: 10.0.0.0/8, protocol: TCP}]}\n"),
+		"address with no mask":     policy("    network: {allow: [{cidr: 10.1.2.3}]}\n"),
+		"host name":                policy("    network: {allow: [{cidr: example.com}]}\n"),
+		"bits after the prefix":    policy("    network: {allow: [{cidr: 10.1.2.3/16}]}\n"),
+		"all IPv4 addresses":       policy("    network: {allow: [{cidr: 0.0.0.0/0}]}\n"),
+		"all IPv6 addresses":       policy("    network: {allow: [{cidr: \"::/0\"}]}\n"),
+		"port zero":                policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [0]}]}\n"),
+		"port too large":           policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [65536]}]}\n"),
+		"port as text":             policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [\"80\"]}]}\n"),
+		"negative port":            policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [-1]}]}\n"),
+		"duplicate port":           policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [80, 80]}]}\n"),
+		"empty port list":          policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: []}]}\n"),
+		"port range as text":       policy("    network: {allow: [{cidr: 10.0.0.0/8, ports: [8000-9000]}]}\n"),
+		"cidr and pods together":   policy("    network: {allow: [{cidr: 10.0.0.0/8, namespace: db, podLabels: {app: x}}]}\n"),
+		"namespace with no labels": policy("    network: {allow: [{namespace: db}]}\n"),
+		"labels with no namespace": policy("    network: {allow: [{podLabels: {app: x}}]}\n"),
+		"empty pod labels":         policy("    network: {allow: [{namespace: db, podLabels: {}}]}\n"),
+		"empty label value":        policy("    network: {allow: [{namespace: db, podLabels: {app: \"\"}}]}\n"),
+		"bad namespace":            policy("    network: {allow: [{namespace: \"All Namespaces\", podLabels: {app: x}}]}\n"),
+		"command is text":          policy("    command: /bin/sh\n"),
+		"empty command":            policy("    command: []\n"),
+		"command with no path":     policy("    command: [python3, -m, open_terminal]\n"),
+		"relative command":         policy("    command: [./start]\n"),
+		"empty command item":       policy("    command: [/bin/sh, \"\"]\n"),
+		"number in command":        policy("    command: [/bin/sleep, 5]\n"),
+		"user root":                policy("    runAsUser: 0\n"),
+		"negative user":            policy("    runAsUser: -1\n"),
+		"user as text":             policy("    runAsUser: \"1000\"\n"),
+		"user name":                policy("    runAsUser: user\n"),
+		"user too large":           policy("    runAsUser: 4294967296\n"),
+		"octal user":               policy("    runAsUser: 01750\n"),
+	}
+	for name, content := range cases {
+		if _, err := Parse([]byte(content)); err == nil {
+			t.Errorf("%s: Parse gave no error", name)
+		}
+	}
+	if _, err := Parse([]byte(policy("    network: {egress: none, dns: false, allow: [{cidr: 10.0.0.0/8, ports: [80]}, {namespace: db, podLabels: {app: postgres}, ports: [5432]}]}\n    runAsUser: 1000\n    command: [/bin/sh]\n"))); err != nil {
+		t.Fatalf("the base file is not valid: %v", err)
+	}
+}
+
+// The defaults of a file can be strict. A policy that adds one destination
+// must not get the "internet" mode by that.
+func TestStrictNetworkDefaultsStayStrict(t *testing.T) {
+	set, err := Parse([]byte(`
+defaults:
+  network: {egress: none}
+policies:
+  - {id: plain, name: Plain, scope: user}
+  - id: database
+    name: Database
+    scope: user
+    network:
+      allow:
+        - {cidr: 10.30.1.0/24, ports: [5432]}
+  - {id: open, name: Open, scope: user, network: {egress: internet}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := mustGet(t, set, "plain"); p.Network.Egress != EgressNone || p.Network.AllowsDNS() || p.Network.Profile() != "none" {
+		t.Errorf("policy with no network key = %+v", p.Network)
+	}
+	if p := mustGet(t, set, "database"); p.Network.Egress != EgressNone || p.Network.AllowsDNS() || len(p.Network.Allow) != 1 {
+		t.Errorf("a policy that adds a destination changed the mode of the defaults: %+v", p.Network)
+	}
+	if p := mustGet(t, set, "open"); p.Network.Egress != EgressInternet || !p.Network.AllowsDNS() {
+		t.Errorf("a policy that sets the mode = %+v", p.Network)
+	}
+}
+
+// An empty egress mode is not "none". It gave the default "internet", or the
+// mode of the defaults, with no message.
+func TestEmptyEgressMode(t *testing.T) {
+	for _, file := range []string{
+		"policies:\n  - {id: a, name: A, scope: user, network: {egress: \"\"}}\n",
+		"defaults: {network: {egress: none}}\npolicies:\n  - {id: a, name: A, scope: user, network: {egress: \"\"}}\n",
+		"defaults: {network: {egress: \"\"}}\npolicies:\n  - {id: a, name: A, scope: user}\n",
+	} {
+		set, err := Parse([]byte(file))
+		if err == nil {
+			p := mustGet(t, set, "a")
+			t.Errorf("Parse accepted an empty egress mode. The policy got %q with DNS %v:\n%s", p.Network.Egress, p.Network.AllowsDNS(), file)
+		} else if !strings.Contains(err.Error(), "network.egress") || !strings.Contains(err.Error(), "line ") {
+			t.Errorf("error = %v, want the key and the line", err)
 		}
 	}
 }
