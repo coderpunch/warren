@@ -8,6 +8,8 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,7 +17,9 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	networkingclient "k8s.io/client-go/kubernetes/typed/networking/v1"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/h3xcat/warren/internal/backend"
@@ -735,5 +739,137 @@ func TestNamespacePolicyThatWarrenCannotRead(t *testing.T) {
 	e.m.Reap(context.Background())
 	if !e.m.Ready() {
 		t.Errorf("the manager is not ready after one read that failed: %s", e.m.NotReadyReason())
+	}
+}
+
+// slowLists is a client whose list request for the network policies takes
+// time: before runs before each such request gets to the API server. A
+// reactor of the simulated cluster cannot do this, because the simulated
+// cluster accepts no other request while a reactor runs.
+type slowLists struct {
+	kubernetes.Interface
+	before func()
+}
+
+func (c slowLists) NetworkingV1() networkingclient.NetworkingV1Interface {
+	return slowNetworking{c.Interface.NetworkingV1(), c.before}
+}
+
+type slowNetworking struct {
+	networkingclient.NetworkingV1Interface
+	before func()
+}
+
+func (n slowNetworking) NetworkPolicies(namespace string) networkingclient.NetworkPolicyInterface {
+	return slowPolicies{n.NetworkingV1Interface.NetworkPolicies(namespace), n.before}
+}
+
+type slowPolicies struct {
+	networkingclient.NetworkPolicyInterface
+	before func()
+}
+
+func (p slowPolicies) List(ctx context.Context, opts metav1.ListOptions) (*networkingv1.NetworkPolicyList, error) {
+	p.before()
+	return p.NetworkPolicyInterface.List(ctx, opts)
+}
+
+// A pod can get its node, become ready, and get its first lease while a run
+// of the reaper is in progress. The policy of the pod then has the address
+// of its node (blockNode). The reaper must not write the policy again with
+// node addresses that it read before that moment.
+func TestReaperKeepsTheNodeAddressOfTheFirstLease(t *testing.T) {
+	var before func()
+	e := newTestEnv(t, func(c *Config) {
+		c.Client = slowLists{c.Client, func() {
+			if before != nil {
+				before()
+			}
+		}}
+	})
+	req := userRef("alice")
+	name := req.Ref.Name()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res := e.acquireAsync(ctx, e.m, req)
+	waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
+	blocked := func() bool {
+		return slices.Contains(e.policyOf(req).Spec.Egress[1].To[0].IPBlock.Except, "203.0.113.5/32")
+	}
+
+	var once sync.Once
+	var lease backend.Lease
+	before = func() {
+		once.Do(func() {
+			// The list request of the reaper is in progress.
+			e.setStatus(name, func(p *corev1.Pod) {
+				readyStatus(p)
+				p.Status.HostIP = "203.0.113.5"
+				p.Status.HostIPs = []corev1.HostIP{{IP: "203.0.113.5"}}
+			})
+			r := <-res
+			if r.err != nil {
+				t.Error(r.err)
+				return
+			}
+			lease = r.lease
+			if !blocked() {
+				t.Error("the policy does not have the address of the node at the first lease")
+			}
+		})
+	}
+	e.m.Reap(context.Background())
+	if lease == nil {
+		t.Fatal("no lease")
+	}
+	defer lease.Release()
+	if !blocked() {
+		t.Error("the reaper removed the address of the node from the policy of a sandbox that has a lease")
+	}
+}
+
+// A person or a program can change the policy of the namespace: it can then
+// permit connections for all sandboxes. If warren cannot repair the policy,
+// warren is not ready and starts no sandbox (docs/isolation.md, section 3.1).
+func TestNamespacePolicyThatWarrenCannotRepair(t *testing.T) {
+	e := newTestEnv(t, nil)
+	ctx := context.Background()
+	policies := e.client.NetworkingV1().NetworkPolicies(testNamespace)
+	cur, err := policies.Get(ctx, defaultDenyName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A rule with no peer permits all connections to all pods.
+	cur.Spec.Ingress = []networkingv1.NetworkPolicyIngressRule{{}}
+	if _, err := policies.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var refuse atomic.Bool
+	refuse.Store(true)
+	e.client.PrependReactor("update", "networkpolicies", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if refuse.Load() {
+			return true, nil, errors.New("networkpolicies is forbidden")
+		}
+		return false, nil, nil
+	})
+	e.m.Reap(ctx)
+	if e.m.Ready() {
+		t.Fatal("the manager is ready with a namespace policy that permits all connections to the sandboxes")
+	}
+	if reason := e.m.NotReadyReason(); !strings.Contains(reason, "repair the network policy") || !strings.Contains(reason, "forbidden") {
+		t.Errorf("reason = %q, want the cause", reason)
+	}
+	if err := e.m.Start(ctx, userRef("alice")); !errors.Is(err, backend.ErrNotReady) {
+		t.Errorf("Start = %v, want ErrNotReady", err)
+	}
+	// Kubernetes accepts the change again. The next reaper run repairs the
+	// policy, and warren is ready.
+	refuse.Store(false)
+	e.m.Reap(ctx)
+	if !e.m.Ready() {
+		t.Errorf("the manager is not ready after the repair: %s", e.m.NotReadyReason())
+	}
+	if np := e.networkPolicies()[defaultDenyName]; len(np.Spec.Ingress) != 0 || len(np.Spec.Egress) != 0 {
+		t.Errorf("rules of the policy after the repair: %+v", np.Spec)
 	}
 }

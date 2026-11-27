@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,15 +21,17 @@ import (
 
 	"github.com/h3xcat/warren/internal/backend"
 	"github.com/h3xcat/warren/internal/policy"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // canaryEnv makes an environment in which the test pod of the network test
 // becomes ready immediately, as on a cluster.
 //
-// The test of warren has two steps. While the test pod has its own network
-// policy, a connection attempt of warren is successful: the policy permits
-// warren. After warren deleted that policy, dial gives the result of each
-// connection attempt: an error on a cluster that applies network policies.
+// While the test pod has its own network policy, a connection attempt of
+// warren is successful: the policy permits warren. After warren deleted that
+// policy, dial gives the result of each connection attempt: an error on a
+// cluster that applies network policies.
 func canaryEnv(t *testing.T, dial func(attempt int32) error) (*testEnv, *atomic.Int32) {
 	return canaryEnvWith(t, func() error { return nil }, dial)
 }
@@ -55,6 +58,9 @@ func canaryEnvWith(t *testing.T, permitted func() error, dial func(attempt int32
 		}
 		return false, nil, nil
 	})
+	// The test deletes its objects with their UID.
+	e.strictDeletes(corev1.SchemeGroupVersion.WithResource("pods"))
+	e.strictDeletes(networkingv1.SchemeGroupVersion.WithResource("networkpolicies"))
 	// newTestEnv records a successful test. Go back to "no test yet".
 	e.m.enforcement.Store(enforcementUnknown)
 	return e, &attempts
@@ -85,8 +91,8 @@ func TestClusterThatAppliesNetworkPolicies(t *testing.T) {
 		return false, nil, nil
 	})
 	e.m.examineEnforcement(context.Background())
-	if !e.m.Ready() || attempts.Load() != 1 {
-		t.Errorf("ready = %v after %d connection attempts, want ready after 1", e.m.Ready(), attempts.Load())
+	if !e.m.Ready() || attempts.Load() != canaryRefusals {
+		t.Errorf("ready = %v after %d connection attempts, want ready after %d", e.m.Ready(), attempts.Load(), canaryRefusals)
 	}
 	if n := len(e.canaries()); n != 0 {
 		t.Errorf("test pods after the test = %d, want 0", n)
@@ -159,8 +165,9 @@ func TestNetworkPluginThatIsSlow(t *testing.T) {
 		return errTimeout
 	})
 	e.m.examineEnforcement(context.Background())
-	if !e.m.Ready() || attempts.Load() != 3 {
-		t.Errorf("ready = %v after %d attempts, want ready after 3", e.m.Ready(), attempts.Load())
+	// Two successful attempts, then the refused attempts of the proof.
+	if want := int32(2 + canaryRefusals); !e.m.Ready() || attempts.Load() != want {
+		t.Errorf("ready = %v after %d attempts, want ready after %d", e.m.Ready(), attempts.Load(), want)
 	}
 }
 
@@ -624,5 +631,404 @@ func TestFirstSandboxOnANodeWithAPublicAddress(t *testing.T) {
 	v4, v6 := np.Spec.Egress[1].To[0].IPBlock.Except, np.Spec.Egress[1].To[1].IPBlock.Except
 	if !slices.Contains(v4, "203.0.113.5/32") || !slices.Contains(v6, "2001:db8::5/128") {
 		t.Errorf("exceptions at the first lease: %v and %v, want the addresses of the node", v4, v6)
+	}
+}
+
+// The test pod must not go to the nodes of one special policy when a policy
+// with the same image can use all nodes. The order of the IDs decides only
+// between two policies with a node selector of the same size.
+func TestTestPodUsesThePolicyWithTheSmallestNodeSelector(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.usePolicies(`
+policies:
+  - id: data-team
+    name: Data team
+    scope: user
+    imagePullSecrets: [data-pull]
+    nodeSelector: {pool: data}
+    tolerations: [{key: pool, operator: Equal, value: data, effect: NoSchedule}]
+  - {id: general, name: General, scope: user, imagePullSecrets: [general-pull]}
+`)
+	pod := e.m.buildCanary("warren-canary-00000000")
+	if len(pod.Spec.NodeSelector) != 0 || len(pod.Spec.Tolerations) != 0 {
+		t.Errorf("node selector = %v, tolerations = %v: the policy %q has the same image and no node selector",
+			pod.Spec.NodeSelector, pod.Spec.Tolerations, "general")
+	}
+	if len(pod.Spec.ImagePullSecrets) != 1 || pod.Spec.ImagePullSecrets[0].Name != "general-pull" {
+		t.Errorf("pull secrets = %v, want those of the policy %q", pod.Spec.ImagePullSecrets, "general")
+	}
+	// With two policies that have a node selector of the same size, the test
+	// pod has all settings of the first one.
+	e.usePolicies(`
+policies:
+  - {id: b-team, name: B, scope: user, nodeSelector: {pool: b}}
+  - {id: a-team, name: A, scope: user, nodeSelector: {pool: a}, imagePullSecrets: [a-pull]}
+`)
+	pod = e.m.buildCanary("warren-canary-00000000")
+	if pod.Spec.NodeSelector["pool"] != "a" || len(pod.Spec.ImagePullSecrets) != 1 {
+		t.Errorf("node selector = %v, pull secrets = %v, want those of the policy %q", pod.Spec.NodeSelector, pod.Spec.ImagePullSecrets, "a-team")
+	}
+}
+
+// An image that Kubernetes cannot pull for some time is not a container that
+// cannot start. The 2 minutes of start_error count from the first sight of a
+// cause that stops the pod, and the log has the message of that cause.
+func TestStartErrorAfterAFailedImagePull(t *testing.T) {
+	var logs syncBuffer
+	e := newTestEnv(t, func(c *Config) { c.Logger = slog.New(slog.NewTextHandler(&logs, nil)) })
+	req := templateRef("other-image", "alice")
+	name := req.Ref.Name()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, _ = e.m.Acquire(ctx, req)
+	waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
+	waiting := func(reason, message string) {
+		e.setStatus(name, func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: containerName, State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: message},
+			}}}
+		})
+		waitFor(t, "status in the cache", func() bool {
+			s := e.m.pod(name).Status.ContainerStatuses
+			return len(s) == 1 && s[0].State.Waiting.Reason == reason
+		})
+	}
+	// The registry does not answer for 3 minutes.
+	waiting("ImagePullBackOff", "registry timeout")
+	e.m.Reap(context.Background())
+	e.clock.Advance(3 * time.Minute)
+	e.m.Reap(context.Background())
+	if n := e.podDeletes(name); n != 0 {
+		t.Fatalf("warren stopped a pod that waits for its image: delete requests = %d", n)
+	}
+	// The image comes, and the container has its first start error.
+	waiting("RunContainerError", `exec: "/sbin/tini": no such file or directory`)
+	e.m.Reap(context.Background())
+	if n := e.podDeletes(name); n != 0 {
+		t.Errorf("delete requests at the first sight of the start error = %d, want 0: the condition must stay for 2 minutes", n)
+	}
+	if !strings.Contains(logs.String(), "/sbin/tini") {
+		t.Errorf("the log does not have the message of the cause that stops the pod: %s", logs.String())
+	}
+	// Kubernetes shows the two causes in turn. Each cause has one log record.
+	waiting("CrashLoopBackOff", "back-off 10s restarting failed container")
+	e.clock.Advance(time.Minute)
+	e.m.Reap(context.Background())
+	waiting("RunContainerError", `exec: "/sbin/tini": no such file or directory`)
+	e.m.Reap(context.Background())
+	if n := strings.Count(logs.String(), "cannot start"); n != 3 {
+		t.Errorf("log records = %d, want 3 (one for each cause): %s", n, logs.String())
+	}
+	if n := e.podDeletes(name); n != 0 {
+		t.Errorf("delete requests 1 minute after the first start error = %d, want 0", n)
+	}
+	e.clock.Advance(90 * time.Second)
+	e.m.Reap(context.Background())
+	waitFor(t, "stop of the pod that cannot start", func() bool { return e.m.pod(name) == nil })
+}
+
+// strictDeletes makes the simulated cluster apply the UID condition of a
+// delete request, as an API server does. Without this rule, a delete request
+// with the UID of a different object deletes the object.
+func (e *testEnv) strictDeletes(resource schema.GroupVersionResource) {
+	e.client.PrependReactor("delete", resource.Resource, func(a k8stesting.Action) (bool, runtime.Object, error) {
+		del, ok := a.(k8stesting.DeleteActionImpl)
+		if !ok || del.DeleteOptions.Preconditions == nil || del.DeleteOptions.Preconditions.UID == nil {
+			return false, nil, nil
+		}
+		obj, err := e.client.Tracker().Get(resource, del.Namespace, del.Name)
+		if err != nil {
+			return false, nil, nil
+		}
+		if meta, ok := obj.(metav1.Object); ok && meta.GetUID() != *del.DeleteOptions.Preconditions.UID {
+			return true, nil, apierrors.NewConflict(resource.GroupResource(), del.Name, errors.New("the UID of the request is not the UID of the object"))
+		}
+		return false, nil, nil
+	})
+}
+
+// One connection attempt can fail for a cause that goes away: a lost packet,
+// a busy node, a fault of warren. On a cluster that ignores network
+// policies, the attempts after it are successful again. One failure, or two,
+// must not be the proof that the cluster applies network policies.
+func TestConnectionThatFailsOneTimeIsNotAProof(t *testing.T) {
+	cases := []struct {
+		// failed has the numbers of the attempts that fail in the second
+		// step. attempts is the number of attempts that warren must make.
+		failed   []int32
+		attempts int32
+	}{
+		{[]int32{1}, canaryAttempts},
+		{[]int32{2}, canaryAttempts},
+		{[]int32{2, 3}, canaryAttempts},
+		// Only failures one after the other count.
+		{[]int32{1, 3, 5}, canaryAttempts},
+		{[]int32{canaryAttempts}, canaryAttempts + 1},
+		{[]int32{canaryAttempts, canaryAttempts + 1}, canaryAttempts + 2},
+	}
+	for _, c := range cases {
+		e, attempts := canaryEnv(t, func(n int32) error {
+			if slices.Contains(c.failed, n) {
+				return errTimeout
+			}
+			return nil
+		})
+		e.m.examineEnforcement(context.Background())
+		if e.m.Ready() {
+			t.Errorf("failed attempts %v: the manager is ready on a cluster that ignores network policies", c.failed)
+		}
+		if got := e.m.enforcement.Load(); got != enforcementAbsent {
+			t.Errorf("failed attempts %v: result = %d, want %d", c.failed, got, enforcementAbsent)
+		}
+		if got := attempts.Load(); got != c.attempts {
+			t.Errorf("failed attempts %v: connection attempts = %d, want %d", c.failed, got, c.attempts)
+		}
+	}
+	// A slow network plugin refuses the connection only at the last regular
+	// attempt. Warren then makes the attempts that the proof needs.
+	e, attempts := canaryEnv(t, func(n int32) error {
+		if n < canaryAttempts {
+			return nil
+		}
+		return errTimeout
+	})
+	e.m.examineEnforcement(context.Background())
+	if want := int32(canaryAttempts + canaryRefusals - 1); !e.m.Ready() || attempts.Load() != want {
+		t.Errorf("slow plugin: ready = %v after %d attempts, want ready after %d", e.m.Ready(), attempts.Load(), want)
+	}
+}
+
+// An image that Kubernetes cannot pull at this time can come later, thus
+// warren does not stop the pod for that cause. The time of that wait must
+// not count for a later error of the container: the 2 minutes start at the
+// first sight of a cause that stops the pod.
+func TestContainerErrorAfterASlowImagePull(t *testing.T) {
+	var logs syncBuffer
+	e := newTestEnv(t, func(c *Config) {
+		c.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		// Only the start_error rule can stop the pod in this test.
+		c.StartTimeout = time.Hour
+	})
+	req := templateRef("other-image", "alice")
+	name := req.Ref.Name()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, _ = e.m.Acquire(ctx, req)
+	waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
+	waiting := func(reason, message string) {
+		t.Helper()
+		e.setStatus(name, func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: containerName, State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: message},
+			}}}
+		})
+		waitFor(t, "status in the cache", func() bool {
+			st := e.m.pod(name).Status.ContainerStatuses
+			return len(st) == 1 && st[0].State.Waiting.Reason == reason
+		})
+	}
+	waiting("ImagePullBackOff", "back-off pulling image")
+	e.m.Reap(context.Background())
+	e.clock.Advance(startErrorAfter + time.Minute)
+	e.m.Reap(context.Background())
+	if e.m.pod(name) == nil || e.podDeletes(name) != 0 {
+		t.Fatal("warren stopped a pod that waits for its image")
+	}
+	// The image came. The first start of the container gives one error.
+	waiting("CreateContainerError", "context deadline exceeded")
+	e.m.Reap(context.Background())
+	if n := e.podDeletes(name); n != 0 {
+		t.Fatalf("delete requests at the first sight of CreateContainerError = %d, want 0: the time of the image pull counted", n)
+	}
+	// The second cause has its own log record.
+	if n := strings.Count(logs.String(), "cannot start"); n != 2 || !strings.Contains(logs.String(), "context deadline exceeded") {
+		t.Errorf("log records = %d, want one for each of the two causes: %s", n, logs.String())
+	}
+	// The image pull fails again for a short time (imagePullPolicy: Always).
+	// That does not start the time again.
+	e.clock.Advance(startErrorAfter / 2)
+	waiting("ErrImagePull", "connection refused")
+	e.m.Reap(context.Background())
+	waiting("CreateContainerError", "context deadline exceeded")
+	e.m.Reap(context.Background())
+	if n := e.podDeletes(name); n != 0 {
+		t.Fatalf("delete requests after 1 minute of CreateContainerError = %d, want 0", n)
+	}
+	// The error stays for more than 2 minutes.
+	e.clock.Advance(startErrorAfter/2 + time.Second)
+	e.m.Reap(context.Background())
+	waitFor(t, "stop of the pod that cannot start", func() bool { return e.m.pod(name) == nil })
+	// One record for each of the three causes, and no record for a cause
+	// that comes again.
+	if n := strings.Count(logs.String(), "cannot start"); n != 3 {
+		t.Errorf("log records = %d, want 3: %s", n, logs.String())
+	}
+}
+
+// A sandbox must get no lease while warren cannot put the address of the
+// node in the network policy of the pod: Kubernetes refuses the read or the
+// change of the policy. A program of the user could then connect to the
+// node.
+func TestNoLeaseWhileTheNodeAddressIsNotInThePolicy(t *testing.T) {
+	for i, verb := range []string{"get", "update"} {
+		e := newTestEnv(t, nil)
+		req := userRef("user" + strconv.Itoa(i))
+		name := req.Ref.Name()
+		var refuse atomic.Bool
+		refuse.Store(true)
+		e.client.PrependReactor(verb, "networkpolicies", func(k8stesting.Action) (bool, runtime.Object, error) {
+			if refuse.Load() {
+				return true, nil, errors.New("the server is not available")
+			}
+			return false, nil, nil
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		res := e.acquireAsync(ctx, e.m, req)
+		waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
+		e.setStatus(name, func(p *corev1.Pod) {
+			readyStatus(p)
+			p.Status.HostIP = "203.0.113.5"
+		})
+		r := <-res
+		cancel()
+		if r.err == nil {
+			r.lease.Release()
+			t.Fatalf("%s refused: lease for a sandbox whose policy permits the address of its node", verb)
+		}
+		if !errors.Is(r.err, backend.ErrNotReady) {
+			t.Errorf("%s refused: Acquire = %v, want ErrNotReady", verb, r.err)
+		}
+		// Warren did not connect to the sandbox.
+		e.mu.Lock()
+		verified := len(e.verified)
+		e.mu.Unlock()
+		if verified != 0 {
+			t.Errorf("%s refused: warren did %d key checks before the policy had the address of the node", verb, verified)
+		}
+		// Kubernetes accepts the request again.
+		refuse.Store(false)
+		e.acquire(req).Release()
+		if v4 := e.policyOf(req).Spec.Egress[1].To[0].IPBlock.Except; !slices.Contains(v4, "203.0.113.5/32") {
+			t.Errorf("%s permitted again: exceptions at the first lease = %v, want the address of the node", verb, v4)
+		}
+	}
+}
+
+// The results of the connection attempts count only for the test pod that
+// warren made, while it operates. A different pod can have the name or the
+// address of a test pod that went away, and a pod in deletion stops its
+// server.
+func TestNetworkTestWhoseTestPodChanged(t *testing.T) {
+	ctx := context.Background()
+	changes := map[string]func(e *testEnv, pod corev1.Pod){
+		"a new pod with the same name": func(e *testEnv, pod corev1.Pod) {
+			pods := e.client.CoreV1().Pods(testNamespace)
+			if err := pods.Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
+				t.Error(err)
+			}
+			if _, err := pods.Create(ctx, e.m.buildCanary(pod.Name), metav1.CreateOptions{}); err != nil {
+				t.Error(err)
+			}
+		},
+		"a pod in deletion": func(e *testEnv, pod corev1.Pod) {
+			now := metav1.NewTime(e.clock.Now())
+			pod.DeletionTimestamp = &now
+			if _, err := e.client.CoreV1().Pods(testNamespace).Update(ctx, &pod, metav1.UpdateOptions{}); err != nil {
+				t.Error(err)
+			}
+		},
+		"a different address": func(e *testEnv, pod corev1.Pod) {
+			e.setStatus(pod.Name, func(p *corev1.Pod) { p.Status.PodIP = "127.0.0.2" })
+		},
+	}
+	for what, change := range changes {
+		var e *testEnv
+		e, _ = canaryEnv(t, func(n int32) error {
+			if n == 1 {
+				for _, p := range e.canaries() {
+					change(e, p)
+				}
+			}
+			return errTimeout
+		})
+		e.m.examineEnforcement(ctx)
+		if e.m.enforcement.Load() != enforcementUnknown || e.m.Ready() {
+			t.Errorf("%s: result = %d, want no result: the refused connections were not connections to the test pod", what, e.m.enforcement.Load())
+		}
+		if reason := e.m.NotReadyReason(); !strings.Contains(reason, "test pod") {
+			t.Errorf("%s: reason = %q, want the cause", what, reason)
+		}
+	}
+}
+
+// On a cluster that applies network policies, a different pod can get the
+// address of a test pod that went away, and its policy can permit warren.
+// Successful connections then do not show a cluster that ignores network
+// policies.
+func TestSuccessfulConnectionsAfterTheTestPodWentAway(t *testing.T) {
+	var e *testEnv
+	e, attempts := canaryEnv(t, func(n int32) error {
+		if n == 1 {
+			for _, p := range e.canaries() {
+				_ = e.client.CoreV1().Pods(testNamespace).Delete(context.Background(), p.Name, metav1.DeleteOptions{})
+			}
+		}
+		return nil
+	})
+	e.m.examineEnforcement(context.Background())
+	if got := e.m.enforcement.Load(); got != enforcementUnknown {
+		t.Errorf("result = %d, want no result: the connections were not connections to the test pod", got)
+	}
+	if got := attempts.Load(); got != canaryAttempts {
+		t.Errorf("connection attempts = %d, want %d", got, canaryAttempts)
+	}
+	if reason := e.m.NotReadyReason(); !strings.Contains(reason, "test pod") {
+		t.Errorf("reason = %q, want the cause", reason)
+	}
+}
+
+// If the test pod goes away in the first step, the failed connections do not
+// show a fault of the configuration of warren.
+func TestFirstStepWhoseTestPodWentAway(t *testing.T) {
+	var e *testEnv
+	e, attempts := canaryEnvWith(t, func() error {
+		for _, p := range e.canaries() {
+			_ = e.client.CoreV1().Pods(testNamespace).Delete(context.Background(), p.Name, metav1.DeleteOptions{})
+		}
+		return errTimeout
+	}, func(int32) error { return errTimeout })
+	e.m.examineEnforcement(context.Background())
+	if e.m.Ready() || attempts.Load() != 0 {
+		t.Errorf("ready = %v, attempts of the second step = %d", e.m.Ready(), attempts.Load())
+	}
+	reason := e.m.NotReadyReason()
+	if !strings.Contains(reason, "test pod") || strings.Contains(reason, errUnreachable.Error()) {
+		t.Errorf("reason = %q, want the test pod as the cause, and not the configuration of warren", reason)
+	}
+}
+
+// The last step of the test makes the policy of the test pod a second time.
+// The second policy has a new UID, and warren deletes its objects with their
+// UID. No policy of the test must stay.
+func TestNetworkTestRemovesItsSecondPolicy(t *testing.T) {
+	e, _ := canaryEnv(t, func(int32) error { return errTimeout })
+	var made atomic.Int32
+	e.client.PrependReactor("create", "networkpolicies", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if strings.HasPrefix(a.(k8stesting.CreateAction).GetObject().(*networkingv1.NetworkPolicy).Name, canaryPrefix) {
+			made.Add(1)
+		}
+		return false, nil, nil
+	})
+	e.m.examineEnforcement(context.Background())
+	if !e.m.Ready() || made.Load() != 2 {
+		t.Fatalf("ready = %v, policies of the test = %d, want ready with 2: %s", e.m.Ready(), made.Load(), e.m.NotReadyReason())
+	}
+	for name := range e.networkPolicies() {
+		if name != defaultDenyName {
+			t.Errorf("the network policy %s stays after the test", name)
+		}
+	}
+	if n := len(e.canaries()); n != 0 {
+		t.Errorf("test pods after the test = %d, want 0", n)
 	}
 }

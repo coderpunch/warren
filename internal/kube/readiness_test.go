@@ -11,8 +11,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/h3xcat/warren/internal/backend"
@@ -696,5 +698,201 @@ func TestTwoProcessesOnAClusterThatIgnoresNetworkPolicies(t *testing.T) {
 	}
 	if first.Ready() || second.Ready() {
 		t.Error("a process is ready on a cluster that ignores network policies")
+	}
+}
+
+// The reaper stops a pod of a previous version of warren because the policy
+// of the namespace refuses all its connections. While that policy does not
+// exist, this process starts no sandbox, and the pod can operate for a
+// process of the previous version: in a rollout, that process has the users
+// until this process is ready. Run must not stop such a pod in that time.
+func TestSandboxOfAPreviousVersionWhileTheNamespaceHasNoPolicy(t *testing.T) {
+	e, _ := canaryEnv(t, func(int32) error { return errTimeout })
+	e.m.cfg.ReapInterval = 10 * time.Millisecond
+	ctx := context.Background()
+	// The namespace has a pod of a different owner, thus warren does not
+	// make the policy of the namespace.
+	var other atomic.Bool
+	other.Store(true)
+	e.client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if !other.Load() {
+			return false, nil, nil
+		}
+		return true, &corev1.PodList{Items: []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "database-0", Namespace: testNamespace}}}}, nil
+	})
+	if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(ctx, defaultDenyName, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	req := userRef("alice")
+	name := req.Ref.Name()
+	old := e.m.buildPod(name, name+"-00000000", req, e.policy(req))
+	delete(old.Labels, LabelStart)
+	readyStatus(old)
+	if _, err := e.client.CoreV1().Pods(testNamespace).Create(ctx, old, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "pod in the cache", func() bool { return e.m.pod(name) != nil })
+
+	before := e.reaps()
+	e.run()
+	waitFor(t, "three runs of the reaper", func() bool { return e.reaps() >= before+3 })
+	if e.m.Ready() {
+		t.Fatal("ready in a namespace with a pod of a different owner and no policy")
+	}
+	if n := e.podDeletes(name); n != 0 {
+		t.Errorf("warren is not ready (%s), and it stopped a sandbox of the previous version: delete requests = %d, want 0", e.m.NotReadyReason(), n)
+	}
+	// The administrator removes the other pod. Warren makes the policy of
+	// the namespace, and that policy refuses all connections of the old pod.
+	other.Store(false)
+	waitFor(t, "stop of the sandbox of the previous version", func() bool { return e.podDeletes(name) > 0 })
+	if _, ok := e.networkPolicies()[defaultDenyName]; !ok {
+		t.Error("warren stopped the sandbox of the previous version before the namespace had its policy")
+	}
+	waitFor(t, "ready", e.m.Ready)
+}
+
+// The reaper writes the cause of a problem with the policy of the namespace,
+// and the network test writes the cause of a test that is not possible. The
+// two operate at the same time. The readiness report must give each
+// condition its own cause, and not the cause of a problem that is gone.
+func TestReadinessReportHasTheCauseOfItsCondition(t *testing.T) {
+	e, _ := canaryEnv(t, func(int32) error { return errTimeout })
+	ctx := context.Background()
+	if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(ctx, defaultDenyName, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var refuse, full atomic.Bool
+	refuse.Store(true)
+	full.Store(true)
+	e.client.PrependReactor("create", "networkpolicies", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if refuse.Load() && a.(k8stesting.CreateAction).GetObject().(*networkingv1.NetworkPolicy).Name == defaultDenyName {
+			return true, nil, errors.New("admission webhook denied the request")
+		}
+		return false, nil, nil
+	})
+	e.refuseCanary(&full, "exceeded quota")
+	e.m.Reap(ctx)
+	// A network test ends after the reaper found the problem.
+	e.m.examineEnforcement(ctx)
+	reason := e.m.NotReadyReason()
+	if !strings.Contains(reason, "has no network policy") || !strings.Contains(reason, "admission webhook") {
+		t.Fatalf("reason = %q, want the policy of the namespace and its cause", reason)
+	}
+	if strings.Contains(reason, "exceeded quota") {
+		t.Errorf("reason = %q: it gives the cause of the network test for the policy of the namespace", reason)
+	}
+	// The administrator corrects the webhook. The policy of the namespace
+	// exists again, and only the network test has no result.
+	refuse.Store(false)
+	e.m.Reap(ctx)
+	reason = e.m.NotReadyReason()
+	if !strings.Contains(reason, "test of the network policies is not complete") || !strings.Contains(reason, "exceeded quota") {
+		t.Fatalf("reason = %q, want the network test and its cause", reason)
+	}
+	if strings.Contains(reason, "admission webhook") || strings.Contains(reason, defaultDenyName) {
+		t.Errorf("reason = %q: it gives the cause of a problem that is gone", reason)
+	}
+}
+
+// Two warren processes can repair the policy of the namespace at the same
+// time, for example in a rollout. One of them gets a conflict, and the
+// policy in the cluster is correct then. That process must read the policy
+// again. It must not refuse all requests until its next reaper run.
+func TestConflictAtTheRepairOfTheNamespacePolicy(t *testing.T) {
+	e := newTestEnv(t, nil)
+	ctx := context.Background()
+	cur, err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Get(ctx, defaultDenyName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// stale is the number of read requests that give the policy as a person
+	// changed it. The cluster itself always has the correct policy: the
+	// second process repaired it.
+	var stale, repairs atomic.Int32
+	e.client.PrependReactor("get", "networkpolicies", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.(k8stesting.GetAction).GetName() != defaultDenyName || stale.Add(-1) < 0 {
+			return false, nil, nil
+		}
+		changed := cur.DeepCopy()
+		changed.Spec.PolicyTypes = nil
+		return true, changed, nil
+	})
+	e.client.PrependReactor("update", "networkpolicies", func(k8stesting.Action) (bool, runtime.Object, error) {
+		repairs.Add(1)
+		return true, nil, apierrors.NewConflict(schema.GroupResource{Group: "networking.k8s.io", Resource: "networkpolicies"},
+			defaultDenyName, errors.New("the object has been modified"))
+	})
+	stale.Store(1)
+	e.m.Reap(ctx)
+	if !e.m.Ready() {
+		t.Errorf("not ready after one conflict: %s (the policy in the cluster is correct)", e.m.NotReadyReason())
+	}
+	if n := repairs.Load(); n != 1 {
+		t.Errorf("repair requests = %d, want 1", n)
+	}
+	// A policy that stays wrong, with a conflict at each repair: warren does
+	// not try with no end, and it starts no sandbox.
+	repairs.Store(0)
+	stale.Store(100)
+	e.m.Reap(ctx)
+	if e.m.Ready() {
+		t.Error("ready although warren could not repair the policy of the namespace")
+	}
+	if n := repairs.Load(); n != defaultDenyAttempts {
+		t.Errorf("repair requests = %d, want %d", n, defaultDenyAttempts)
+	}
+}
+
+// After one successful test, a test that is not possible keeps the result,
+// and the next test comes after the usual interval, not after the short
+// time of a warren that is not ready (docs/isolation.md, section 4).
+func TestNextTestAfterATestThatIsNotPossible(t *testing.T) {
+	e, _ := canaryEnv(t, func(int32) error { return errTimeout })
+	e.m.cfg.ReapInterval = 10 * time.Millisecond
+	e.m.cfg.CanaryInterval = 500 * time.Millisecond
+	e.m.cfg.CanaryRetry = 5 * time.Millisecond
+	var full atomic.Bool
+	var refused atomic.Int32
+	e.client.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if full.Load() && a.(k8stesting.CreateAction).GetObject().(*corev1.Pod).Labels[LabelCanary] == "true" {
+			refused.Add(1)
+			return true, nil, errors.New("exceeded quota")
+		}
+		return false, nil, nil
+	})
+	e.run()
+	waitFor(t, "ready", e.m.Ready)
+	full.Store(true)
+	waitFor(t, "a test that is not possible", func() bool { return refused.Load() >= 1 })
+	time.Sleep(100 * time.Millisecond)
+	if n := refused.Load(); n != 1 {
+		t.Errorf("tests in 100 ms after a test that was not possible = %d, want 1: the interval is 500 ms", n)
+	}
+	if !e.m.Ready() {
+		t.Errorf("not ready after a test that was not possible: %s", e.m.NotReadyReason())
+	}
+}
+
+// While warren is not ready, it refuses each new request to a sandbox, also
+// to a sandbox that operates. A terminal that is open stays open
+// (docs/isolation.md, section 4).
+func TestNotReadyRefusesEachNewRequest(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	open := e.acquire(req)
+	defer open.Release()
+	e.m.enforcement.Store(enforcementAbsent)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := e.m.Acquire(ctx, req); !errors.Is(err, backend.ErrNotReady) {
+		t.Errorf("Acquire for a sandbox that operates = %v, want %v", err, backend.ErrNotReady)
+	}
+	if err := e.m.Restart(ctx, req); !errors.Is(err, backend.ErrNotReady) {
+		t.Errorf("Restart = %v, want %v", err, backend.ErrNotReady)
+	}
+	e.m.Reap(ctx)
+	if n := e.podDeletes(req.Ref.Name()); n != 0 {
+		t.Errorf("warren stopped a sandbox with an open terminal: delete requests = %d", n)
 	}
 }

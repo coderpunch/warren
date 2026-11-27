@@ -86,8 +86,9 @@ type Config struct {
 	// CanaryInterval is the time between two tests of the network policies.
 	// CanaryPoll and CanaryPause are the wait times in one test.
 	CanaryInterval, CanaryPoll, CanaryPause time.Duration
-	// CanaryRetry is the time before the next test when a test did not show
-	// that the cluster applies network policies.
+	// CanaryRetry is the time before the next test while the recorded result
+	// is not "the cluster applies network policies". A test that was not
+	// possible keeps the recorded result of a previous test.
 	CanaryRetry time.Duration
 	// Verify makes sure that a key operates on a target. Tests change it.
 	Verify func(ctx context.Context, target backend.Target) error
@@ -160,11 +161,13 @@ type state struct {
 	// in deletion.
 	unschedulable types.UID
 	stuck         types.UID
-	// waiting is the UID of the pod for which warren wrote a log record,
-	// because its container cannot start. waitingSince is the time at which
-	// warren saw that condition first.
-	waiting      types.UID
-	waitingSince time.Time
+	// waiting is the UID of the pod whose container cannot start.
+	// waitingReasons has the causes for which warren wrote a log record for
+	// that pod. waitingSince is the time at which warren saw a cause that
+	// stops the pod first. It is zero while warren saw no such cause.
+	waiting        types.UID
+	waitingReasons []string
+	waitingSince   time.Time
 	// resetting is true while a reset operation runs. No start and no
 	// lease is possible in that time.
 	resetting bool
@@ -203,9 +206,13 @@ type Manager struct {
 	// namespace that warren did not make and that the configuration does
 	// not accept. It is -1 until warren examined the namespace.
 	otherPolicies atomic.Int32
-	// networkProblem is the text of the last problem with the network
-	// policies, for the readiness report.
-	networkProblem atomic.Value
+	// policyProblem is the text of the last problem with the network policy
+	// of the namespace, and testProblem is the text of the last problem with
+	// the test of the network plugin. They are for the readiness report. The
+	// reaper writes the first one and the test writes the second one, at the
+	// same time, thus each condition has its own text.
+	policyProblem atomic.Value
+	testProblem   atomic.Value
 	// enforcement is the result of the test that shows whether the cluster
 	// applies network policies.
 	enforcement atomic.Int32
@@ -440,20 +447,27 @@ func (m *Manager) Ready() bool { return m.NotReadyReason() == "" }
 // NotReadyReason returns the cause for which no sandbox can start, or an
 // empty text.
 func (m *Manager) NotReadyReason() string {
-	problem, _ := m.networkProblem.Load().(string)
 	switch {
 	case !m.Synced():
 		return "the cache of the pods and the volumes is not ready"
 	case !m.networkReady.Load():
-		return "the sandbox namespace has no network policy that refuses all connections: " + problem
+		return withCause("the sandbox namespace has no network policy that refuses all connections", &m.policyProblem)
 	case m.otherPolicies.Load() < 0:
 		return "warren did not examine the network policies of the sandbox namespace"
 	case m.enforcement.Load() == enforcementAbsent:
 		return "the cluster does not apply network policies"
 	case m.enforcement.Load() != enforcementProven:
-		return "the test of the network policies is not complete: " + problem
+		return withCause("the test of the network policies is not complete", &m.testProblem)
 	}
 	return ""
+}
+
+// withCause adds the text of a problem to a condition, if there is one.
+func withCause(condition string, problem *atomic.Value) string {
+	if text, _ := problem.Load().(string); text != "" {
+		return condition + ": " + text
+	}
+	return condition
 }
 
 // podChanged is the handler for each pod event.

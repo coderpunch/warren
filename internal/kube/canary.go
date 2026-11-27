@@ -30,9 +30,10 @@ import (
 //     namespace in the configuration of warren are correct. If they are
 //     not, no request could get to a sandbox.
 //  2. Warren deletes that policy. Only the policy of the namespace applies
-//     to the pod now, and it must refuse the connection. If the connection
-//     is successful, the cluster does not apply network policies, and warren
-//     starts no sandbox.
+//     to the pod now, and it must refuse the connection: three times, one
+//     after the other. If the connection is still successful after some
+//     time, the cluster does not apply network policies, and warren starts
+//     no sandbox.
 //  3. Warren makes the policy again, and it must get a connection again. A
 //     connection can fail for a different cause: the pod is gone, or warren
 //     has a fault of its own. Without this step, such a failure would look
@@ -55,11 +56,16 @@ const (
 	// canaryMaxTime is more than the time of one test. Warren does not
 	// remove the pod or the policy of a test that is younger: a test of a
 	// second warren process can be in progress, for example in a rollout.
-	canaryMaxTime = canaryStartTimeout + 2*time.Minute
+	canaryMaxTime = canaryStartTimeout + 3*time.Minute
 	// canaryAttempts and canaryPause give a network plugin some time to
 	// apply the policy of the namespace to a new pod.
 	canaryAttempts = 6
 	canaryPause    = 4 * time.Second
+	// canaryRefusals is the number of connection attempts, one after the
+	// other, that must fail without the policy of the test pod. One attempt
+	// can fail for a cause that goes away, also on a cluster that ignores
+	// network policies: a lost packet, a busy node, a fault of warren.
+	canaryRefusals = 3
 	// canarySlow is the time after which warren writes a warning: a
 	// connection was still possible that long after the delete of the policy.
 	canarySlow = 3 * time.Second
@@ -152,18 +158,28 @@ func (m *Manager) buildCanary(name string) *corev1.Pod {
 	// The test pod must get the image as a sandbox gets it, on a node on
 	// which a sandbox can operate: a private registry needs the pull secrets
 	// of the policy, and the nodes of the sandboxes can have a taint. Use
-	// the settings of the first policy that has the image of the test pod.
+	// the settings of one policy that has the image of the test pod: the
+	// policy with the smallest node selector, and of two such policies the
+	// first one in the order of the IDs. The test pod must not go to the
+	// nodes of one special policy when a different policy can use all nodes.
 	if all, ok := m.cfg.Policies.(interface{ List() []policy.Policy }); ok {
-		for _, pol := range all.List() {
+		var source *policy.Policy
+		list := all.List()
+		for i := range list {
+			pol := &list[i]
 			if pol.Image != "" && pol.Image != m.cfg.Image {
 				continue
 			}
-			for _, s := range pol.ImagePullSecrets {
+			if source == nil || len(pol.NodeSelector) < len(source.NodeSelector) {
+				source = pol
+			}
+		}
+		if source != nil {
+			for _, s := range source.ImagePullSecrets {
 				pod.Spec.ImagePullSecrets = append(pod.Spec.ImagePullSecrets, corev1.LocalObjectReference{Name: s})
 			}
-			pod.Spec.NodeSelector = pol.NodeSelector
-			pod.Spec.Tolerations = pol.Tolerations
-			break
+			pod.Spec.NodeSelector = source.NodeSelector
+			pod.Spec.Tolerations = source.Tolerations
 		}
 	}
 	return pod
@@ -283,7 +299,7 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 			case <-waitCtx.Done():
 				return errors.New("the test pod did not become ready." + canaryProblem(last) +
 					" Examine the image of the sandboxes (--sandbox-image): the test pod uses it with the program /usr/local/bin/python3, " +
-					"and with the imagePullSecrets, the node selector, and the tolerations of the first policy that has this image")
+					"and with the imagePullSecrets, the node selector, and the tolerations of the policy with the smallest node selector that has this image")
 			case <-time.After(m.cfg.CanaryPoll):
 			}
 		}
@@ -346,24 +362,36 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 	// permitted after the delete of the policy.
 	lastSuccess := start
 	var refused error
-	for attempt := 1; ; attempt++ {
-		if refused = m.cfg.Dial(ctx, address); refused != nil {
-			break
+	// One refused connection is not the proof. On a cluster that ignores
+	// network policies, one attempt can fail and the next one can be
+	// successful again. A successful attempt thus starts the count again,
+	// and a successful attempt after canaryAttempts attempts is the result
+	// "not applied". The loop ends after a maximum of
+	// canaryAttempts+canaryRefusals-1 attempts.
+	for attempt, refusals := 1, 0; refusals < canaryRefusals; attempt++ {
+		err := m.cfg.Dial(ctx, address)
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		lastSuccess = m.now()
-		if attempt >= canaryAttempts {
-			// The connections must be connections to the test pod.
-			if err := present(); err != nil {
+		if err != nil {
+			refused = err
+			refusals++
+		} else {
+			refusals = 0
+			lastSuccess = m.now()
+			if attempt >= canaryAttempts {
+				// The connections must be connections to the test pod.
+				if err := present(); err != nil {
+					return err
+				}
+				return errNotEnforced
+			}
+		}
+		if refusals < canaryRefusals {
+			if err := pause(); err != nil {
 				return err
 			}
-			return errNotEnforced
 		}
-		if err := pause(); err != nil {
-			return err
-		}
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
 	}
 	// A connection to a pod that is gone fails on each cluster. The error is
 	// the proof only if the test pod operates at this time.
@@ -422,7 +450,7 @@ func (m *Manager) examineEnforcement(ctx context.Context) {
 		}
 	case errors.Is(err, errUnreachable):
 		// The result of a previous test stays.
-		m.networkProblem.Store(err.Error())
+		m.testProblem.Store(err.Error())
 		m.cfg.Logger.Error("warren cannot connect to a test pod whose network policy permits warren. No request could get to a sandbox. "+
 			"Examine the configuration: the namespace and the pod labels of warren (--warren-namespace, --warren-pod-labels) must be those of the warren pods, "+
 			"and the pod of warren must not use the network of its node.",
@@ -435,7 +463,7 @@ func (m *Manager) examineEnforcement(ctx context.Context) {
 	default:
 		// The result of a previous test stays. With no previous test, warren
 		// starts no sandbox.
-		m.networkProblem.Store(err.Error())
+		m.testProblem.Store(err.Error())
 		m.cfg.Logger.Warn("warren cannot test if the cluster applies network policies", "error", err.Error())
 	}
 }

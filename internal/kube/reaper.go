@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -135,6 +136,13 @@ func (m *Manager) Reap(ctx context.Context) {
 			// A previous version of warren made this pod. It has no network
 			// policy of its own, thus the policy of the namespace refuses
 			// all its connections, also the connections from warren.
+			if !m.networkReady.Load() {
+				// The namespace does not have that policy, and this process
+				// starts no sandbox. The pod can operate for a process of the
+				// previous version, for example in a rollout that does not
+				// complete. Keep it until the policy exists.
+				continue
+			}
 			if m.deletePod(ctx, pod, "no_network_policy", false) == nil {
 				previous++
 			}
@@ -316,8 +324,8 @@ func (m *Manager) warnUnschedulable(pod *corev1.Pod, now time.Time) {
 }
 
 // startErrorAfter is the time after which warren stops a pod whose container
-// cannot start. It counts from the time at which warren saw the condition
-// first, until the pod is ready again.
+// cannot start. It counts from the time at which warren saw a cause that
+// stops the pod first, until the pod is ready again.
 const startErrorAfter = 2 * time.Minute
 
 // waitingErrors are the causes for which a container does not start, and
@@ -331,9 +339,9 @@ var waitingErrors = map[string]bool{
 	"ErrImagePull": false, "ImagePullBackOff": false,
 }
 
-// startError writes one log record for a pod whose container cannot start.
-// Without the record, an administrator sees only a sandbox that is not
-// ready. It reports true when warren must stop the pod.
+// startError writes one log record for each cause for which the container of
+// a pod cannot start. Without the record, an administrator sees only a
+// sandbox that is not ready. It reports true when warren must stop the pod.
 func (m *Manager) startError(pod *corev1.Pod, now time.Time) bool {
 	for _, c := range pod.Status.ContainerStatuses {
 		w := c.State.Waiting
@@ -346,9 +354,19 @@ func (m *Manager) startError(pod *corev1.Pod, now time.Time) bool {
 		}
 		m.mu.Lock()
 		st := m.stateLocked(pod.Name)
-		logged := st.waiting == pod.UID
+		if st.waiting != pod.UID {
+			st.waiting, st.waitingReasons, st.waitingSince = pod.UID, nil, time.Time{}
+		}
+		logged := slices.Contains(st.waitingReasons, w.Reason)
 		if !logged {
-			st.waiting, st.waitingSince = pod.UID, now
+			st.waitingReasons = append(st.waitingReasons, w.Reason)
+		}
+		// An image that Kubernetes cannot pull is not a container that
+		// cannot start: the time starts at the first cause that stops the
+		// pod. A later image error does not start the time again. If it
+		// did, a pod with the two causes in turn would stay with no end.
+		if stop && st.waitingSince.IsZero() {
+			st.waitingSince = now
 		}
 		since := st.waitingSince
 		m.mu.Unlock()
@@ -356,10 +374,11 @@ func (m *Manager) startError(pod *corev1.Pod, now time.Time) bool {
 			m.cfg.Logger.Warn("the container of a sandbox cannot start. Examine the image, the command, and the user ID of the policy.",
 				"sandbox", pod.Name, "template", pod.Labels[LabelTemplate], "reason", w.Reason, "message", w.Message)
 		}
-		// The time counts from the first sight of the condition, not from
-		// the start of the pod. A sandbox that operated, and whose container
-		// then stops again and again, gets the same time as a new sandbox:
-		// Kubernetes starts the container again with the same home directory.
+		// The time counts from the first sight of a cause that stops the
+		// pod, not from the start of the pod. A sandbox that operated, and
+		// whose container then stops again and again, gets the same time as a
+		// new sandbox: Kubernetes starts the container again with the same
+		// home directory.
 		return stop && now.Sub(since) > startErrorAfter
 	}
 	if podReady(pod) {

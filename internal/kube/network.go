@@ -334,6 +334,11 @@ func (m *Manager) buildNetworkPolicy(start string, podLabels map[string]string, 
 	}
 }
 
+// defaultDenyAttempts is the number of times that warren reads and repairs
+// the policy of the namespace in one run, when a different writer changes
+// the policy at the same time.
+const defaultDenyAttempts = 3
+
 // ensureDefaultDeny makes the policy that refuses all connections in the
 // sandbox namespace, or repairs it. No sandbox starts before this function
 // was successful one time, and no sandbox starts while warren knows that the
@@ -344,43 +349,52 @@ func (m *Manager) ensureDefaultDeny(ctx context.Context) error {
 	// absent records that the namespace does not have the correct policy, and
 	// that warren cannot make it.
 	absent := func(err error) error {
-		m.networkProblem.Store(err.Error())
+		m.policyProblem.Store(err.Error())
 		m.networkReady.Store(false)
 		return err
 	}
-	cur, err := policies.Get(ctx, defaultDenyName, metav1.GetOptions{})
-	switch {
-	case apierrors.IsNotFound(err):
-		// The policy stops all connections of all pods of the namespace.
-		// Before warren makes it, make sure that the namespace has no pods
-		// of a different owner.
-		if err := m.otherPods(ctx); err != nil {
-			return absent(err)
+	for attempt := 1; ; attempt++ {
+		cur, err := policies.Get(ctx, defaultDenyName, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			// The policy stops all connections of all pods of the namespace.
+			// Before warren makes it, make sure that the namespace has no pods
+			// of a different owner.
+			if err := m.otherPods(ctx); err != nil {
+				return absent(err)
+			}
+			if _, err = policies.Create(ctx, want, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+				return absent(fmt.Errorf("make the network policy %s: %w", defaultDenyName, err))
+			}
+			m.cfg.Logger.Info("network policy made", "log", "audit", "policy", defaultDenyName)
+		case err != nil:
+			// Warren does not know the state of the policy. One error of a read
+			// request does not change the result of the previous run.
+			err = fmt.Errorf("read the network policy %s: %w", defaultDenyName, err)
+			if !m.networkReady.Load() {
+				m.policyProblem.Store(err.Error())
+			}
+			return err
+		case !apiequality.Semantic.DeepEqual(cur.Spec, want.Spec):
+			// A person or a different program changed the policy. It could now
+			// permit connections for all sandboxes.
+			cur.Spec = want.Spec
+			_, err = policies.Update(ctx, cur, metav1.UpdateOptions{})
+			if apierrors.IsConflict(err) && attempt < defaultDenyAttempts {
+				// A different writer changed the policy after the read. A
+				// second warren process can do the same repair at the same
+				// time, and the policy is then correct. Read it again.
+				continue
+			}
+			if err != nil {
+				return absent(fmt.Errorf("repair the network policy %s: %w", defaultDenyName, err))
+			}
+			m.cfg.Logger.Warn("the network policy that refuses all connections was changed. Warren repaired it.",
+				"log", "audit", "policy", defaultDenyName)
 		}
-		if _, err = policies.Create(ctx, want, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-			return absent(fmt.Errorf("make the network policy %s: %w", defaultDenyName, err))
-		}
-		m.cfg.Logger.Info("network policy made", "log", "audit", "policy", defaultDenyName)
-	case err != nil:
-		// Warren does not know the state of the policy. One error of a read
-		// request does not change the result of the previous run.
-		err = fmt.Errorf("read the network policy %s: %w", defaultDenyName, err)
-		if !m.networkReady.Load() {
-			m.networkProblem.Store(err.Error())
-		}
-		return err
-	case !apiequality.Semantic.DeepEqual(cur.Spec, want.Spec):
-		// A person or a different program changed the policy. It could now
-		// permit connections for all sandboxes.
-		cur.Spec = want.Spec
-		if _, err = policies.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
-			return absent(fmt.Errorf("repair the network policy %s: %w", defaultDenyName, err))
-		}
-		m.cfg.Logger.Warn("the network policy that refuses all connections was changed. Warren repaired it.",
-			"log", "audit", "policy", defaultDenyName)
+		m.networkReady.Store(true)
+		return nil
 	}
-	m.networkReady.Store(true)
-	return nil
 }
 
 // otherPods returns an error if the sandbox namespace has pods that warren
@@ -416,6 +430,12 @@ func (m *Manager) otherPods(ctx context.Context) error {
 // comes back. It also deletes the network policies that have no pod.
 func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.Pod, live map[string]bool) {
 	policies := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace)
+	// List all policies of the namespace, not only the policies of warren.
+	list, err := policies.List(ctx, metav1.ListOptions{})
+	// Read the node addresses after the list of the policies, not before it.
+	// blockNode adds the address of a node to a policy before the first
+	// lease of a pod. If the list has such a policy, the addresses from the
+	// cache then also have that address, and this run does not remove it.
 	hosts := m.hostAddresses()
 	// From here, a pod event asks for a run of the reaper only for a node
 	// address that this run does not have.
@@ -426,8 +446,6 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 	m.mu.Lock()
 	m.hosts = known
 	m.mu.Unlock()
-	// List all policies of the namespace, not only the policies of warren.
-	list, err := policies.List(ctx, metav1.ListOptions{})
 	if err != nil {
 		m.cfg.Logger.Warn("cannot list the network policies", "error", err.Error())
 		return
