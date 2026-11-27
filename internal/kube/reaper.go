@@ -100,7 +100,11 @@ func (m *Manager) Reap(ctx context.Context) {
 	// A person or a different program can delete or change the policy that
 	// refuses all connections in the sandbox namespace.
 	if err := m.ensureDefaultDeny(ctx); err != nil {
-		m.cfg.Logger.Error("warren cannot examine the network policy of the sandbox namespace", "error", err.Error())
+		text := "warren cannot examine the network policy of the sandbox namespace"
+		if !m.networkReady.Load() {
+			text = "the sandbox namespace has no network policy that refuses all connections, and warren cannot make it. No sandbox can start."
+		}
+		m.cfg.Logger.Error(text, "error", err.Error())
 	}
 	// live has the names of the Secrets that a pod uses. The network policy
 	// of a pod has the same name.
@@ -115,6 +119,12 @@ func (m *Manager) Reap(ctx context.Context) {
 	}()
 	for _, obj := range m.informer.GetStore().List() {
 		pod := obj.(*corev1.Pod)
+		if pod.Labels[LabelManagedBy] != ManagedByValue {
+			// The cache has only the pods of warren. This check is a second
+			// protection: the reaper runs at the same time as the test of
+			// the network plugin, and it must not stop the test pod.
+			continue
+		}
 		pods = append(pods, pod)
 		live[podSecretName(pod)] = true
 		if pod.DeletionTimestamp != nil {
@@ -306,7 +316,8 @@ func (m *Manager) warnUnschedulable(pod *corev1.Pod, now time.Time) {
 }
 
 // startErrorAfter is the time after which warren stops a pod whose container
-// cannot start.
+// cannot start. It counts from the time at which warren saw the condition
+// first, until the pod is ready again.
 const startErrorAfter = 2 * time.Minute
 
 // waitingErrors are the causes for which a container does not start, and
@@ -336,13 +347,28 @@ func (m *Manager) startError(pod *corev1.Pod, now time.Time) bool {
 		m.mu.Lock()
 		st := m.stateLocked(pod.Name)
 		logged := st.waiting == pod.UID
-		st.waiting = pod.UID
+		if !logged {
+			st.waiting, st.waitingSince = pod.UID, now
+		}
+		since := st.waitingSince
 		m.mu.Unlock()
 		if !logged {
 			m.cfg.Logger.Warn("the container of a sandbox cannot start. Examine the image, the command, and the user ID of the policy.",
 				"sandbox", pod.Name, "template", pod.Labels[LabelTemplate], "reason", w.Reason, "message", w.Message)
 		}
-		return stop && now.Sub(pod.CreationTimestamp.Time) > startErrorAfter
+		// The time counts from the first sight of the condition, not from
+		// the start of the pod. A sandbox that operated, and whose container
+		// then stops again and again, gets the same time as a new sandbox:
+		// Kubernetes starts the container again with the same home directory.
+		return stop && now.Sub(since) > startErrorAfter
+	}
+	if podReady(pod) {
+		// The container operates. A later error is a new condition.
+		m.mu.Lock()
+		if st := m.sandboxes[pod.Name]; st != nil && st.waiting == pod.UID {
+			st.waiting = ""
+		}
+		m.mu.Unlock()
 	}
 	return false
 }

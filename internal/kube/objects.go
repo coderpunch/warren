@@ -289,7 +289,13 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request, pol pol
 	podLabels[LabelStart] = secretName
 	command := defaultCommand
 	if pol.Command != nil {
-		command = pol.Command
+		// Kubernetes replaces "$(NAME)" in an item of the command also. The
+		// escape is the same as for the variables: the program gets each
+		// item as the file has it.
+		command = make([]string, len(pol.Command))
+		for i, item := range pol.Command {
+			command[i] = strings.ReplaceAll(item, "$", "$$")
+		}
 	}
 
 	pod := &corev1.Pod{

@@ -53,7 +53,7 @@ func (f *fakeInstances) Reset(_ context.Context, ref scope.Ref) error {
 	return f.err
 }
 func (f *fakeInstances) WaitReady(context.Context, scope.Ref) { f.waited = true }
-func (f *fakeInstances) Ready() bool                          { return f.ready }
+func (f *fakeInstances) Synced() bool                         { return f.ready }
 
 func newHandler(t *testing.T, inst *fakeInstances) *Handler {
 	t.Helper()

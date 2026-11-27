@@ -349,8 +349,12 @@ func TestNoSandboxBeforeTheNamespacePolicy(t *testing.T) {
 	if err := m.ensureDefaultDeny(ctx); err == nil {
 		t.Fatal("no error when Kubernetes refuses the policy")
 	}
-	if m.Ready() {
-		t.Error("the manager is ready with no policy for the namespace")
+	// All other conditions are good: only the policy of the namespace
+	// decides.
+	m.enforcement.Store(enforcementProven)
+	m.otherPolicies.Store(0)
+	if m.Ready() || !strings.Contains(m.NotReadyReason(), "forbidden") {
+		t.Errorf("ready = %v, reason = %q with no policy for the namespace", m.Ready(), m.NotReadyReason())
 	}
 	if _, err := m.Acquire(ctx, userRef("alice")); !errors.Is(err, backend.ErrNotReady) {
 		t.Errorf("Acquire with no policy for the namespace: %v, want ErrNotReady", err)
@@ -666,5 +670,70 @@ func TestNoRulePermitsAllPeers(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// Kubernetes refuses a network policy that has a bad label or a bad
+// namespace. The policy of the test pod has no DNS rule. Thus a bad DNS
+// label would pass the test of the network plugin, and then each start of a
+// sandbox would fail. Warren must refuse such a configuration at its start.
+func TestLabelsThatKubernetesRefuses(t *testing.T) {
+	for name, change := range map[string]func(*NetworkConfig){
+		// "--dns-pod-labels=k8s-app=kube-dns app=x": a space in place of the comma.
+		"DNS label value with a space":     func(c *NetworkConfig) { c.DNSPodLabels = map[string]string{"k8s-app": "kube-dns app=x"} },
+		"DNS label value with two signs":   func(c *NetworkConfig) { c.DNSPodLabels = map[string]string{"a": "b=c"} },
+		"warren label value with ;":        func(c *NetworkConfig) { c.WarrenPodLabels = map[string]string{"a": "b;c=d"} },
+		"warren label key with a space":    func(c *NetworkConfig) { c.WarrenPodLabels = map[string]string{"app name": "warren"} },
+		"DNS namespace that is no name":    func(c *NetworkConfig) { c.DNSNamespace = "kube system" },
+		"warren namespace that is no name": func(c *NetworkConfig) { c.WarrenNamespace = "Warren_System" },
+	} {
+		c := NetworkConfig{WarrenNamespace: "warren-system", WarrenPodLabels: map[string]string{"app": "warren"}}
+		change(&c)
+		if err := c.validate(testNamespace); err == nil || !strings.Contains(err.Error(), "--") {
+			t.Errorf("%s: validate = %v, want an error that names the flag", name, err)
+		}
+	}
+	// The usual labels stay valid.
+	ok := NetworkConfig{
+		WarrenNamespace: "warren-system", WarrenPodLabels: map[string]string{"app.kubernetes.io/name": "warren", "tier": "A_1.b"},
+		DNSNamespace: "openshift-dns", DNSPodLabels: map[string]string{"dns.operator.openshift.io/daemonset-dns": "default"},
+	}
+	if err := ok.validate(testNamespace); err != nil {
+		t.Errorf("valid labels: %v", err)
+	}
+}
+
+// On a cluster with IPv4 and IPv6, a pod has two addresses. The second one
+// can be public when the first one is private.
+func TestSandboxWithAPublicSecondAddress(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	res := e.acquireAsync(ctx, e.m, req)
+	waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
+	uid := e.m.pod(name).UID
+	e.setStatus(name, func(p *corev1.Pod) {
+		readyStatus(p)
+		p.Status.PodIPs = []corev1.PodIP{{IP: "127.0.0.1"}, {IP: "2a01:4f8::1234"}}
+	})
+	r := <-res
+	if r.err == nil || !strings.Contains(r.err.Error(), "2a01:4f8::1234") {
+		t.Fatalf("Acquire = %v, want an error that names the public address", r.err)
+	}
+	waitFor(t, "stop of the sandbox with a public address", func() bool { p := e.m.pod(name); return p == nil || p.UID != uid })
+}
+
+// A problem of the API server for a short time tells nothing about the
+// policy of the namespace. Warren stays ready.
+func TestNamespacePolicyThatWarrenCannotRead(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.client.PrependReactor("get", "networkpolicies", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("the server is not available")
+	})
+	e.m.Reap(context.Background())
+	if !e.m.Ready() {
+		t.Errorf("the manager is not ready after one read that failed: %s", e.m.NotReadyReason())
 	}
 }

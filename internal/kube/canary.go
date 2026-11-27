@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,6 +33,10 @@ import (
 //     to the pod now, and it must refuse the connection. If the connection
 //     is successful, the cluster does not apply network policies, and warren
 //     starts no sandbox.
+//  3. Warren makes the policy again, and it must get a connection again. A
+//     connection can fail for a different cause: the pod is gone, or warren
+//     has a fault of its own. Without this step, such a failure would look
+//     like a cluster that applies network policies.
 
 const (
 	// LabelCanary is on the test pod. The pod does not have the label of
@@ -43,13 +48,20 @@ const (
 	enforcementProven
 	enforcementAbsent
 
+	// canaryPrefix starts the name of the test pod and of its policy.
+	canaryPrefix = "warren-canary-"
+
 	canaryStartTimeout = 4 * time.Minute
+	// canaryMaxTime is more than the time of one test. Warren does not
+	// remove the pod or the policy of a test that is younger: a test of a
+	// second warren process can be in progress, for example in a rollout.
+	canaryMaxTime = canaryStartTimeout + 2*time.Minute
 	// canaryAttempts and canaryPause give a network plugin some time to
 	// apply the policy of the namespace to a new pod.
 	canaryAttempts = 6
 	canaryPause    = 4 * time.Second
-	// canarySlow is the time after which warren writes a warning: for that
-	// time, a new pod had no network policy.
+	// canarySlow is the time after which warren writes a warning: a
+	// connection was still possible that long after the delete of the policy.
 	canarySlow = 3 * time.Second
 )
 
@@ -72,7 +84,7 @@ func (m *Manager) buildCanary(name string) *corev1.Pod {
 	no, yes := false, true
 	grace, deadline := int64(1), int64(900)
 	user, group := int64(defaultUser), int64(volumeGroup)
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: m.cfg.Namespace,
@@ -137,6 +149,43 @@ func (m *Manager) buildCanary(name string) *corev1.Pod {
 			}},
 		},
 	}
+	// The test pod must get the image as a sandbox gets it, on a node on
+	// which a sandbox can operate: a private registry needs the pull secrets
+	// of the policy, and the nodes of the sandboxes can have a taint. Use
+	// the settings of the first policy that has the image of the test pod.
+	if all, ok := m.cfg.Policies.(interface{ List() []policy.Policy }); ok {
+		for _, pol := range all.List() {
+			if pol.Image != "" && pol.Image != m.cfg.Image {
+				continue
+			}
+			for _, s := range pol.ImagePullSecrets {
+				pod.Spec.ImagePullSecrets = append(pod.Spec.ImagePullSecrets, corev1.LocalObjectReference{Name: s})
+			}
+			pod.Spec.NodeSelector = pol.NodeSelector
+			pod.Spec.Tolerations = pol.Tolerations
+			break
+		}
+	}
+	return pod
+}
+
+// canaryProblem returns the cause for which the test pod is not ready, as
+// Kubernetes reports it, or an empty text.
+func canaryProblem(pod *corev1.Pod) string {
+	if pod == nil {
+		return ""
+	}
+	for _, c := range pod.Status.ContainerStatuses {
+		if w := c.State.Waiting; w != nil && w.Reason != "" && w.Reason != "ContainerCreating" && w.Reason != "PodInitializing" {
+			return fmt.Sprintf(" The state of its container is %s: %s.", w.Reason, w.Message)
+		}
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse {
+			return fmt.Sprintf(" Kubernetes finds no node for it (%s): %s.", c.Reason, c.Message)
+		}
+	}
+	return ""
 }
 
 // errUnreachable means that warren cannot connect to a pod whose network
@@ -153,12 +202,17 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 	policies := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace)
 	zero := int64(0)
 	now := metav1.DeleteOptions{GracePeriodSeconds: &zero}
-	// Remove the test pods of previous runs.
+	// Remove the test pods of previous runs. A pod that is younger than the
+	// time of one test can be the pod of a second warren process.
 	if old, err := pods.List(ctx, metav1.ListOptions{LabelSelector: LabelCanary + "=true"}); err == nil {
 		for i := range old.Items {
 			// A list of the simulated cluster of the tests ignores the
 			// selector, thus examine the label again.
-			if p := &old.Items[i]; p.Labels[LabelCanary] == "true" && p.Labels[LabelManagedBy] == "" {
+			p := &old.Items[i]
+			if !podTerminal(p) && m.now().Sub(p.CreationTimestamp.Time) < canaryMaxTime {
+				continue
+			}
+			if p.Labels[LabelCanary] == "true" && p.Labels[LabelManagedBy] == "" {
 				_ = pods.Delete(ctx, p.Name, now)
 				_ = policies.Delete(ctx, p.Name, metav1.DeleteOptions{})
 			}
@@ -169,7 +223,7 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 	if _, err := rand.Read(suffix); err != nil {
 		return err
 	}
-	name := "warren-canary-" + hex.EncodeToString(suffix)
+	name := canaryPrefix + hex.EncodeToString(suffix)
 	cleanup := func(delete func(c context.Context)) {
 		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
@@ -180,7 +234,10 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 	// connection: the same code makes it.
 	var closed policy.Policy
 	closed.Network.Egress = policy.EgressNone
-	madePolicy, err := policies.Create(ctx, m.buildNetworkPolicy(name, map[string]string{LabelSandbox: name}, closed, nil), metav1.CreateOptions{})
+	makePolicy := func() (*networkingv1.NetworkPolicy, error) {
+		return policies.Create(ctx, m.buildNetworkPolicy(name, map[string]string{LabelSandbox: name}, closed, nil), metav1.CreateOptions{})
+	}
+	madePolicy, err := makePolicy()
 	if err != nil {
 		return fmt.Errorf("make the network policy of the test pod: %w", err)
 	}
@@ -205,20 +262,28 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 	waitCtx, cancel := context.WithTimeout(ctx, canaryStartTimeout)
 	defer cancel()
 	var address string
+	var last *corev1.Pod
 	for address == "" {
 		pod, err := pods.Get(waitCtx, name, metav1.GetOptions{})
 		if err != nil {
+			if waitCtx.Err() != nil && ctx.Err() == nil {
+				// The time limit ended during the request.
+				return errors.New("the test pod did not become ready." + canaryProblem(last))
+			}
 			return fmt.Errorf("read the test pod: %w", err)
 		}
+		last = pod
 		switch {
 		case podTerminal(pod):
-			return fmt.Errorf("the test pod stopped (%s)", pod.Status.Reason)
+			return fmt.Errorf("the test pod stopped (%s).%s", pod.Status.Reason, canaryProblem(pod))
 		case podReady(pod):
 			address = net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(m.cfg.Port))
 		default:
 			select {
 			case <-waitCtx.Done():
-				return errors.New("the test pod did not become ready. Examine the image of the sandboxes (--sandbox-image): the test pod uses it with the default command")
+				return errors.New("the test pod did not become ready." + canaryProblem(last) +
+					" Examine the image of the sandboxes (--sandbox-image): the test pod uses it with the program /usr/local/bin/python3, " +
+					"and with the imagePullSecrets, the node selector, and the tolerations of the first policy that has this image")
 			case <-time.After(m.cfg.CanaryPoll):
 			}
 		}
@@ -232,6 +297,23 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 		}
 	}
 
+	// present makes sure that the test pod operates with the same address.
+	// The pod can go away in the middle of the test: a second warren
+	// process, an eviction, or the time limit of the pod can remove it. The
+	// result of a connection then shows nothing about the network plugin,
+	// and a different pod can have the address.
+	present := func() error {
+		pod, err := pods.Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("read the test pod in the middle of the test: %w", err)
+		}
+		if pod.UID != made.UID || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning ||
+			net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(m.cfg.Port)) != address {
+			return errors.New("the test pod stopped in the middle of the test")
+		}
+		return nil
+	}
+
 	// Step 1: the policy of the test pod permits warren. A network plugin
 	// can need some seconds to apply the policy to a new pod.
 	for attempt := 1; ; attempt++ {
@@ -243,6 +325,11 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 			return ctx.Err()
 		}
 		if attempt >= canaryAttempts {
+			// The failure is a fault of the configuration only if the pod
+			// operates.
+			if err := present(); err != nil {
+				return err
+			}
 			return fmt.Errorf("%w: %v", errUnreachable, err)
 		}
 		if err := pause(); err != nil {
@@ -255,25 +342,70 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 		return fmt.Errorf("delete the network policy of the test pod: %w", err)
 	}
 	start := m.now()
+	// lastSuccess is the time of the last connection that the cluster
+	// permitted after the delete of the policy.
+	lastSuccess := start
+	var refused error
 	for attempt := 1; ; attempt++ {
-		if err := m.cfg.Dial(ctx, address); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if late := m.now().Sub(start); attempt > 1 && late >= canarySlow {
-				m.cfg.Logger.Warn("the network plugin of the cluster needed some seconds to apply a change of the network policies. "+
-					"If it is also slow for a new pod, a sandbox has no network isolation in its first seconds. Examine the configuration of the network plugin.",
-					"seconds", int(late.Seconds()))
-			}
-			return nil
+		if refused = m.cfg.Dial(ctx, address); refused != nil {
+			break
 		}
+		lastSuccess = m.now()
 		if attempt >= canaryAttempts {
+			// The connections must be connections to the test pod.
+			if err := present(); err != nil {
+				return err
+			}
 			return errNotEnforced
 		}
 		if err := pause(); err != nil {
 			return err
 		}
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	// A connection to a pod that is gone fails on each cluster. The error is
+	// the proof only if the test pod operates at this time.
+	if err := present(); err != nil {
+		return err
+	}
+
+	// Step 3: with its policy again, the test pod must accept warren again.
+	// If it does not, the failure of step 2 had a different cause (for
+	// example, warren cannot open a connection at all), and the test has no
+	// result.
+	again, err := makePolicy()
+	if err != nil {
+		return fmt.Errorf("make the network policy of the test pod again: %w", err)
+	}
+	// removePolicy now deletes the new policy.
+	madePolicy = again
+	for attempt := 1; ; attempt++ {
+		err := m.cfg.Dial(ctx, address)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt >= canaryAttempts {
+			return fmt.Errorf("the connection to the test pod failed without its network policy (%v), and it also failed with the policy again (%v). "+
+				"The cause is thus not the network policy: examine if the test pod went away during the test", refused, err)
+		}
+		if err := pause(); err != nil {
+			return err
+		}
+	}
+	// The first attempt of step 2 comes immediately after the delete, and it
+	// is usually successful: a network plugin needs some time. Only a
+	// connection after a pause shows a slow plugin.
+	if late := lastSuccess.Sub(start); late >= canarySlow {
+		m.cfg.Logger.Warn("the network plugin of the cluster needed some seconds to apply a change of the network policies. "+
+			"If it is also slow for a new pod, a sandbox has no network isolation in its first seconds. Examine the configuration of the network plugin.",
+			"seconds", int(late.Seconds()))
+	}
+	return nil
 }
 
 // examineEnforcement does the test and records the result.

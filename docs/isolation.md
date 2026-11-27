@@ -76,8 +76,13 @@ The key `userNamespace: true` of a policy gives the pod its own user namespace (
 The user IDs of the sandbox are then different user IDs on the node, and each sandbox has a different range.
 If code gets out of the container, it has no user ID of a different sandbox and no user ID of the node.
 
-The cluster must support user namespaces: the container runtime, the kernel, and the file system of the volumes.
-If it does not, the pod does not start, and warren writes the cause to its log.
+The cluster must support user namespaces: the Kubernetes API (the feature `UserNamespacesSupport`), the container runtime, the kernel, and the file system of the volumes.
+
+- If the Kubernetes API ignores the setting, warren deletes the pod, and the request gets an error. The log of warren gives the cause. Kubernetes before version 1.33 ignores the setting by default.
+- If a node cannot make the user namespace, the pod does not become ready. Warren stops the pod after the time of the flag `--start-timeout`. Warren does not read the events of Kubernetes: `kubectl describe pod` shows the cause (`FailedCreatePodSandBox`).
+- If the container cannot start in the user namespace, warren writes the message of Kubernetes to its log and stops the pod (section 7, `start_error`).
+
+Kubernetes gives a pod 65536 user IDs by default. With `userNamespace: true`, use a `runAsUser` value from 1 to 65535.
 
 ### 2.3 Runtime class
 
@@ -93,6 +98,7 @@ A pod that has no policy of its own can thus open no connection, and no pod can 
 
 Warren makes this policy only when the namespace has no pods of a different owner. The policy would stop all their connections.
 Warren examines the policy each 30 seconds. If a person changes or deletes it, warren repairs it.
+If warren cannot repair it, warren is not ready and starts no sandbox until the policy is correct again.
 
 ### 3.2 Policy of each sandbox
 
@@ -121,17 +127,19 @@ The `internet` mode does not permit these networks:
 | `168.63.129.16/32` | The platform service of Azure. |
 | `127.0.0.0/8`, `::1/128`, `0.0.0.0/8`, `192.0.0.0/24`, `198.18.0.0/15`, `224.0.0.0/4`, `240.0.0.0/4`, `ff00::/8` | Special networks. |
 | `64:ff9b:1::/48`, `2002::/16`, and the NAT64 form of each blocked IPv4 network | IPv6 addresses that contain an IPv4 address. |
-| The address of each node that has a sandbox | A node can have a public address. |
+| The address of each node that has a sandbox, if it is not in one of the networks above | A node can have a public address. Refer to the limits below. |
 | The networks of the flag `--egress-blocked-cidrs` | Refer to the text below. |
 
 Your cluster can have addresses that are not in these networks. Add them with the flag `--egress-blocked-cidrs`:
 
 - The pod network or the service network, if it is not a private network.
-- The addresses of the nodes, if they are public. Warren finds only the nodes that have a sandbox. It does not find the control plane.
+- The addresses of the nodes, if they are public. Warren finds only the nodes that have a sandbox, and only the address in the field `status.hostIPs` of the pod. That is usually the internal address of the node, not an external address that a cloud gives to it. Warren does not find the control plane.
+  Warren knows the node of a new sandbox only after Kubernetes selected it. Warren adds the address to the policy of the sandbox before the first request gets to the sandbox, and to the policies of the other sandboxes immediately after that. If your nodes have public addresses, do not rely on this function only: set the flag.
 - A public address of the Kubernetes API.
 - A NAT64 network that is not `64:ff9b::/96`.
 
-At its start, warren refuses a configuration in which its own pod address or the service address of the Kubernetes API is not in a blocked network.
+At its start, warren examines its own pod address and the service address of the Kubernetes API.
+If one of them is not in a blocked network, warren stops (section 5).
 Warren also stops a sandbox whose pod address is not in a blocked network. The log gives the flag to set.
 
 ### 3.4 DNS
@@ -160,7 +168,8 @@ Thus give the port of the pod, not the port of the service.
 A network policy can only permit connections. A policy of a different owner in the sandbox namespace can thus permit what warren refuses.
 Some platforms make such policies in each namespace.
 
-Warren examines the namespace each 30 seconds. If it finds a policy that warren did not make, and that has a rule, warren starts no new sandbox and writes an error to its log.
+Warren examines the namespace each 30 seconds. It looks for policies that it did not make and that have a rule.
+If it finds one, it starts no new sandbox and writes an error to its log.
 To accept such a policy, give its name in the flag `--accepted-network-policies`.
 
 Warren cannot see policies that are not NetworkPolicy objects of the namespace, for example the cluster-wide policies of a network plugin.
@@ -174,13 +183,26 @@ Warren thus makes a test at its start, and again each hour:
 2. Warren connects to the pod. The connection must be successful. This shows that the namespace and the pod labels in the configuration of warren are correct.
 3. Warren deletes the policy of the pod. Only the policy of the namespace applies now.
 4. Warren connects again. The connection must fail.
-5. Warren deletes the pod.
+5. Warren makes the policy again and connects again. The connection must be successful. This shows that the cause of the failure in step 4 was the network policy, and not a pod that went away or a fault of warren.
+6. Warren deletes the pod.
+
+The test pod uses the image of the flag `--sandbox-image`, and the program `/usr/local/bin/python3` of that image.
+It does not use the `command` of a policy.
+It gets the `imagePullSecrets`, the node selector, and the tolerations of the first policy that uses this image.
+If the test pod cannot start, the test is not possible. The log of warren then gives the cause of Kubernetes.
 
 | Result | What warren does |
 |---|---|
-| Step 2 fails | Warren is not ready and starts no sandbox. The log names the flags `--warren-namespace` and `--warren-pod-labels`. |
+| Step 2 fails | The result of the previous test stays, and warren writes an error to its log. With no previous test, warren is not ready and starts no sandbox. The log names the flags `--warren-namespace` and `--warren-pod-labels`. |
 | Step 4 is successful | The cluster does not apply network policies. Warren is not ready and starts no sandbox. It does the test again each minute. |
-| The test is not possible | The result of the previous test stays. With no previous test, warren is not ready. |
+| Step 5 fails, or the test is not possible | The result of the previous test stays. With no previous test, warren is not ready. Warren does the test again each minute. |
+
+The test is not possible, for example, when Kubernetes refuses the test pod, when the test pod does not become ready in 4 minutes, or when the test pod goes away before the end of the test.
+A second warren process can do its test at the same time, for example during a rollout. Warren thus removes a test pod of a different test only when it stopped or when it is older than 6 minutes.
+
+While warren is not ready, it continues to stop idle sandboxes and to repair the network policies of the sandboxes that operate.
+The management API of warren still stops and deletes sandboxes. Only a start is not possible.
+But if the readiness probe of the warren pod uses `/readyz`, Kubernetes sends no request to a warren that is not ready. In that condition, stop the sandboxes with `kubectl delete pod`.
 
 The readiness address of warren (`/readyz` on the admin port) gives the cause.
 
@@ -188,7 +210,7 @@ Limits of the test:
 
 - It examines connections to a pod, not connections from a pod.
 - It examines one node.
-- Some network plugins apply a policy to a new pod some seconds after its start. In that time the pod has no isolation. If the test finds a slow change, warren writes a warning. On the AWS VPC CNI, use the strict mode.
+- Some network plugins apply a policy to a new pod some seconds after its start. In that time the pod has no isolation. Warren writes a warning if a connection in step 4 is successful 3 seconds or more after the delete of the policy. Warren waits 4 seconds between two attempts, thus it does not find a shorter delay. On the AWS VPC CNI, use the strict mode.
 
 The flag `--skip-network-policy-test` turns the test off. Do not use it on a cluster with users.
 
@@ -198,13 +220,37 @@ Warren stops with an error message in these conditions:
 
 - Warren operates in the sandbox namespace.
 - The service account of warren does not have all necessary permissions in the sandbox namespace. The message names them.
+- A namespace or a pod label in the flags is not a name that Kubernetes accepts.
+- The service address of the Kubernetes API is not in a blocked network.
+
+Warren also stops in these conditions, if it can read its own pod:
+
 - The pod of warren does not have the labels of the flag `--warren-pod-labels`.
 - The pod of warren uses the network of its node (`hostNetwork`). A network policy cannot select such a pod.
-- The pod address of warren, or the service address of the Kubernetes API, is not in a blocked network.
+- The pod address of warren is not in a blocked network.
+
+To read its pod, warren needs the permission of section 9 and the name of the pod.
+Set the variable `WARREN_POD_NAME` from the field `metadata.name` of the pod:
+
+```yaml
+env:
+  - name: WARREN_POD_NAME
+    valueFrom: {fieldRef: {fieldPath: metadata.name}}
+```
+
+Without the variable, warren uses its host name. The host name is not the pod name in these conditions:
+
+- The pod uses the network of its node. The host name is then the name of the node.
+- The pod name has more than 63 characters.
+- The pod sets a different host name.
+
+If warren cannot read its pod, it writes a warning and does not do these three checks.
+The test of the network plugin (section 4) then finds the first two conditions, and warren is not ready.
 
 Warren is not ready, and writes the cause to its log, in these conditions:
 
-- The sandbox namespace has pods of a different owner, and the policy of the namespace does not exist. The flag `--allow-other-pods` accepts them.
+- The sandbox namespace has pods of a different owner, and the policy of the namespace does not exist: at the start, or because a person deleted it later. The flag `--allow-other-pods` accepts them.
+- Warren cannot make or repair the policy of the namespace.
 - The test of the network plugin did not have the correct result.
 
 ## 6. Flags
@@ -213,6 +259,7 @@ Warren is not ready, and writes the cause to its log, in these conditions:
 |---|---|---|
 | `--warren-namespace` | The namespace of the pod | The namespace of the warren pods. |
 | `--warren-pod-labels` | `app.kubernetes.io/name=warren` | The labels of the warren pods. |
+| `--pod-name` | The host name | The name of the pod of warren. Refer to section 5. |
 | `--ingress-cidrs` | None | More sources that can connect to a sandbox. Only for a warren that is not a pod, on a network where the pod addresses are reachable. |
 | `--egress-blocked-cidrs` | None | More networks that the `internet` mode does not permit. |
 | `--dns-namespace`, `--dns-pod-labels`, `--dns-ports`, `--dns-cidrs` | Refer to section 3.4 | The DNS service of the cluster. |
@@ -231,12 +278,12 @@ Warren stops a pod in these conditions, in addition to the conditions of [polici
 |---|---|
 | `network_changed` | The policy file removed a network permission of the sandbox. A network plugin can let an open connection continue, thus only a stop closes it. |
 | `no_policy` | The policy of the sandbox is not in the file, or it has a different scope. Warren does not wait for open connections. |
-| `unreachable` | The pod is ready, and warren cannot connect to it for 60 seconds. |
-| `start_error` | The container cannot start, for example because the command is not in the image. The log has the message of Kubernetes. |
-| `public_address` | The pod address is not in a blocked network. |
+| `unreachable` | The pod is ready, and each attempt of warren to connect to it fails for more than 60 seconds. A time of more than 60 seconds with no attempt starts the count again. |
+| `start_error` | The container cannot start, for example because the command is not in the image. The log has the message of Kubernetes. Warren stops the pod when the condition stays for 2 minutes. |
+| `public_address` | An address of the pod is not in a blocked network. |
 | `no_network_policy` | A version of warren before the network policies started the pod. |
 
-A new network permission needs no stop: warren changes the network policy of the pod in 30 seconds.
+A new network permission needs no stop. Warren changes the network policy of the pod a maximum of 30 seconds after it reads the new file.
 
 ## 8. Upgrade from a version with no network policies
 
@@ -254,7 +301,7 @@ kubectl -n <sandbox namespace> delete networkpolicy -l app.kubernetes.io/managed
 |---|---|---|
 | NetworkPolicy | `warren-default-deny` | As long as warren operates. |
 | NetworkPolicy | The name of the Secret of the same start | The same as its pod. |
-| Pod | `warren-canary-` and 8 hexadecimal characters | Some seconds, during the test of the network plugin. |
+| Pod, NetworkPolicy | `warren-canary-` and 8 hexadecimal characters | Some seconds, during the test of the network plugin. |
 
 Permissions of the service account of warren in the sandbox namespace, in addition to the permissions of [policies.md](policies.md), section 12:
 

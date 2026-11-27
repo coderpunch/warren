@@ -19,6 +19,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/h3xcat/warren/internal/policy"
@@ -185,11 +186,19 @@ func (c *NetworkConfig) validate(sandboxNamespace string) error {
 		}
 	}
 	c.blocked = c.blockedPrefixes()
+	// Kubernetes refuses a network policy that has a bad namespace or a bad
+	// label. The policy of the test pod has no DNS rule, thus only the start
+	// of the first sandbox would show a bad DNS value.
+	for flag, namespace := range map[string]string{"--warren-namespace": c.WarrenNamespace, "--dns-namespace": c.DNSNamespace} {
+		if namespace != "" && len(validation.IsDNS1123Label(namespace)) > 0 {
+			return fmt.Errorf("kube: %s: %q is not the name of a namespace", flag, namespace)
+		}
+	}
 	// An empty selector selects all pods. A rule must never have one.
-	for name, labels := range map[string]map[string]string{"warren": c.WarrenPodLabels, "DNS": c.DNSPodLabels} {
+	for flag, labels := range map[string]map[string]string{"--warren-pod-labels": c.WarrenPodLabels, "--dns-pod-labels": c.DNSPodLabels} {
 		for key, value := range labels {
-			if key == "" || value == "" {
-				return fmt.Errorf("kube: a %s pod label has an empty key or value", name)
+			if value == "" || len(validation.IsQualifiedName(key)) > 0 || len(validation.IsValidLabelValue(value)) > 0 {
+				return fmt.Errorf("kube: %s: %q=%q is not a pod label. Use the form key=value with commas between the labels", flag, key, value)
 			}
 		}
 	}
@@ -327,31 +336,45 @@ func (m *Manager) buildNetworkPolicy(start string, podLabels map[string]string, 
 
 // ensureDefaultDeny makes the policy that refuses all connections in the
 // sandbox namespace, or repairs it. No sandbox starts before this function
-// was successful one time.
+// was successful one time, and no sandbox starts while warren knows that the
+// policy is absent or wrong.
 func (m *Manager) ensureDefaultDeny(ctx context.Context) error {
 	policies := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace)
 	want := m.buildDefaultDeny()
+	// absent records that the namespace does not have the correct policy, and
+	// that warren cannot make it.
+	absent := func(err error) error {
+		m.networkProblem.Store(err.Error())
+		m.networkReady.Store(false)
+		return err
+	}
 	cur, err := policies.Get(ctx, defaultDenyName, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
 		// The policy stops all connections of all pods of the namespace.
-		// Before warren makes it the first time, make sure that the
-		// namespace has no pods of a different owner.
+		// Before warren makes it, make sure that the namespace has no pods
+		// of a different owner.
 		if err := m.otherPods(ctx); err != nil {
-			return err
+			return absent(err)
 		}
 		if _, err = policies.Create(ctx, want, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("make the network policy %s: %w", defaultDenyName, err)
+			return absent(fmt.Errorf("make the network policy %s: %w", defaultDenyName, err))
 		}
 		m.cfg.Logger.Info("network policy made", "log", "audit", "policy", defaultDenyName)
 	case err != nil:
-		return fmt.Errorf("read the network policy %s: %w", defaultDenyName, err)
+		// Warren does not know the state of the policy. One error of a read
+		// request does not change the result of the previous run.
+		err = fmt.Errorf("read the network policy %s: %w", defaultDenyName, err)
+		if !m.networkReady.Load() {
+			m.networkProblem.Store(err.Error())
+		}
+		return err
 	case !apiequality.Semantic.DeepEqual(cur.Spec, want.Spec):
 		// A person or a different program changed the policy. It could now
 		// permit connections for all sandboxes.
 		cur.Spec = want.Spec
 		if _, err = policies.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("repair the network policy %s: %w", defaultDenyName, err)
+			return absent(fmt.Errorf("repair the network policy %s: %w", defaultDenyName, err))
 		}
 		m.cfg.Logger.Warn("the network policy that refuses all connections was changed. Warren repaired it.",
 			"log", "audit", "policy", defaultDenyName)
@@ -393,6 +416,16 @@ func (m *Manager) otherPods(ctx context.Context) error {
 // comes back. It also deletes the network policies that have no pod.
 func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.Pod, live map[string]bool) {
 	policies := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace)
+	hosts := m.hostAddresses()
+	// From here, a pod event asks for a run of the reaper only for a node
+	// address that this run does not have.
+	known := make(map[string]bool, len(hosts))
+	for _, cidr := range hosts {
+		known[cidr] = true
+	}
+	m.mu.Lock()
+	m.hosts = known
+	m.mu.Unlock()
 	// List all policies of the namespace, not only the policies of warren.
 	list, err := policies.List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -424,7 +457,6 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 		m.cfg.Logger.Error("the sandbox namespace has network policies that warren did not make. They can permit connections that warren refuses. "+
 			"No new sandbox starts until they are gone, or until the configuration of warren accepts them (--accepted-network-policies).", "policies", others)
 	}
-	hosts := m.hostAddresses()
 
 	for _, pod := range pods {
 		start := pod.Labels[LabelStart]
@@ -453,20 +485,29 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 			// can let an open connection continue after a change of the
 			// policy. Only a stop of the pod closes such a connection.
 			removed := narrower(cur.Annotations[AnnotationNetwork], pol.Network)
-			cur.Spec = want.Spec
-			// With the pod as owner, Kubernetes deletes the policy with
-			// the pod.
-			cur.OwnerReferences = want.OwnerReferences
-			if cur.Annotations == nil {
-				cur.Annotations = map[string]string{}
+			// After a removed permission, the record of the previous
+			// settings stays: the policy goes away with its pod. If the
+			// stop of the pod fails, the next run finds the removed
+			// permission again, and it tries the stop again. The policy
+			// itself needs no second change then.
+			if !removed || !apiequality.Semantic.DeepEqual(cur.Spec, want.Spec) || len(cur.OwnerReferences) == 0 {
+				cur.Spec = want.Spec
+				// With the pod as owner, Kubernetes deletes the policy with
+				// the pod.
+				cur.OwnerReferences = want.OwnerReferences
+				if cur.Annotations == nil {
+					cur.Annotations = map[string]string{}
+				}
+				if !removed {
+					cur.Annotations[AnnotationNetwork] = want.Annotations[AnnotationNetwork]
+				}
+				if _, err := policies.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
+					m.cfg.Logger.Warn("cannot change the network policy of a sandbox", "sandbox", pod.Name, "error", err.Error())
+					continue
+				}
+				m.cfg.Logger.Info("network policy of a sandbox changed", "log", "audit", "sandbox", pod.Name, "policy", start,
+					"template", pod.Labels[LabelTemplate], "restart", removed)
 			}
-			cur.Annotations[AnnotationNetwork] = want.Annotations[AnnotationNetwork]
-			if _, err := policies.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
-				m.cfg.Logger.Warn("cannot change the network policy of a sandbox", "sandbox", pod.Name, "error", err.Error())
-				continue
-			}
-			m.cfg.Logger.Info("network policy of a sandbox changed", "log", "audit", "sandbox", pod.Name, "policy", start,
-				"template", pod.Labels[LabelTemplate], "restart", removed)
 			if removed {
 				_ = m.deletePod(ctx, pod, "network_changed", false)
 			}
@@ -476,6 +517,12 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 	now := m.now()
 	for name, np := range have {
 		if name == defaultDenyName || live[name] || now.Sub(np.CreationTimestamp.Time) < orphanAge {
+			continue
+		}
+		// The test of the network plugin, of this process or of a second
+		// process, makes its policy before its pod, and the pod is not in
+		// the cache. Without its policy, the test gives a wrong result.
+		if strings.HasPrefix(name, canaryPrefix) && now.Sub(np.CreationTimestamp.Time) < canaryMaxTime {
 			continue
 		}
 		// A start request makes the network policy before the pod.
@@ -535,17 +582,8 @@ func narrower(record string, now policy.Network) bool {
 func (m *Manager) hostAddresses() []string {
 	seen := map[string]bool{}
 	for _, obj := range m.informer.GetStore().List() {
-		pod := obj.(*corev1.Pod)
-		ips := []string{pod.Status.HostIP}
-		for _, h := range pod.Status.HostIPs {
-			ips = append(ips, h.IP)
-		}
-		for _, ip := range ips {
-			addr, err := netip.ParseAddr(ip)
-			if err != nil {
-				continue
-			}
-			seen[netip.PrefixFrom(addr, addr.BitLen()).String()] = true
+		for _, cidr := range m.podHosts(obj.(*corev1.Pod)) {
+			seen[cidr] = true
 		}
 	}
 	out := make([]string, 0, len(seen))
@@ -553,6 +591,71 @@ func (m *Manager) hostAddresses() []string {
 		out = append(out, cidr)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// blockNode makes sure, before the first lease of a pod, that the network
+// policy of the pod does not permit a public address of the node of the pod.
+// The start request makes the policy before Kubernetes selects the node, and
+// the reaper corrects the policy only at its next run. No program of a user
+// runs in a sandbox before its first lease.
+func (m *Manager) blockNode(ctx context.Context, pod *corev1.Pod) error {
+	m.mu.Lock()
+	done := m.stateLocked(pod.Name).nodeBlocked == pod.UID
+	m.mu.Unlock()
+	if done {
+		return nil
+	}
+	start := pod.Labels[LabelStart]
+	if pol, ok := m.cfg.Policies.Get(pod.Labels[LabelTemplate]); ok && len(m.podHosts(pod)) > 0 && start != "" && pol.Network.Egress == policy.EgressInternet {
+		policies := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace)
+		cur, err := policies.Get(ctx, start, metav1.GetOptions{})
+		if err != nil {
+			// If the policy is absent, the reaper makes it again.
+			return err
+		}
+		// Change the rules only. The record of the network settings stays,
+		// thus the reaper still sees a permission that the policy file
+		// removed. The address of this pod comes from the pod, not from the
+		// cache: the cache can be older.
+		hosts := m.hostAddresses()
+		for _, cidr := range m.podHosts(pod) {
+			if !slices.Contains(hosts, cidr) {
+				hosts = append(hosts, cidr)
+			}
+		}
+		sort.Strings(hosts)
+		want := m.buildNetworkPolicy(start, pod.Labels, pol, hosts)
+		if !apiequality.Semantic.DeepEqual(cur.Spec.Egress, want.Spec.Egress) {
+			cur.Spec.Egress = want.Spec.Egress
+			if _, err := policies.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
+				return err
+			}
+			m.cfg.Logger.Info("network policy of a sandbox changed: it has the address of the node now", "log", "audit",
+				"sandbox", pod.Name, "policy", start)
+		}
+	}
+	m.mu.Lock()
+	m.stateLocked(pod.Name).nodeBlocked = pod.UID
+	m.mu.Unlock()
+	return nil
+}
+
+// podHosts returns the addresses of the node of a pod, each as a network of
+// one address. An address in a network that the configuration refuses
+// already is not in the result: if it was, each new node would change the
+// network policies of all sandboxes.
+func (m *Manager) podHosts(pod *corev1.Pod) []string {
+	ips := []string{pod.Status.HostIP}
+	for _, h := range pod.Status.HostIPs {
+		ips = append(ips, h.IP)
+	}
+	var out []string
+	for _, ip := range ips {
+		if addr, err := netip.ParseAddr(ip); err == nil && !m.cfg.Network.Blocked(addr) {
+			out = append(out, netip.PrefixFrom(addr, addr.BitLen()).String())
+		}
+	}
 	return out
 }
 
@@ -579,7 +682,8 @@ func SelfCheck(ctx context.Context, client kubernetes.Interface, podName string,
 	}
 	pod, err := client.CoreV1().Pods(net.WarrenNamespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
-		logger.Warn("warren cannot read its own pod, thus it cannot examine its labels and its address. "+
+		logger.Warn("warren cannot read its own pod, thus it cannot examine its labels, its address, and its use of the node network. "+
+			"Set the variable WARREN_POD_NAME from the field metadata.name: the host name is not the pod name for a pod with hostNetwork. "+
 			"If no request gets to a sandbox, examine the pod labels in the configuration of warren.", "pod", podName, "error", err.Error())
 		return nil
 	}

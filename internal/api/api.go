@@ -50,8 +50,12 @@ type Instances interface {
 	// WaitReady waits until the sandbox is ready, or until it is clear
 	// that it does not start.
 	WaitReady(ctx context.Context, ref scope.Ref)
-	// Ready reports whether the data about the sandboxes is complete.
-	Ready() bool
+	// Synced reports whether the data about the sandboxes is complete. It
+	// does not tell if a sandbox can start: Start and Restart report that
+	// with backend.ErrNotReady. The list, the status, and the operations
+	// that stop or delete a sandbox must operate also when no sandbox can
+	// start.
+	Synced() bool
 }
 
 // operationWait is the maximum time that a start or restart operation
@@ -230,7 +234,7 @@ func (h *Handler) serveTemplate(w http.ResponseWriter, r *http.Request, rest str
 		return
 	}
 	switch {
-	case h.Instances != nil && !h.Instances.Ready():
+	case h.Instances != nil && !h.Instances.Synced():
 		// Without the data about the sandboxes, a reply would be wrong.
 		w.Header().Set("Retry-After", "5")
 		httpx.Error(w, http.StatusServiceUnavailable, "The server starts. Try again in a short time.")

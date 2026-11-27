@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -193,6 +194,8 @@ func TestNetworkTestRemovesOldTestPods(t *testing.T) {
 	if _, err := e.client.CoreV1().Pods(testNamespace).Create(context.Background(), old, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	// A younger test pod can be the pod of a test in progress.
+	e.clock.Advance(canaryMaxTime + time.Second)
 	sandbox := e.m.buildPod("wr-sandbox", "wr-sandbox-00000000", userRef("alice"), e.policy(userRef("alice")))
 	if _, err := e.client.CoreV1().Pods(testNamespace).Create(context.Background(), sandbox, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -274,8 +277,10 @@ func TestNetworkPolicyThatWarrenDidNotMake(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.m.Reap(context.Background())
-	if _, err := e.m.Acquire(context.Background(), userRef("bob")); err == nil {
-		t.Error("a sandbox started in a namespace with a network policy of a different owner")
+	limited, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := e.m.Acquire(limited, userRef("bob")); err == nil || errors.Is(err, backend.ErrNotReady) {
+		t.Errorf("Acquire in a namespace with a network policy of a different owner: %v, want an error that names the cause", err)
 	}
 	// Warren does not delete or change that policy.
 	if _, ok := e.networkPolicies()["allow-same-namespace"]; !ok {
@@ -302,8 +307,8 @@ func TestNetworkPolicyThatWarrenDidNotMake(t *testing.T) {
 		t.Fatal(err)
 	}
 	e2.m.Reap(context.Background())
-	if _, err := e2.m.Acquire(context.Background(), userRef("bob")); err == nil {
-		t.Error("a sandbox started with a network policy that the configuration does not accept")
+	if _, err := e2.m.Acquire(limited, userRef("bob")); err == nil || errors.Is(err, backend.ErrNotReady) {
+		t.Errorf("Acquire with a network policy that the configuration does not accept: %v, want an error that names the cause", err)
 	}
 }
 
@@ -370,8 +375,16 @@ func TestNamespaceWithPodsOfADifferentOwner(t *testing.T) {
 	if len(list.Items) != 0 {
 		t.Error("warren made the policy in a namespace with a pod of a different owner")
 	}
-	if m.Ready() {
-		t.Error("the manager is ready with no policy for the namespace")
+	// All other conditions are good: only the policy of the namespace
+	// decides.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.factory.Start(ctx.Done())
+	waitFor(t, "caches", m.Synced)
+	m.enforcement.Store(enforcementProven)
+	m.otherPolicies.Store(0)
+	if m.Ready() || !strings.Contains(m.NotReadyReason(), "database-0") {
+		t.Errorf("ready = %v, reason = %q with no policy for the namespace", m.Ready(), m.NotReadyReason())
 	}
 	// An administrator can accept it.
 	c := cfg()
@@ -445,5 +458,171 @@ func TestNodeAddressesAreBlocked(t *testing.T) {
 	e.acquire(userRef("bob")).Release()
 	if got := e.policyOf(userRef("bob")).Spec.Egress[1].To[0].IPBlock.Except; !has(got, "203.0.113.5/32") {
 		t.Errorf("exceptions of a new sandbox: %v", got)
+	}
+}
+
+// If the test pod cannot start, the error must give the cause of Kubernetes
+// and the facts that an administrator needs.
+func TestNetworkTestPodThatCannotPullItsImage(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.client.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		pod := a.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+		if pod.Labels[LabelCanary] == "true" {
+			pod.Status.Phase = corev1.PodPending
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: containerName, State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "pull access denied"},
+			}}}
+		}
+		return false, nil, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := e.m.checkEnforcement(ctx)
+	if err == nil {
+		t.Fatal("checkEnforcement gave no error")
+	}
+	for _, want := range []string{"ImagePullBackOff", "pull access denied", "--sandbox-image", "imagePullSecrets", "/usr/local/bin/python3"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want %q in it", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "default command") {
+		t.Errorf("error = %q: the test pod does not use the default command of a sandbox", err)
+	}
+	if n := len(e.canaries()); n != 0 {
+		t.Errorf("test pods after the test = %d, want 0", n)
+	}
+}
+
+// After one good test, a later test in which warren cannot connect to the
+// permitted pod does not stop the start of sandboxes: the result of the
+// previous test stays (docs/isolation.md, section 4).
+func TestLaterFailureOfTheFirstStepKeepsTheResult(t *testing.T) {
+	var fail atomic.Bool
+	e, _ := canaryEnvWith(t, func() error {
+		if fail.Load() {
+			return errTimeout
+		}
+		return nil
+	}, func(int32) error { return errTimeout })
+	e.m.examineEnforcement(context.Background())
+	if !e.m.Ready() {
+		t.Fatalf("not ready after a good test: %s", e.m.NotReadyReason())
+	}
+	fail.Store(true)
+	e.m.examineEnforcement(context.Background())
+	if !e.m.Ready() {
+		t.Errorf("a later failure of the first step removed the result of the previous test: %s", e.m.NotReadyReason())
+	}
+}
+
+// After one successful test, a later test in which warren cannot connect to
+// the permitted pod does not change the result (docs/isolation.md, section 4).
+func TestLaterNetworkTestKeepsThePreviousResult(t *testing.T) {
+	e, _ := canaryEnvWith(t, func() error { return errTimeout }, func(int32) error { return errTimeout })
+	e.m.enforcement.Store(enforcementProven)
+	e.m.examineEnforcement(context.Background())
+	if !e.m.Ready() {
+		t.Errorf("the manager is not ready after a later test that failed in its first step: %s", e.m.NotReadyReason())
+	}
+}
+
+// One failure of the key check, a long time before, is not "no connection
+// for 60 seconds". One more failure must not stop the sandbox.
+func TestOneOldFailureDoesNotStopASandbox(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	e := newTestEnv(t, func(c *Config) {
+		c.Verify = func(context.Context, backend.Target) error {
+			if fail.Load() {
+				return errTimeout
+			}
+			return nil
+		}
+	})
+	req := userRef("alice")
+	name := req.Ref.Name()
+	try := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		res := e.acquireAsync(ctx, e.m, req)
+		waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
+		if !podReady(e.m.pod(name)) {
+			e.makeReady(name)
+		}
+		return (<-res).err
+	}
+	if err := try(); !errors.Is(err, backend.ErrNotReady) {
+		t.Fatalf("first request: %v, want ErrNotReady", err)
+	}
+	uid := e.m.pod(name).UID
+	// The client went away. Ten minutes later, one key check fails again.
+	e.clock.Advance(10 * time.Minute)
+	if err := try(); !errors.Is(err, backend.ErrNotReady) {
+		t.Errorf("request after 10 minutes: %v, want ErrNotReady", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if p := e.m.pod(name); p == nil || p.UID != uid {
+		t.Fatal("warren stopped the sandbox after two failures that are 10 minutes apart")
+	}
+	fail.Store(false)
+	e.acquire(req).Release()
+}
+
+// A container that stops again and again, in a sandbox that operated, is not
+// a container that cannot start. Warren stops the pod only when the container
+// did not operate for the time limit.
+func TestContainerThatStopsInASandboxThatOperated(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	e.clock.Advance(10 * time.Minute)
+	e.setStatus(name, func(p *corev1.Pod) {
+		p.Status.Conditions = []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionFalse, LastTransitionTime: metav1.NewTime(e.clock.Now()),
+		}}
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: containerName, RestartCount: 2, State: corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff", Message: "back-off 10s restarting failed container"},
+		}}}
+	})
+	waitFor(t, "status in the cache", func() bool { return len(e.m.pod(name).Status.ContainerStatuses) == 1 })
+	e.clock.Advance(20 * time.Second)
+	e.m.Reap(context.Background())
+	time.Sleep(50 * time.Millisecond)
+	if e.m.pod(name) == nil {
+		t.Fatal("warren stopped a sandbox whose container stopped 20 seconds before")
+	}
+	// The container does not come back.
+	e.clock.Advance(3 * time.Minute)
+	e.m.Reap(context.Background())
+	waitFor(t, "stop of the pod whose container does not start again", func() bool { return e.m.pod(name) == nil })
+}
+
+// The start request makes the network policy before Kubernetes selects a
+// node. The first sandbox on a node must not get a lease while its policy
+// permits the address of its own node.
+func TestFirstSandboxOnANodeWithAPublicAddress(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res := e.acquireAsync(ctx, e.m, req)
+	waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
+	e.setStatus(name, func(p *corev1.Pod) {
+		readyStatus(p)
+		p.Status.HostIP = "203.0.113.5"
+		p.Status.HostIPs = []corev1.HostIP{{IP: "203.0.113.5"}, {IP: "2001:db8::5"}}
+	})
+	r := <-res
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	defer r.lease.Release()
+	np := e.policyOf(req)
+	v4, v6 := np.Spec.Egress[1].To[0].IPBlock.Except, np.Spec.Egress[1].To[1].IPBlock.Except
+	if !slices.Contains(v4, "203.0.113.5/32") || !slices.Contains(v6, "2001:db8::5/128") {
+		t.Errorf("exceptions at the first lease: %v and %v, want the addresses of the node", v4, v6)
 	}
 }
