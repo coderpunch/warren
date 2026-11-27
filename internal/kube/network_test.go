@@ -1351,3 +1351,73 @@ func TestNewPodOnANodeThatARunRemovesAtThisTime(t *testing.T) {
 		t.Error("the policy of carol permits the address of node A after the next run")
 	}
 }
+
+// The record of the node addresses can have the address of a node that has
+// no sandbox, until the next run of the reaper. A pod that gets that node
+// later asks for no run. Thus a sandbox that starts in that time must get a
+// policy that has the addresses of the record.
+func TestNewPolicyHasTheNodeAddressesOfTheRecord(t *testing.T) {
+	e := newTestEnv(t, nil)
+	carol, dan, yuri, xena := userRef("carol"), userRef("dan"), userRef("yuri"), userRef("xena")
+	e.startOnNode(carol, publicNodeB)
+	e.startOnNode(yuri, publicNodeA)
+	e.completeRun(carol, yuri)
+	if !e.refusesNode(carol, publicNodeA) {
+		t.Fatal("the test is wrong: the policy of carol does not have the address of node A")
+	}
+
+	// The last sandbox of node A goes away. No run of the reaper comes.
+	e.stop(yuri)
+	waitFor(t, "pod of yuri out of the cache", func() bool { return e.m.pod(yuri.Ref.Name()) == nil })
+	// A sandbox starts on node B and gets its first lease.
+	e.startOnNode(dan, publicNodeB)
+	if !e.refusesNode(dan, publicNodeA) {
+		t.Fatal("the policy of a new sandbox does not have the address of node A, which is in the record")
+	}
+
+	// A sandbox starts on node A and gets its first lease. No run of the
+	// reaper is necessary: each policy has the address of node A.
+	e.startOnNode(xena, publicNodeA)
+	for _, req := range []backend.Request{carol, dan, xena} {
+		if !e.refusesNode(req, publicNodeA) {
+			t.Errorf("the policy of %s permits the address of node A, on which a sandbox operates", req.UserID)
+		}
+	}
+}
+
+// A run of the reaper can record a new node address after a start request
+// made the policy of a sandbox, and before the pod of that sandbox was in
+// the pods of that run. That policy does not have the address. The first
+// lease must put it into the policy, also for a pod on a node that has no
+// public address.
+func TestFirstLeasePutsTheRecordedNodeAddressesIntoThePolicy(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("dan")
+	name := req.Ref.Name()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res := e.acquireAsync(ctx, e.m, req)
+	waitFor(t, "pod", func() bool { return e.m.pod(name) != nil })
+	if e.refusesNode(req, publicNodeA) {
+		t.Fatal("the test is wrong: the policy has the address of node A at its start")
+	}
+	// A run that did not have the pod of this sandbox recorded node A.
+	e.m.mu.Lock()
+	e.m.hosts = map[string]bool{publicNodeA + "/32": true}
+	e.m.mu.Unlock()
+
+	// The pod is on a node with a private address.
+	e.setStatus(name, func(p *corev1.Pod) {
+		readyStatus(p)
+		p.Status.HostIP = "10.0.0.7"
+		p.Status.HostIPs = []corev1.HostIP{{IP: "10.0.0.7"}}
+	})
+	r := <-res
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	defer r.lease.Release()
+	if !e.refusesNode(req, publicNodeA) {
+		t.Error("the sandbox got its first lease, and its policy permits the address of node A")
+	}
+}

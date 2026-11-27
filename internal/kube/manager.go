@@ -220,7 +220,9 @@ type Manager struct {
 	// hosts has the node addresses that are in the network policies of the
 	// sandboxes. The reaper records a new address after a run that wrote all
 	// policies, and it removes an address before it writes the policies
-	// without that address. The caller must hold mu.
+	// without that address. A policy that warren makes between two runs gets
+	// the addresses of this record: refer to policyHosts. The caller must
+	// hold mu.
 	hosts map[string]bool
 	// kick asks Run for one run of the reaper at this time.
 	kick chan struct{}
@@ -1232,7 +1234,7 @@ func (m *Manager) createObjects(ctx context.Context, name string, req backend.Re
 	// a time when only the policy of the namespace applies to it: it would
 	// not be wrong, but warren could not connect to the sandbox.
 	podSpec := m.buildPod(name, secretName, req, pol)
-	madePolicy, err := networkPolicies.Create(ctx, m.buildNetworkPolicy(secretName, podSpec.Labels, pol, m.hostAddresses()), metav1.CreateOptions{})
+	madePolicy, err := networkPolicies.Create(ctx, m.buildNetworkPolicy(secretName, podSpec.Labels, pol, m.policyHosts()), metav1.CreateOptions{})
 	if err != nil {
 		removeStartObjects()
 		removeNewVolume()

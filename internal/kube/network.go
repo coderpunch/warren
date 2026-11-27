@@ -654,6 +654,31 @@ func (m *Manager) hostAddresses() []string {
 	return out
 }
 
+// policyHosts returns the node addresses for a policy that warren makes or
+// changes between two runs of the reaper: the addresses of the cache, the
+// addresses of the record, and the addresses that the caller gives. The
+// record can have the address of a node that has no sandbox at this time. A
+// pod that gets that node later asks for no run of the reaper, because the
+// record has the address. Thus each policy must have each address of the
+// record.
+func (m *Manager) policyHosts(more ...string) []string {
+	hosts := m.hostAddresses()
+	m.mu.Lock()
+	for cidr := range m.hosts {
+		if !slices.Contains(hosts, cidr) {
+			hosts = append(hosts, cidr)
+		}
+	}
+	m.mu.Unlock()
+	for _, cidr := range more {
+		if !slices.Contains(hosts, cidr) {
+			hosts = append(hosts, cidr)
+		}
+	}
+	sort.Strings(hosts)
+	return hosts
+}
+
 // blockNode makes sure, before the first lease of a pod, that the network
 // policy of the pod does not permit a public address of the node of the pod.
 // The start request makes the policy before Kubernetes selects the node, and
@@ -667,7 +692,14 @@ func (m *Manager) blockNode(ctx context.Context, pod *corev1.Pod) error {
 		return nil
 	}
 	start := pod.Labels[LabelStart]
-	if pol, ok := m.cfg.Policies.Get(pod.Labels[LabelTemplate]); ok && len(m.podHosts(pod)) > 0 && start != "" && pol.Network.Egress == policy.EgressInternet {
+	// The address of this pod comes from the pod, not from the cache: the
+	// cache can be older. The addresses of the record are necessary also for
+	// a pod on a node with no public address: a run of the reaper can record
+	// a new node address after the start request made this policy, and
+	// before the pod of this sandbox was in the pods of that run.
+	own := m.podHosts(pod)
+	hosts := m.policyHosts(own...)
+	if pol, ok := m.cfg.Policies.Get(pod.Labels[LabelTemplate]); ok && len(hosts) > 0 && start != "" && pol.Network.Egress == policy.EgressInternet {
 		policies := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace)
 		cur, err := policies.Get(ctx, start, metav1.GetOptions{})
 		if err != nil {
@@ -676,15 +708,7 @@ func (m *Manager) blockNode(ctx context.Context, pod *corev1.Pod) error {
 		}
 		// Change the rules only. The record of the network settings stays,
 		// thus the reaper still sees a permission that the policy file
-		// removed. The address of this pod comes from the pod, not from the
-		// cache: the cache can be older.
-		hosts := m.hostAddresses()
-		for _, cidr := range m.podHosts(pod) {
-			if !slices.Contains(hosts, cidr) {
-				hosts = append(hosts, cidr)
-			}
-		}
-		sort.Strings(hosts)
+		// removed.
 		want := m.buildNetworkPolicy(start, pod.Labels, pol, hosts)
 		// Write the policy also when its rules are correct already: the
 		// annotation gets the UID of the pod. The policy can have the address
@@ -694,7 +718,9 @@ func (m *Manager) blockNode(ctx context.Context, pod *corev1.Pod) error {
 		// version from its list of the policies. This write gives the policy
 		// a new resource version, thus Kubernetes refuses that request. An
 		// update request with no change would not give a new version.
-		if !apiequality.Semantic.DeepEqual(cur.Spec.Egress, want.Spec.Egress) || cur.Annotations[AnnotationNodeBlocked] != string(pod.UID) {
+		// A pod on a node with no public address needs that write only when
+		// the rules are not correct.
+		if !apiequality.Semantic.DeepEqual(cur.Spec.Egress, want.Spec.Egress) || (len(own) > 0 && cur.Annotations[AnnotationNodeBlocked] != string(pod.UID)) {
 			cur.Spec.Egress = want.Spec.Egress
 			if cur.Annotations == nil {
 				cur.Annotations = map[string]string{}
@@ -703,7 +729,7 @@ func (m *Manager) blockNode(ctx context.Context, pod *corev1.Pod) error {
 			if _, err := policies.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
 				return err
 			}
-			m.cfg.Logger.Info("network policy of a sandbox changed: it has the address of the node now", "log", "audit",
+			m.cfg.Logger.Info("network policy of a sandbox changed: it has the addresses of the nodes now", "log", "audit",
 				"sandbox", pod.Name, "policy", start)
 		}
 	}
