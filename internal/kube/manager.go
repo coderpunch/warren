@@ -80,8 +80,9 @@ type Config struct {
 
 	// Port is the port of Open Terminal in a pod. Tests change it.
 	Port int
-	// Dial opens one TCP connection, for the test of the network policies.
-	// Tests change it.
+	// Dial makes one connection attempt to the test pod, for the test of the
+	// network policies. It returns nil only when the test pod answers. Tests
+	// change it.
 	Dial func(ctx context.Context, address string) error
 	// CanaryInterval is the time between two tests of the network policies.
 	// CanaryPoll and CanaryPause are the wait times in one test.
@@ -268,7 +269,7 @@ func New(cfg Config) (*Manager, error) {
 		cfg.Port = terminalPort
 	}
 	if cfg.Dial == nil {
-		cfg.Dial = dialTCP
+		cfg.Dial = dialCanary
 	}
 	if cfg.CanaryInterval <= 0 {
 		cfg.CanaryInterval = time.Hour
@@ -394,9 +395,8 @@ func (m *Manager) Run(ctx context.Context) error {
 func (m *Manager) runEnforcementTests(ctx context.Context) {
 	for {
 		wait := m.cfg.ReapInterval
-		// The last step of the test needs the policy of the namespace. With
-		// no such policy, the test would show a cluster that applies no
-		// policies. The reaper makes the policy.
+		// The test needs the policy of the namespace. With no such policy,
+		// the test is not possible. The reaper makes the policy.
 		if m.networkReady.Load() {
 			m.examineEnforcement(ctx)
 			wait = m.cfg.CanaryRetry

@@ -186,6 +186,9 @@ Warren thus makes a test at its start, and again each hour:
 5. Warren makes the policy again and connects again. The connection must be successful. This shows that the network policy was the cause of the failures in step 4. A pod that went away, or a fault of warren, was not the cause.
 6. Warren deletes the pod.
 
+A connection is successful only when the HTTP server of the test pod answers with the status 200. An open TCP connection is not sufficient.
+A proxy of a service mesh on the pod of warren can accept a connection that does not get to the test pod.
+
 The test pod uses the image of the flag `--sandbox-image`, and the program `/usr/local/bin/python3` of that image.
 It does not use the `command` of a policy.
 It gets the `imagePullSecrets`, the node selector, and the tolerations of one policy that uses this image.
@@ -206,6 +209,7 @@ The test is not possible in these conditions, for example:
 - Kubernetes refuses the test pod.
 - The test pod does not become ready in 4 minutes.
 - The test pod goes away before the end of the test.
+- The policy of the namespace (section 3.1) is absent, or it changes before the end of step 4. Only that policy refuses the connections of step 4.
 
 A second warren process can do its test at the same time, for example during a rollout. Warren thus removes a test pod of a different test only when it stopped or when it is older than 7 minutes.
 
