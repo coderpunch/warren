@@ -116,6 +116,18 @@ Results for warren:
 
 If `OPEN_TERMINAL_EXECUTE_TIMEOUT` is set, a request without `wait` waits for that time. That time has no upper limit (`main.py:1879-1880`, `main.py:1932-1933`, `env.py:91-97`).
 
+Facts about the two WebSockets:
+
+- After the first message, the `/execute` WebSocket sends the process list immediately, also when the list is empty. It sends the list again only when the list changes (`main.py:1778-1786`).
+- After the first message, the `/execute/{process_id}/status` WebSocket sends one status object immediately, and one more for each change of the process (`main.py:1804-1817`). When the process is complete, the server closes the WebSocket with the code 1000 (`main.py:1740`, `:1757`, `:1815-1816`).
+- The server reads and discards each message of the client after the first message (`main.py:1733-1737`).
+
+Results for warren:
+
+1. A client only receives data on these two WebSockets.
+2. On the `/execute` WebSocket, the first message of the server comes immediately after a correct first message of the client. A client that gets no message did not get to a server. The client of Open WebUI has a special rule for that condition (`protocol.md`, section 4.2.3).
+3. Warren puts these two routes, and the `/events` route of section 3.12, into the class of the watcher routes (`policies.md`, section 10.3).
+
 ### 3.3 Files (19 routes)
 
 | Method | Path | Auth | Tool | Function | Proxy notes | Reference |
@@ -263,6 +275,9 @@ The `fetch`, `pull`, and `push` actions use the network and can take a long time
 | WebSocket | `/events` | First message | File change and port change messages | `main.py:724-744` |
 
 After authentication, the client must send a `subscribe` message in a maximum of 10 seconds (`open_terminal/utils/events.py:142-161`).
+After that message, the server waits for more `subscribe` messages with no time limit (`open_terminal/utils/events.py:142`). Each message of the client that is not a `subscribe` message closes the WebSocket with the code 4000 (`open_terminal/utils/events.py:143-145`).
+The server sends `fs:ready` one time when its watch of the files operates, and `fs:change` after each change of the files. These messages have no file names (`open_terminal/utils/events.py:60-72`, `:100-108`, `:133-136`).
+A client only receives data on this WebSocket after its `subscribe` message. Warren puts the route into the class of the watcher routes (`policies.md`, section 10.3).
 
 ### 3.13 MCP
 

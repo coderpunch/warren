@@ -38,18 +38,28 @@ func (e *env) sandboxCloses() []int {
 	return append([]int(nil), e.alice.wsClosed...)
 }
 
+// The close code depends on the reason of the stop and on the class of the
+// route. A watcher route is different from a viewer route only for the idle
+// stop (docs/policies.md, sections 10.2 and 10.3).
 func TestSandboxStopClosesWebSockets(t *testing.T) {
 	const (
 		terminal = "/api/terminals/abc12345"
 		events   = "/events"
+		list     = "/execute"
+		output   = "/execute/p1/status"
+		view     = "/browser/view/sid/tok/stream"
+
+		operation = "An operation stopped or restarted the terminal"
+		idle      = "The terminal stopped after its idle time"
 	)
 	cases := []struct {
 		reason, path string
 		code         int
 		text         string
 	}{
-		{backend.StopAPI, terminal, 1012, "An operation stopped or restarted the terminal"},
-		{backend.StopIdle, terminal, 4004, "The terminal stopped after its idle time"},
+		// Viewer routes.
+		{backend.StopAPI, terminal, 1012, operation},
+		{backend.StopIdle, terminal, 4004, idle},
 		{backend.StopNoPolicy, terminal, 4004, "Template not found"},
 		{backend.StopNetworkChanged, terminal, 1012, "The terminal restarts"},
 		{backend.StopVolumeGone, terminal, 1012, "The terminal restarts"},
@@ -57,11 +67,25 @@ func TestSandboxStopClosesWebSockets(t *testing.T) {
 		{"failed", terminal, 1011, "The terminal failed"},
 		{"not_ready", terminal, 1011, "The terminal failed"},
 		{"a reason that the proxy does not know", terminal, 1011, "The terminal failed"},
-		// In this version each route has the same codes.
-		{backend.StopAPI, events, 1012, "An operation stopped or restarted the terminal"},
-		{backend.StopIdle, events, 4004, "The terminal stopped after its idle time"},
-		{backend.StopExternal, "/execute/p1/status", 1012, "The terminal restarts"},
-		{backend.StopAPI, "/browser/view/sid/tok/stream", 1012, "An operation stopped or restarted the terminal"},
+		{backend.StopIdle, "/desktop/stream", 4004, idle},
+		{backend.StopIdle, "/desktop/audio", 4004, idle},
+		{backend.StopIdle, "/agents/sessions/s1/connect", 4004, idle},
+		{backend.StopIdle, view, 4004, idle},
+		{backend.StopAPI, view, 1012, operation},
+		// Watcher routes. After the idle stop, a watcher gets a code after
+		// which its client connects again.
+		{backend.StopIdle, events, 1012, idle},
+		{backend.StopIdle, list, 1012, idle},
+		{backend.StopIdle, output, 1012, idle},
+		{backend.StopAPI, events, 1012, operation},
+		{backend.StopAPI, list, 1012, operation},
+		{backend.StopNoPolicy, events, 4004, "Template not found"},
+		{backend.StopNoPolicy, output, 4004, "Template not found"},
+		{backend.StopNetworkChanged, list, 1012, "The terminal restarts"},
+		{backend.StopVolumeGone, events, 1012, "The terminal restarts"},
+		{backend.StopExternal, output, 1012, "The terminal restarts"},
+		{"failed", events, 1011, "The terminal failed"},
+		{"a reason that the proxy does not know", list, 1011, "The terminal failed"},
 	}
 	for _, c := range cases {
 		t.Run(c.reason+" "+c.path, func(t *testing.T) {
@@ -112,29 +136,33 @@ func TestSandboxStopClosesWebSockets(t *testing.T) {
 // A sandbox that stops sends its own close code, or it breaks the
 // connection. Warren gives the stop signal before its delete request, thus
 // the lease has the signal at that time. The client gets the code of warren,
-// and not the code of the sandbox.
+// and not the code of the sandbox. On a watcher route the two codes are the
+// same for the idle stop. The text and the audit record show which one the
+// client got.
 func TestStopReasonWinsOverTheCloseOfTheSandbox(t *testing.T) {
-	for _, end := range []string{"close-1012", "cut"} {
-		t.Run(end, func(t *testing.T) {
-			e := newEnv(t)
-			conn, lease := e.openSocket(t, "/api/terminals/abc12345")
-			// The backend stops the sandbox, and the sandbox ends its side
-			// immediately after that.
-			e.alice.mu.Lock()
-			e.alice.beforeEnd = func() { lease.stop(backend.StopIdle) }
-			e.alice.mu.Unlock()
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(end)); err != nil {
-				t.Fatal(err)
-			}
-			code, text := closeMessage(t, conn)
-			if code != 4004 || text != "The terminal stopped after its idle time" {
-				t.Errorf("close message = %d %q, want the code and the text of warren for the idle stop", code, text)
-			}
-			conn.Close()
-			want := `"detail":"closed by warren, code 4004, reason idle"`
-			waitFor(t, "audit record", func() bool { return strings.Contains(e.logs.String(), want) })
-			waitFor(t, "end of the lease", func() bool { return e.resolver.openLeases() == 0 })
-		})
+	for path, want := range map[string]int{"/api/terminals/abc12345": 4004, "/events": 1012} {
+		for _, end := range []string{"close-1012", "cut"} {
+			t.Run(path+" "+end, func(t *testing.T) {
+				e := newEnv(t)
+				conn, lease := e.openSocket(t, path)
+				// The backend stops the sandbox, and the sandbox ends its side
+				// immediately after that.
+				e.alice.mu.Lock()
+				e.alice.beforeEnd = func() { lease.stop(backend.StopIdle) }
+				e.alice.mu.Unlock()
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(end)); err != nil {
+					t.Fatal(err)
+				}
+				code, text := closeMessage(t, conn)
+				if code != want || text != "The terminal stopped after its idle time" {
+					t.Errorf("close message = %d %q, want %d and the text of warren for the idle stop", code, text, want)
+				}
+				conn.Close()
+				detail := fmt.Sprintf(`"detail":"closed by warren, code %d, reason idle"`, want)
+				waitFor(t, "audit record", func() bool { return strings.Contains(e.logs.String(), detail) })
+				waitFor(t, "end of the lease", func() bool { return e.resolver.openLeases() == 0 })
+			})
+		}
 	}
 }
 

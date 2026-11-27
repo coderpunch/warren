@@ -19,6 +19,22 @@ func TestStaticBackendIgnoresPassive(t *testing.T) {
 	}
 }
 
+// A request that does not begin a start gets the one server immediately:
+// that server always operates.
+func TestStaticBackendIgnoresNoStart(t *testing.T) {
+	target := Target{URL: &url.URL{Scheme: "http", Host: "127.0.0.1:8000"}, APIKey: "key"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, req := range []Request{{NoStart: true}, {NoStart: true, WebSocket: true}} {
+		// The backend does not wait, also when the context is at its end.
+		lease, err := Static{Server: target}.Acquire(ctx, req)
+		if err != nil || lease.Target() != target {
+			t.Fatalf("request %+v: lease = %v, error = %v; want the one server", req, lease, err)
+		}
+		lease.Release()
+	}
+}
+
 // The development backend stops nothing, thus its lease never gets a stop
 // signal.
 func TestStaticLeaseHasNoStopSignal(t *testing.T) {

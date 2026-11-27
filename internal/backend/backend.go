@@ -33,6 +33,14 @@ type Request struct {
 	// it as activity, and the lease does not keep the sandbox. The request
 	// waits only for a start that a different request or operation began.
 	Passive bool
+	// NoStart is true for a request that does not begin a start of the
+	// sandbox. On a sandbox that operates, it is a usual request, with a
+	// usual lease. On a sandbox that does not operate, it waits until a
+	// different request or operation starts the sandbox, or until its context
+	// ends. In that wait it has no lease, and it is not a use of the sandbox.
+	// The proxy sets it for the WebSocket routes that only watch a sandbox
+	// (docs/policies.md, section 10.3).
+	NoStart bool
 }
 
 // Lease is the permission to use a sandbox for one request or connection.
@@ -120,7 +128,8 @@ func (staticLease) StopReason() string       { return "" }
 func (staticLease) Release()                 {}
 
 // Acquire returns a lease on the one server. The one server always operates,
-// thus a passive request gets the same lease.
+// thus a passive request, and a request that does not begin a start, get the
+// same lease.
 func (s Static) Acquire(context.Context, Request) (Lease, error) {
 	return staticLease{s.Server}, nil
 }

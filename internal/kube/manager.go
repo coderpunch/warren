@@ -649,6 +649,15 @@ const pollInterval = time.Second
 // While a restart operation is in progress, no request starts the sandbox.
 // Each request waits for the start of that operation: refer to Restart.
 //
+// A request that does not begin a start (backend.Request.NoStart) sends no
+// start request and no delete request for a pod in a final phase. While the
+// sandbox has no usable pod, it waits for the start of a different request or
+// operation, until its context ends. In that wait it has no lease, it makes
+// no record of the sandbox, and it is not a use of the sandbox. The limits on
+// the number of sandboxes and the wait time after refused keys do not apply
+// to it, because it starts nothing. On a pod that is ready, it gets the lease
+// of a usual request, after the same checks.
+//
 // The lease of a WebSocket request (backend.Request.WebSocket) is for one
 // pod. Its Stopped channel closes when that pod stops.
 func (m *Manager) Acquire(ctx context.Context, req backend.Request) (backend.Lease, error) {
@@ -743,6 +752,12 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 		// waits for the start of the operation.
 		return nil, nil
 	case pod == nil:
+		if req.NoStart {
+			// The request does not begin a start. It waits for the pod of a
+			// start that a different request or operation begins. This step
+			// made no record of the sandbox, and it makes none.
+			return nil, nil
+		}
 		if bad.count > 0 && m.now().Sub(bad.last) < bad.backoff() {
 			// A sandbox that refuses its key again and again must not
 			// make warren start and delete pods with no end.
@@ -759,7 +774,11 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 	case pod.DeletionTimestamp != nil || deleting:
 		return nil, nil
 	case podTerminal(pod):
-		_ = m.deletePod(ctx, pod, "failed", false)
+		// The delete of this pod is the first step of the next start. A
+		// request that does not begin a start leaves the pod to the reaper.
+		if !req.NoStart {
+			_ = m.deletePod(ctx, pod, "failed", false)
+		}
 		return nil, nil
 	case !podReady(pod):
 		return nil, nil

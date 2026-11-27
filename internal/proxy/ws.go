@@ -41,6 +41,20 @@ var (
 	headerRoutes = regexp.MustCompile(`^/browser/view/[^/]+/[^/]+/(ws|stream|vnc)$`)
 )
 
+// watcherRoutes are the WebSocket routes on which a client only watches a
+// sandbox: the events of files and ports, the process list, and the output of
+// one process. The browser client of Open WebUI opens them with no action of
+// a person, sends no data on them after the first messages, and connects
+// again with no limit after most close codes (docs/protocol.md, section
+// 4.2.3). Each other WebSocket route is a viewer route: a person or an agent
+// uses the sandbox through it.
+var watcherRoutes = regexp.MustCompile(`^/(events|execute|execute/[^/]+/status)$`)
+
+// watcherRoute reports whether a decoded request path is a watcher route. A
+// watcher does not begin a start of its sandbox, and it has its own close
+// code for the idle stop (docs/policies.md, section 10.3).
+func watcherRoute(path string) bool { return watcherRoutes.MatchString(path) }
+
 func classifyWS(path string) wsAuth {
 	switch {
 	case firstMessageRoutes.MatchString(path):
@@ -223,7 +237,12 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 		}
 	}()
 
-	s := &session{proxy: p, client: conn}
+	// A watcher does not begin a start of its sandbox. It waits here until a
+	// different request or operation starts the sandbox, for the same maximum
+	// time. At the end of that time it gets the code 1013, as each WebSocket
+	// whose sandbox is not ready.
+	watcher := watcherRoute(r.URL.Path)
+	s := &session{proxy: p, client: conn, watcher: watcher}
 	// From this point only the client pump reads from the client. It finds
 	// a client that goes away, and it answers pings, while the sandbox
 	// starts.
@@ -240,7 +259,7 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 		<-clientDone
 	}
 
-	lease, err := p.opts.Backend.Acquire(ctx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID, WebSocket: true})
+	lease, err := p.opts.Backend.Acquire(ctx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID, WebSocket: true, NoStart: watcher})
 	if err != nil {
 		switch {
 		case errors.Is(err, backend.ErrCapacity):
@@ -465,11 +484,20 @@ type closeInfo struct {
 // 1011 and 1012, and it does not connect again after a code from 4000 to
 // 4999 (docs/protocol.md, section 4.2.3). Open WebUI does not send the text
 // to the browser. The text is for other clients.
-func stopClose(reason string) (code int, text string) {
+//
+// The two classes of routes are different only for the idle stop. A viewer that
+// connects again starts the sandbox, thus it gets a code after which it
+// stops. A watcher that connects again starts nothing, and a watcher that
+// stopped stays stopped when the sandbox operates again. Thus a watcher gets
+// a code after which it connects again.
+func stopClose(reason string, watcher bool) (code int, text string) {
 	switch reason {
 	case backend.StopAPI:
 		return websocket.CloseServiceRestart, "An operation stopped or restarted the terminal"
 	case backend.StopIdle:
+		if watcher {
+			return websocket.CloseServiceRestart, "The terminal stopped after its idle time"
+		}
 		return closeNotFound, "The terminal stopped after its idle time"
 	case backend.StopNoPolicy:
 		// A new connection gets the same code and text from the route check.
@@ -481,15 +509,16 @@ func stopClose(reason string) (code int, text string) {
 }
 
 // backendStop returns the close data for a stop of the sandbox by the
-// backend. It reports false if the lease does not have the stop signal.
-func backendStop(lease backend.Lease) (closeInfo, bool) {
+// backend, for a watcher route or for a viewer route. It reports false if
+// the lease does not have the stop signal.
+func backendStop(lease backend.Lease, watcher bool) (closeInfo, bool) {
 	select {
 	case <-lease.Stopped():
 	default:
 		return closeInfo{}, false
 	}
 	reason := lease.StopReason()
-	code, text := stopClose(reason)
+	code, text := stopClose(reason, watcher)
 	return closeInfo{side: sideWarren, code: code, text: text, reason: reason}, true
 }
 
@@ -503,7 +532,7 @@ func (s *session) cause(first closeInfo) closeInfo {
 	if first.side != sideSandbox {
 		return first
 	}
-	if stop, ok := backendStop(s.lease); ok {
+	if stop, ok := backendStop(s.lease, s.watcher); ok {
 		return stop
 	}
 	return first
@@ -517,6 +546,8 @@ type session struct {
 	// lease is the lease on the sandbox. It is nil until the backend gives
 	// it.
 	lease backend.Lease
+	// watcher is true for a watcher route: refer to watcherRoute.
+	watcher bool
 	// closing is true after warren sent a close message. The copy loops
 	// then read and discard, until the reply to the close message comes.
 	closing atomic.Bool
@@ -646,7 +677,7 @@ func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 	case info := <-sandboxDone:
 		take(info, false)
 	case <-s.lease.Stopped():
-		first, _ = backendStop(s.lease)
+		first, _ = backendStop(s.lease, s.watcher)
 	case <-s.proxy.closing:
 		first = closeInfo{side: sideWarren, code: websocket.CloseServiceRestart, text: "The server restarts"}
 	}

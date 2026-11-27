@@ -202,6 +202,24 @@ time.sleep(5)
 live = [x["metadata"]["name"] for x in pods() if x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] == "user:bob" and "deletionTimestamp" not in x["metadata"]]
 check("the request for the system information starts no sandbox", live == [], live)
 
+# ---- watcher WebSocket of a stopped sandbox ----
+# A WebSocket on a watcher route does not start a sandbox. Warren accepts it, and it waits for a start by a different request.
+# On a sandbox that operates, the process list comes immediately after the first message.
+async def ws_watch():
+    hdr = {"X-User-Id": "bob", "X-Terminal-Template-Id": "personal", "X-Session-Id": "chat-1"}
+    async with websockets.connect(f"ws://{NODE}:30080/execute?user_id=bob", additional_headers=hdr, proxy=None, close_timeout=2) as c:
+        await c.send(json.dumps({"type": "auth", "token": KEY, "chat_id": "chat-1"}))
+        got = "nothing"
+        try:
+            got = ("message", await asyncio.wait_for(c.recv(), 8))
+        except asyncio.TimeoutError: pass
+        except websockets.exceptions.ConnectionClosed as e: got = ("close", e.rcvd.code if e.rcvd is not None else None)
+        return got
+got = asyncio.run(ws_watch())
+check("a watcher WebSocket of a stopped sandbox waits: no data and no close", got == "nothing", got)
+live = [x["metadata"]["name"] for x in pods() if x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] == "user:bob" and "deletionTimestamp" not in x["metadata"]]
+check("the watcher WebSocket starts no sandbox", live == [], live)
+
 # ---- metrics ----
 s, _, b = call("GET", "/metrics", user=None, key=None, base=ADMIN)
 text = b.decode()

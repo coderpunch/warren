@@ -335,11 +335,30 @@ More facts:
 - When the HTTP request of the desktop fails, the desktop does not try again. The tab shows the error text (`Tabs/Desktop.svelte:139-143`).
 - The process list has one more rule. If its WebSocket closes before the first message, with a code that is not 4001 or 4003, the client does not connect again. It then sends HTTP requests each second (section 4.1.2).
 
+Facts about the clients of the `/events` and `/execute` routes:
+
+- The file browser, the git bar, and the port list each open a WebSocket on `/events` (`src/lib/components/chat/FileNav.svelte:1305-1325`, `src/lib/components/chat/Tabs/GitBar.svelte:285-310`, `src/lib/components/chat/FileNav/PortList.svelte:33-58`). Each one opens it when the page shows that part. No action of a person in the terminal is necessary.
+- Before each of these parts opens its WebSocket, it sends `GET /api/config` on path A (`FileNav.svelte:1312`, `Tabs/GitBar.svelte:286`, `FileNav/PortList.svelte:41`). The browser keeps no copy of the reply: each call sends the request (`src/lib/apis/terminal/index.ts:121-133`). The client sends no such request before it connects again (`src/lib/apis/terminal/events.ts:29-35`).
+- The file browser also sends `GET /files/cwd` on path A when the page makes it, unless it shows a file first (`FileNav.svelte:2262-2266`).
+- The process dock opens the WebSocket on `/execute` when the page makes the dock (`src/lib/components/chat/TerminalDock.svelte:181-204`). The dock is a part of each file browser of the Files tab (`FileNav.svelte:3227-3254`). The page makes a new dock only when the chat, the terminal, or the model changes (`FileNav.svelte:3243`).
+- The dock opens the WebSocket on `/execute/{process_id}/status` for the process that it shows, while the dock is active and open (`TerminalDock.svelte:54-76`).
+- On `/events`, the client sends the first message and one `subscribe` message (`events.ts:15-17`). On the two `/execute` routes, it sends only the first message (`src/lib/apis/terminal/socket.ts:38-62`, `:82`). The client sends no other message on these three routes.
+- The terminal server sends the process list on `/execute` immediately after the first message (`open-terminal-api.md`, section 3.2). Thus the rule for a close before the first message applies only when the WebSocket gets no data from a terminal server.
+- After a code from 4000 to 4999, the process list does not connect again, and it sends no HTTP requests. The dock has a mark that says that the WebSocket operates. While the mark is set, the function for the HTTP requests returns immediately (`TerminalDock.svelte:48`, `:123`). Only the rule for a close before the first message removes the mark (`TerminalDock.svelte:196-202`).
+- The dock then shows the text "Live updates unavailable" (`socket.ts:103`, `TerminalDock.svelte:193-195`, `:291-296`). The page hides a dock that has no process (`TerminalDock.svelte:80`, `FileNav.svelte:3229`). Thus the page does not show a command that the model runs after that time.
+- The stream of the process output has no rule for a close before the first message (`TerminalDock.svelte:66-74`).
+- After a code from 4000 to 4999, the file browser reads its directory again in two conditions only: the chat tells it that a tool wrote a file or ran a command while its watcher has no connection, and the document becomes visible (`src/lib/components/chat/Chat.svelte:1606-1611`, `FileNav.svelte:1318`, `:2257-2258`, `:2305-2316`). The git bar reads its status again only when the document becomes visible (`Tabs/GitBar.svelte:480-482`).
+- The port list sends no HTTP request for the ports when the terminal server has the events function. Its only data source is then the WebSocket (`FileNav/PortList.svelte:41-57`).
+
 Results for warren:
 
-1. Each attempt is a new WebSocket upgrade or a new HTTP request at warren. Each one is a usual request: it starts a stopped sandbox.
-2. Thus after a close with the code 1011, 1012, or 1013, a page that has the terminal open starts the sandbox again after 1 or 2 seconds. Only a code from 4000 to 4999 stops the clients of the `/events` and `/execute` routes.
-3. After a code from 4000 to 4999, these clients stay stopped until the page makes them again, for example when the user changes the chat or opens the tab again.
+1. Each attempt is a new WebSocket upgrade or a new HTTP request at warren.
+2. An HTTP request is a usual request: it starts a stopped sandbox. The interactive terminal and the desktop send one before each attempt.
+3. If each WebSocket upgrade started a stopped sandbox, a page with the file browser would start the sandbox again 1 second after each close with the code 1011, 1012, or 1013, with no person. Only a code from 4000 to 4999 stops the clients of the `/events` and `/execute` routes.
+4. After a code from 4000 to 4999, these clients stay stopped until the page makes them again, for example when the user changes the chat or opens the tab again. The process list and the port list then show no new data, also when the sandbox operates again.
+5. Thus no one close code is correct for these clients while each upgrade starts a sandbox. Warren has a different rule for the three routes `/events`, `/execute`, and `/execute/{process_id}/status`: a WebSocket upgrade on them does not start a sandbox. It waits for a start that a different request or operation began. Warren can then close such a WebSocket with a code after which the client connects again. Decision 10 of section 9.5 is this rule.
+6. A WebSocket upgrade on each other route is a usual request: it starts a stopped sandbox.
+7. The wait of rule 5 must be long. When the page makes the file browser, the HTTP requests of the list above start the sandbox at the same time. The WebSocket of the process list must stay open until the sandbox is ready: a close before the first message starts the HTTP requests of section 4.1.2 each second, with no end, and each one is a usual request.
 
 ### 4.3 Path C: tool calls from the Open WebUI backend
 
@@ -694,7 +713,7 @@ These are conclusions from the facts above. They are inputs to the design. They 
 
 ### 9.5 Decisions
 
-The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 7 to 9 are from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
+The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 7 to 10 are from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
 
 | No. | Subject | Decision |
 |---|---|---|
@@ -707,6 +726,7 @@ The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 
 | 7 | Limit variables | Warren sets four variables on the container of each sandbox, from the limits of the policy. `OPEN_TERMINAL_CPU_LIMIT` and `OPEN_TERMINAL_MEMORY_LIMIT` have the form in which Kubernetes shows a quantity, for example `500m` and `2Gi`. `OPEN_TERMINAL_CPU_COUNT` is the CPU limit as a whole number, rounded up, with a minimum of 1. `OPEN_TERMINAL_MEMORY_BYTES` is the memory limit as a whole number of bytes. A policy cannot set these variables. The note below the table gives the source. |
 | 8 | System information | Warren sends `GET /system/info` only to a sandbox that operates. For a stopped sandbox, the reply is status 409, and the sandbox does not start. The request is not activity: it does not change the idle time of the sandbox. The note below the table gives the details. |
 | 9 | WebSockets of a sandbox that stops | When warren stops a sandbox, it closes each open WebSocket of that sandbox. For a stop, restart, reset, or delete operation of the management API, the client gets the close code 1012. The note below the table gives the codes for the other reasons, and the details. |
+| 10 | WebSockets that only watch a sandbox | A WebSocket upgrade on `/events`, `/execute`, or `/execute/{process_id}/status` does not start a sandbox. It waits for a start that a different request or operation began. These routes have their own close code for the idle time. The note below the table gives the details. |
 
 Because the identity is in headers, warren must have these protections:
 
@@ -741,13 +761,25 @@ Note for decision 8: the owner of the project asked for the three rules of the t
 
 Note for decision 9: the owner of the project asked for the close code 1012 at a stop, a restart, a reset, and a delete of the management API, so that the client connects again. Before this decision, warren closed no WebSocket because of a stop. The client got the close code that the sandbox sent when it stopped, or the code 1011 when the connection broke. A sandbox that stops usually sends the code 1012 with no text (`open-terminal-api.md`, section 4.3). The details are decisions of warren:
 
-- The table of `policies.md`, section 10.2, gives the close code and the reason text for each stop reason. The code is 4004 for a removed policy, because a new connection gets that code from the route check. It is 1012 for a removed network permission, for a volume that is gone, and for a pod that a different actor deletes: the sandbox can start again. It is 1011 for each other reason.
+- The table of `policies.md`, section 10.2, gives the close code and the reason text for each stop reason, and for each class of route (decision 10). The code is 4004 for a removed policy, because a new connection gets that code from the route check. It is 1012 for a removed network permission, for a volume that is gone, and for a pod that a different actor deletes: the sandbox can start again. It is 1011 for each other reason.
 - Warren also closes the WebSockets of a pod that a different actor deletes, for example a person with kubectl. Warren sees that in its pod cache.
 - Warren tells the WebSockets before it sends the delete request to Kubernetes. If the sandbox side closes first, and warren stopped the sandbox, the client gets the code of warren and not the code of the sandbox. If Kubernetes refuses the delete request, the WebSockets are closed, and the pod continues.
 - The sandbox side of the WebSocket gets the code 1001, as at a stop of the warren process.
 - Open WebUI does not send the reason text to the browser (section 4.2.1). The text is for other clients.
 - The audit record of the WebSocket has the code and the stop reason. The record for a stop of the warren process has the code 1012.
 - An HTTP request in progress gets no signal. A WebSocket that has no connection to its pod at the time of the stop gets the usual code for a connection that fails.
-- In this version, an open WebSocket is a use of the sandbox. Thus warren does not stop a sandbox with an open WebSocket for its idle time, and the code for the idle time does not occur. Each route gets the same codes.
-- The close code does not make a stop hold. After the code 1012, the clients connect again (section 4.2.3), and Open WebUI sends requests by itself after each instance operation (section 4.1.3). Each such request starts the sandbox again.
+- In this version, an open WebSocket is a use of the sandbox. Thus warren does not stop a sandbox with an open WebSocket for its idle time, and the code for the idle time does not occur. The code for the idle time is the only code that is different for the two classes of routes (decision 10).
+- The close code does not make a stop hold. After the code 1012, the clients connect again (section 4.2.3), and Open WebUI sends requests by itself after each instance operation (section 4.1.3). Each HTTP request, and each new WebSocket on a viewer route, starts the sandbox again. A new WebSocket on a watcher route does not (decision 10).
 - While a restart operation is in progress, only the operation starts the sandbox. A request in that time waits for the start of the operation. Without this rule, a client that connects again can send the start request before the operation. The sandbox then goes on the account of the user of that client, or that user gets the error of the sandbox limit. A request for the system information also waits in that time (decision 8).
+
+Note for decision 10: the owner of the project did not ask for this rule. It is a decision of warren, and it comes from the review of decision 9. Section 4.2.3 gives the cause: the clients of the three routes connect again with no limit after each close code that is not from 4000 to 4999, and they stay stopped after a code from 4000 to 4999. With one rule for all routes, the code 1012 lets an open page start a stopped sandbox again with no person, and the code 4004 leaves the process list and the port list of the page with no new data after the next start. The details:
+
+- The class of a route comes from the decoded path of a WebSocket upgrade. The watcher routes are exactly `/events`, `/execute`, and `/execute/{process_id}/status`, with one path segment for the process ID. Each other WebSocket route is a viewer route. The query string has no effect. An HTTP request has no class: it is a usual request, also on these paths.
+- A WebSocket on a watcher route does not begin the start of a sandbox. Warren accepts the WebSocket, and waits for a start that a different request or operation began. When the pod is ready, the watcher gets its connection.
+- The wait has the usual maximum of 50 seconds, and not a shorter time (section 4.2.3, result 7). At the end of that time, warren closes the WebSocket with the code 1013, as for each sandbox that is not ready. Open WebUI sends that code to the browser with no change (section 4.2.1), and the clients connect again after it.
+- Warren does not refuse the upgrade in place of the wait. Open WebUI changes each handshake status that is not 401, 403, or 404 to the close code 1011, and it writes an error with a stack trace to its log (section 4.2.1, `routers/terminals.py:760-765`). The process list then gets a close before its first message immediately.
+- In the wait, the watcher is not a use of the sandbox, and it sends no delete request for a pod that failed. The limits on the number of sandboxes do not apply: the watcher starts nothing.
+- On a sandbox that operates, a watcher is a usual WebSocket. It makes the checks of `isolation.md`, section 7, when it is the first request for a pod.
+- The close codes of the two classes are different only for the idle time: 4004 on a viewer route, and 1012 on a watcher route (`policies.md`, section 10.2). After the code 1012 for an operation of the management API, the watchers connect again and start nothing. Thus that code does not start the sandbox again through a watcher.
+- A watcher cannot send the start request before a restart operation does. The rule of decision 9 for a restart operation stays necessary for the HTTP requests and for the viewer routes.
+- `policies.md`, section 10.3, gives the limits of this rule. The most important one: the process list of Open WebUI sends HTTP requests each second when its WebSocket closes before the first message (section 4.1.2). That occurs when the sandbox is not ready at the end of the wait.
