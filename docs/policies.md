@@ -172,7 +172,7 @@ Warren deletes a volume in these conditions only:
 - A start made the volume, and the same start did not make the pod. That volume is empty.
 - The volume never got storage, and its storage class or size is different from the policy. That volume is empty. Warren deletes it at the next start, and makes a new volume with the settings of the policy.
 
-The retention time starts when warren finds that the volume has no pod. Warren writes that time to the annotation `warren.h3xcat.github.io/unused-since` of the volume. A start of the sandbox removes the annotation.
+The retention time starts when warren finds that the volume has no pod. Warren writes that time to the annotation `warren.coderpunch.io/unused-since` of the volume. A start of the sandbox removes the annotation.
 
 Warren uses the retention time of the policy file at that moment.
 If you make the retention time shorter, the new time applies immediately to the volumes that are already not in use.
@@ -325,7 +325,7 @@ If you put the policy back, its sandboxes find their volumes again.
 The cleanup operation is a command of the administrator. It deletes all volumes of one policy:
 
 ```bash
-kubectl -n <sandbox namespace> delete pvc -l warren.h3xcat.github.io/template=<policy id>
+kubectl -n <sandbox namespace> delete pvc -l warren.coderpunch.io/template=<policy id>
 ```
 
 To see the volumes first, use `get` in place of `delete` in the command.
@@ -341,8 +341,8 @@ Warren makes these objects in the sandbox namespace. Each object has the label `
 | Secret | The pod name, `-`, and 8 hexadecimal characters | The same as its pod. It has the API key of that pod. |
 | PersistentVolumeClaim | The pod name | Refer to section 7.1. |
 
-The labels `warren.h3xcat.github.io/template`, `/scope`, and `/owner` give the policy, the scope, and a digest of the user ID.
-The annotations `warren.h3xcat.github.io/context-id` and `/created-by` give the context and the user that started the sandbox first.
+The labels `warren.coderpunch.io/template`, `/scope`, and `/owner` give the policy, the scope, and a digest of the user ID.
+The annotations `warren.coderpunch.io/context-id` and `/created-by` give the context and the user that started the sandbox first.
 
 The service account of warren needs these permissions in the sandbox namespace:
 

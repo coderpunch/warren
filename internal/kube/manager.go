@@ -30,10 +30,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/metrics"
-	"github.com/h3xcat/warren/internal/policy"
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/metrics"
+	"github.com/coderpunch/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 const timeFormat = time.RFC3339

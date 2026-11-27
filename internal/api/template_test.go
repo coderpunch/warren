@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/h3xcat/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/policy"
 )
 
 // Run with -race. Requests at the same time read the storage size of one

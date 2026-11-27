@@ -17,7 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	"github.com/h3xcat/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/policy"
 )
 
 // A network policy is only a request to the network plugin of the cluster.

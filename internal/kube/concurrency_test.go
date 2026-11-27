@@ -18,7 +18,7 @@ import (
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/h3xcat/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/policy"
 )
 
 // A policy with a new scope and a retention time must not delete the volumes

@@ -20,13 +20,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/h3xcat/warren/internal/auth"
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/httpx"
-	"github.com/h3xcat/warren/internal/metrics"
-	"github.com/h3xcat/warren/internal/openapi"
-	"github.com/h3xcat/warren/internal/policy"
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/auth"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/httpx"
+	"github.com/coderpunch/warren/internal/metrics"
+	"github.com/coderpunch/warren/internal/openapi"
+	"github.com/coderpunch/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // Policies gives the policy for a template ID.

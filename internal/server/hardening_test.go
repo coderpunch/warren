@@ -13,9 +13,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/proxy"
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/proxy"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // These tests are for defects that an independent review found. Each test

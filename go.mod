@@ -1,4 +1,4 @@
-module github.com/h3xcat/warren
+module github.com/coderpunch/warren
 
 go 1.24.0
 

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/h3xcat/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/policy"
 )
 
 var base = []string{"--api-key-file", "k", "--policy-file", "p", "--sandbox-namespace", "sandboxes"}

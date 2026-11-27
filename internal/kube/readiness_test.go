@@ -17,7 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/h3xcat/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/backend"
 )
 
 // reaps returns the number of reaper runs: each run lists the Secrets one

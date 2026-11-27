@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/h3xcat/warren/internal/api"
-	"github.com/h3xcat/warren/internal/auth"
-	"github.com/h3xcat/warren/internal/httpx"
-	"github.com/h3xcat/warren/internal/metrics"
-	"github.com/h3xcat/warren/internal/proxy"
+	"github.com/coderpunch/warren/internal/api"
+	"github.com/coderpunch/warren/internal/auth"
+	"github.com/coderpunch/warren/internal/httpx"
+	"github.com/coderpunch/warren/internal/metrics"
+	"github.com/coderpunch/warren/internal/proxy"
 )
 
 // Server is the handler for the port that Open WebUI calls. Each request on

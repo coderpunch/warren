@@ -13,14 +13,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/policy"
 )
 
 // Warren keeps its state in these labels and annotations. It has no other
 // database.
 const (
-	prefix = "warren.h3xcat.github.io"
+	prefix = "warren.coderpunch.io"
 
 	LabelManagedBy = "app.kubernetes.io/managed-by"
 	ManagedByValue = "warren"
