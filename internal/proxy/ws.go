@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -54,6 +55,18 @@ var watcherRoutes = regexp.MustCompile(`^/(events|execute|execute/[^/]+/status)$
 // watcher does not begin a start of its sandbox, and it has its own close
 // code for the idle stop (docs/policies.md, section 10.3).
 func watcherRoute(path string) bool { return watcherRoutes.MatchString(path) }
+
+// holdRoutes is the WebSocket route of an agent session. Its only client is
+// the Open WebUI backend, which keeps it open for one chat turn of an agent
+// and sends no HTTP request to the sandbox in that time (docs/protocol.md,
+// section 4.7). No browser can open it, thus a forgotten page cannot keep it
+// open.
+var holdRoutes = regexp.MustCompile(`^/agents/sessions/[^/]+/connect$`)
+
+// holdRoute reports whether a decoded request path is the route of an agent
+// session. The open WebSocket on that route is a use of the sandbox, and the
+// idle stop waits for its end (docs/policies.md, section 10.4).
+func holdRoute(path string) bool { return holdRoutes.MatchString(path) }
 
 func classifyWS(path string) wsAuth {
 	switch {
@@ -259,7 +272,9 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 		<-clientDone
 	}
 
-	lease, err := p.opts.Backend.Acquire(ctx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID, WebSocket: true, NoStart: watcher})
+	lease, err := p.opts.Backend.Acquire(ctx, backend.Request{
+		Ref: rt.ref, UserID: rt.id.UserID, WebSocket: true, NoStart: watcher, Hold: holdRoute(r.URL.Path),
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, backend.ErrCapacity):
@@ -595,16 +610,209 @@ func readFailure(src side, err error) closeInfo {
 	return info
 }
 
+// automaticBytes is the number of bytes at the start of a text message of a
+// client that warren examines to find the kind of the message.
+const automaticBytes = 64
+
+// The parts of the start of an automatic message, in their sequence, and the
+// three types of an automatic message with their quotation marks.
+var (
+	automaticStart = [][]byte{[]byte("{"), []byte(`"type"`), []byte(":")}
+	typePing       = []byte(`"ping"`)
+	typeAck        = []byte(`"ack"`)
+	typeFrameAck   = []byte(`"frameAck"`)
+)
+
+// messageKind is the result of the examination of one message of a client.
+type messageKind int
+
+const (
+	// kindUse is a message that is a use of the sandbox.
+	kindUse messageKind = iota
+	// kindPing and kindFrameAck are automatic messages that are never a use.
+	kindPing
+	kindFrameAck
+	// kindAck is an automatic message that is a use only while the client
+	// shows the terminal: refer to clientUse.
+	kindAck
+)
+
+// jsonSpace is the white space of JSON.
+const jsonSpace = " \t\n\r"
+
+// automaticKind examines the first bytes of a text message of a client. The
+// clients of Open WebUI send three types of message with no action of a
+// person: "ping" on a timer, "ack" after output of the sandbox that the
+// terminal wrote to the screen, and "frameAck" after each frame of a screen
+// stream (docs/protocol.md, section 4.2.4). Such a message is not proof that
+// a person uses the sandbox.
+//
+// A message is automatic if and only if head starts with these parts, in this
+// sequence: optional JSON white space, "{", optional white space, the bytes
+// "type" in quotation marks, optional white space, ":", optional white space,
+// and then exactly "ping", "ack", or "frameAck" in quotation marks. Each
+// other message is a use message.
+//
+// The caller gives a maximum of automaticBytes bytes. The size of the message
+// and all bytes after the type have no effect. That is necessary: a sandbox
+// controls a value that the client puts into an "ack" message, and thus the
+// size of that message (docs/protocol.md, section 4.2.4). A result "use" that
+// is wrong is what a sandbox can use to keep itself, thus the rule must not
+// depend on a value that a sandbox controls. A result "automatic" that is
+// wrong harms only the client that sent the message.
+//
+// The function is not a JSON decoder. A key with an escape sequence, and a
+// "type" member that is not the first member, give a use message.
+func automaticKind(head []byte) messageKind {
+	rest := head
+	for _, part := range automaticStart {
+		rest = bytes.TrimLeft(rest, jsonSpace)
+		if !bytes.HasPrefix(rest, part) {
+			return kindUse
+		}
+		rest = rest[len(part):]
+	}
+	rest = bytes.TrimLeft(rest, jsonSpace)
+	switch {
+	case bytes.HasPrefix(rest, typePing):
+		return kindPing
+	case bytes.HasPrefix(rest, typeAck):
+		return kindAck
+	case bytes.HasPrefix(rest, typeFrameAck):
+		return kindFrameAck
+	}
+	return kindUse
+}
+
+// visibility examines a complete text message of a client. The interactive
+// terminal of Open WebUI sends the message {"type":"activity","active":B}
+// when it becomes visible or hidden: B is true only while the page shows the
+// terminal tab and the document is not hidden (docs/protocol.md, section
+// 4.2.4). The function returns B, and true if the message is such a message:
+// a JSON object whose member "type" is the string "activity" and whose member
+// "active" is true or false. Open Terminal has the same condition
+// (docs/open-terminal-api.md, section 3.4).
+func visibility(msg []byte) (active, ok bool) {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(msg, &object) != nil {
+		return false, false
+	}
+	var typ string
+	if json.Unmarshal(object["type"], &typ) != nil || typ != "activity" {
+		return false, false
+	}
+	switch string(object["active"]) {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	}
+	return false, false
+}
+
+// clientUse finds the messages of the client of one relay that are a use of
+// the sandbox, and tells the lease about each one (backend.Lease.Active). An
+// open WebSocket is not a use of the sandbox: only these messages are
+// (docs/policies.md, section 10.4). The rules:
+//
+//   - A binary message is always a use message.
+//   - A text message is a use message unless it is automatic: refer to
+//     automaticKind.
+//   - An automatic "ping" or "frameAck" message is never a use.
+//   - An automatic "ack" message is a use only while visible is true. A
+//     terminal sends it after it wrote output to the screen. Thus output that
+//     a visible terminal shows is a use, and output in a hidden terminal is
+//     not.
+//   - A message of the sandbox is never a use. The copy loop of that
+//     direction has no clientUse.
+//
+// Only the copy loop of the client direction uses a clientUse, thus it needs
+// no lock. Warren relays each message with no change: the rules decide only
+// the call of Active.
+type clientUse struct {
+	lease backend.Lease
+	// visible is the last value that the client reported with a message of
+	// the type "activity". It is false until the first such message. No
+	// message of the sandbox can change it.
+	visible bool
+
+	// The data of the message in progress. head has the first bytes of a text
+	// message: one more than automaticBytes, to tell a message of exactly
+	// that size from a longer one.
+	head    [automaticBytes + 1]byte
+	size    int
+	decided bool
+}
+
+// start begins a new message of the client.
+func (u *clientUse) start(messageType int) {
+	u.size, u.decided = 0, false
+	if messageType != websocket.TextMessage {
+		// Terminal input and the data of a remote desktop are binary.
+		u.decided = true
+		u.lease.Active()
+	}
+}
+
+// data gets each part of the message, in sequence.
+func (u *clientUse) data(part []byte) {
+	if u.decided {
+		return
+	}
+	u.size += copy(u.head[u.size:], part)
+	if u.size > automaticBytes {
+		// The message is longer than the bytes that warren examines.
+		u.decide(false)
+	}
+}
+
+// end completes the message.
+func (u *clientUse) end() {
+	if !u.decided {
+		u.decide(true)
+	}
+}
+
+// decide makes the decision for a text message. complete is true if head has
+// the full message.
+func (u *clientUse) decide(complete bool) {
+	u.decided = true
+	head := u.head[:min(u.size, automaticBytes)]
+	switch automaticKind(head) {
+	case kindPing, kindFrameAck:
+		return
+	case kindAck:
+		if u.visible {
+			u.lease.Active()
+		}
+		return
+	}
+	if complete {
+		if active, ok := visibility(head); ok {
+			u.visible = active
+		}
+	}
+	u.lease.Active()
+}
+
 // copyMessages copies each message from src to dst as a stream. It does not
 // keep a message in memory, and it does not group messages: Open Terminal
 // closes a terminal when too much input waits
 // (docs/open-terminal-api.md, section 3.4). If reader is not nil, it is a
 // message of src that the caller started to read.
+//
+// In the direction from the client, it also tells the lease about each
+// message that is a use of the sandbox: refer to clientUse. The cost for one
+// message is a copy of its first bytes and one call of Active.
 func (s *session) copyMessages(dst, src *websocket.Conn, fromClient bool, mt int, reader io.Reader) closeInfo {
 	srcSide, dstSide := otherSide(fromClient)
 	writeFailure := closeInfo{side: dstSide, code: websocket.CloseAbnormalClosure, writeFailed: true}
 	timeout := s.proxy.opts.WriteTimeout
 	buf := make([]byte, 32<<10)
+	var use *clientUse
+	if fromClient {
+		use = &clientUse{lease: s.lease}
+	}
 	for {
 		if reader == nil {
 			var err error
@@ -627,9 +835,15 @@ func (s *session) copyMessages(dst, src *websocket.Conn, fromClient bool, mt int
 		if err != nil {
 			return writeFailure
 		}
+		if use != nil {
+			use.start(mt)
+		}
 		for {
 			n, rerr := reader.Read(buf)
 			if n > 0 {
+				if use != nil {
+					use.data(buf[:n])
+				}
 				_ = dst.SetWriteDeadline(time.Now().Add(timeout))
 				if _, werr := writer.Write(buf[:n]); werr != nil {
 					return writeFailure
@@ -643,6 +857,9 @@ func (s *session) copyMessages(dst, src *websocket.Conn, fromClient bool, mt int
 				// and the part would arrive as a complete message.
 				return readFailure(srcSide, rerr)
 			}
+		}
+		if use != nil {
+			use.end()
 		}
 		if err := writer.Close(); err != nil {
 			return writeFailure

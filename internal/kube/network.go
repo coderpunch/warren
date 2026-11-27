@@ -556,7 +556,7 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 					"template", pod.Labels[LabelTemplate], "restart", removed)
 			}
 			if removed {
-				_ = m.deletePod(ctx, pod, backend.StopNetworkChanged, false)
+				_ = m.deletePod(ctx, pod, backend.StopNetworkChanged, notIdle)
 			}
 		}
 	}

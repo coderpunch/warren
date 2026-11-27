@@ -195,10 +195,12 @@ These requests come one time for an event, with no action of the user in the ter
 - `GET /api/config`, when the selected terminal or the chat changes (`src/lib/components/chat/Tabs.svelte:1565-1573`, `:1602-1625`).
 - `GET /files/cwd`, then `GET /files/list` and a maximum of 8 `GET /files/read` requests for the list of recent directories, when the directory menu of the chat input loads (`src/lib/components/chat/MessageInput/WorkingDirectoryMenu.svelte:58-99`, `src/lib/apis/terminal/recentFolders.ts:16-57`).
 - `GET /files/cwd` and `GET /agents` from the Open WebUI backend (path D), for each load of the model list while a terminal is selected (`main.py:933-941`, `utils/agents/discovery.py:36-48`).
+- `GET /files/list` for the directory that the file browser shows, and one more for each open directory below it, after each `fs:ready` and each `fs:change` message on the `/events` WebSocket (`src/lib/components/chat/FileNav.svelte:1275-1281`, `:1314-1319`, `src/lib/apis/terminal/events.ts:56`, `src/lib/apis/terminal/index.ts:310-315`). The file browser does this only while it shows no file. It does not examine the visibility of the document.
+- `GET /git/status` from the git bar, after each of the same messages, only while the document is visible (`src/lib/components/chat/Tabs/GitBar.svelte:195-199`, `:296-303`).
 
 Results for warren:
 
-1. Warren has no special rule for the requests of the last list. Each one is a use of the sandbox, and it starts a stopped sandbox. The browser sends some of them again after an event of Open WebUI, with no person (section 4.1.3), and before a WebSocket connects again (section 4.2.3).
+1. Warren has no special rule for the requests of the last list. Each one is a use of the sandbox, and it starts a stopped sandbox. The browser sends some of them again after an event of Open WebUI, with no person (section 4.1.3), and before a WebSocket connects again (section 4.2.3). A program in the sandbox causes the last two when it changes a file (section 4.2.4).
 2. The system information is different: a view that stays open sends requests with no end, and the data are not proof that a person uses the sandbox. Decision 8 of section 9.5 is the rule of warren for it.
 3. Warren has no rule for the timer of the Browser tab. Each such request is a use of the sandbox, and it starts a stopped sandbox. A forgotten Browser tab thus keeps its sandbox with no end.
 4. A new sandbox does not know the browser session of the previous pod, thus the reply to the timer is then status 404 (`open-terminal-api.md`, section 3.7). The browser ignores the reply, and the timer continues.
@@ -360,6 +362,58 @@ Results for warren:
 6. A WebSocket upgrade on each other route is a usual request: it starts a stopped sandbox.
 7. The wait of rule 5 must be long. When the page makes the file browser, the HTTP requests of the list above start the sandbox at the same time. The WebSocket of the process list must stay open until the sandbox is ready: a close before the first message starts the HTTP requests of section 4.1.2 each second, with no end, and each one is a usual request.
 
+#### 4.2.4 Messages that a client sends with no action of a person
+
+After the first message, the clients send these messages on a WebSocket:
+
+| Client | Message | When | Reference |
+|---|---|---|---|
+| Interactive terminal | Text `{"type":"ping"}` | Each 25 seconds while the WebSocket is open. No other client in the browser has such a timer. | `src/lib/components/chat/XTerminal.svelte:128-130` |
+| Interactive terminal | Text `{"type":"activity","active":B}` | After each connect, and when `B` changes. `B` is true only while the page shows the terminal tab and the document is not hidden. | `XTerminal.svelte:61-68`, `:74`, `:124`, `:241`, `:244`, `src/lib/components/chat/Tabs.svelte:196`, `:2184` |
+| Interactive terminal | Text `{"type":"resize","cols":N,"rows":N}` | After each connect, and when the size of the terminal changes while the tab is active. | `XTerminal.svelte:127`, `:284-287` |
+| Interactive terminal | Text `{"type":"ack","cursor":N}` | After the terminal wrote a group of output to the screen, when the terminal server confirmed flow control. The client always asks for flow control. | `XTerminal.svelte:132`, `:155-158`, `:180-188` |
+| Interactive terminal | Text `{"type":"chat","chat_id":ID}` | One time, when a terminal gets its saved chat. | `XTerminal.svelte:44-57`, `src/lib/apis/terminal/socket.ts:3-36` |
+| Interactive terminal | Binary | The data that the terminal library gives as input: the keys of the person, and a paste. | `XTerminal.svelte:277-283` |
+| File browser, git bar, and port list | Text `{"type":"subscribe", ...}` | One time after each connect. | `src/lib/apis/terminal/events.ts:15-17` |
+| Process list and process output | None | | `src/lib/apis/terminal/socket.ts:82-94` |
+| Desktop, transport `frames` | Text `{"type":"frameAck","window":3}` | After each picture of the screen that the client drew. | `src/lib/components/chat/Tabs/Desktop.svelte:81-93` |
+| Desktop, transport `vnc` | Binary | The VNC library of the browser uses the WebSocket. | `Tabs/Desktop.svelte:100-105` |
+| Desktop audio | None | | `src/lib/components/chat/Tabs/DesktopAudio.svelte:86-94` |
+| Browser view, `stream` | Text messages of the types `frames`, `quality`, `visibility`, and `viewport` | After each connect. | `src/lib/components/chat/Tabs/ChromeBrowser.svelte:104-106`, `:200-207` |
+| Browser view, `stream` | Text `{"type":"frameAck","window":3}` | After each binary message of the terminal server. | `Tabs/ChromeBrowser.svelte:226-230` |
+| Agent session (the Open WebUI backend) | Text `{"type": "ack", "sequence": N}` | After each output message of the agent. | `utils/agents/transport.py:109-115` |
+
+Facts about these messages:
+
+- Open WebUI sends each text or binary message of the browser that is not empty to the terminal server with no change. It drops an empty message (`routers/terminals.py:700-710`).
+- Open WebUI relays only text and binary messages from the terminal server (`routers/terminals.py:715-727`). It opens the WebSocket to the terminal server with no heartbeat (`routers/terminals.py:674-678`). Thus no ping frame and no pong frame of the WebSocket protocol goes through Open WebUI on these routes. The agent WebSocket of path G is different (section 4.7).
+- In each object that a client makes, `type` is the first member. The browser makes the text with no white space. The Open WebUI backend makes it with one space after each `:` and each `,` (`utils/agents/transport.py:65-66`).
+- The interactive terminal reports `active` as false on a tab that the page does not show, and in a hidden document, for example a browser tab in the background (`XTerminal.svelte:63`).
+- The `ack` message comes from output of the sandbox, and not from a person. The terminal sends it only after it wrote the output to its screen (`XTerminal.svelte:180-188`). No person read the source of the terminal library to find out if that occurs in a hidden document.
+- The terminal copies the value `end` of an `output` message of the terminal server into `cursor` with no check, and it sends that value in the `ack` message (`XTerminal.svelte:160`, `:181`, `:187`). Thus a terminal server controls the value, and with it the size, of the `ack` message.
+- The desktop does not close its WebSocket when the document becomes hidden: its condition is the visible tab of the page only (`src/lib/components/chat/Tabs.svelte:196`, `:2134`, `Tabs/Desktop.svelte:161-164`).
+- Each 10 seconds, Open WebUI makes sure that the caller continues to have access (section 4.2.1, step 12). That check sends a request to the orchestrator only (section 4.6), and no message on the WebSocket.
+
+A terminal server can make a client send requests and messages. No person is necessary:
+
+| What the terminal server does | What the client does | Reference |
+|---|---|---|
+| It closes a WebSocket with a code after which the client connects again (section 4.2.3). | The client connects again. The interactive terminal first sends `GET /api/terminals/{session_id}`, and then the `activity` and `resize` messages on the new WebSocket. The desktop first sends `GET /desktop`. | `XTerminal.svelte:109-127`, `:206`, `:221-223`, `Tabs/Desktop.svelte:70-74`, `:131-137` |
+| It closes the `/events` WebSocket. | The client connects again after each code that is not from 4000 to 4999, and sends `subscribe`. The delay goes back to 1 second after each message that the client got, thus the terminal server controls the times. | `events.ts:15-17`, `:22`, `:29-35` |
+| It sends `fs:ready` or `fs:change` on `/events`. A change of a file in the directory that the page watches causes `fs:change` (`open-terminal-api.md`, section 3.12). | The file browser sends `GET /files/list` requests, and the git bar sends `GET /git/status` (section 4.1.2). | Section 4.1.2 |
+| It sends output on the terminal WebSocket. | The interactive terminal sends `ack`. | `XTerminal.svelte:180-188` |
+| It sends output with a query for the terminal, for example for the position of the cursor. | Inference: the terminal library answers through its input event, and the client sends the answer as a binary message. Open Terminal has a rule for input that "the terminal itself" sends (`open-terminal-api.md`, section 3.4). No person read the source of the terminal library for this document. | `XTerminal.svelte:277-279` |
+| It sends a picture of the screen (transport `frames`), or data of the VNC protocol. | The client sends `frameAck`. Inference for the VNC protocol: the client answers with binary data. No person read the VNC library for this document. | `Tabs/Desktop.svelte:81-105` |
+| The agent process sends a request to its client. | The Open WebUI backend answers with an `input` message (section 4.7). | Section 4.7 |
+
+Results for warren:
+
+1. An open WebSocket is not proof that a person uses the sandbox, and a message on it is not always such proof. Decision 11 of section 9.5 is the rule of warren for the idle time.
+2. The `ping` message, the `frameAck` message, and the `ack` message are automatic. Warren finds them from the first bytes of the message, because `type` is the first member in each message of a client.
+3. The rule for an automatic message must not use the size of the message: a terminal server controls the size of the `ack` message.
+4. The `activity` message is the only signal that tells a terminal that a person looks at from a forgotten terminal. Warren reads it, and it counts an `ack` message as a use only while the terminal is visible.
+5. Warren cannot prevent that a sandbox with a connected client keeps itself in operation: the table above gives the methods. The idle time is thus a rule for resources, and not a protection against a hostile sandbox.
+
 ### 4.3 Path C: tool calls from the Open WebUI backend
 
 When a model uses the terminal tools, the Open WebUI backend calls the terminal server (`utils/tools.py:1588-1733`).
@@ -488,6 +542,25 @@ The Open WebUI backend starts coding agents on the terminal server and connects 
 The headers are the headers of path D (`utils/agents/transport.py:34-38`). On this path the WebSocket upgrade request has the `Authorization` header.
 The first WebSocket message has `type: "auth"`, `cursor`, and `token`. The `token` value is the bearer value of the `Authorization` header (`utils/agents/transport.py:95-96`).
 Thus in `session` mode, the credential of the caller goes to the terminal server on this WebSocket.
+
+Facts about the WebSocket of an agent session:
+
+- Its only client is the Open WebUI backend. The WebSocket routes of Open WebUI for the browser are the fixed list of section 4.2, and no route of that list goes to `agents/`.
+- The backend opens the WebSocket at the start of one chat turn of an agent, and it closes the WebSocket at the end of that turn (`utils/agents/runner.py:161-180`, `utils/agents/transport.py:59-63`).
+- The backend sends an `input` message for the prompt (`utils/agents/transport.py:141-152`). After the first message of each new connection, it sends again each `input` message that the terminal server did not confirm (`utils/agents/transport.py:96-98`).
+- After each output message of the agent, the backend sends an `ack` message (`utils/agents/transport.py:109-115`).
+- When the agent process sends a request to its client, the backend answers with an `input` message. Examples are a request for the permission to use a tool, and a request with a method that the backend does not know (`utils/agents/acp.py:106-124`). In the default mode of a chat, the backend gives the permission with no person (`utils/agents/output.py:154-168`, `utils/tool_permissions.py:116-119`, `utils/agents/runner.py:157`).
+- The backend sends a ping frame of the WebSocket protocol each 20 seconds (`utils/agents/transport.py:91`).
+- In the turn, the backend sends no HTTP request to the terminal server. Its HTTP requests are the start and the stop of the session (`utils/agents/transport.py:60`, `:184`).
+- The backend has no time limit for a turn (`utils/agents/acp.py:238`).
+- The backend does not read the close code. After each close it connects again after 1 second, until it got no message for more than 60 seconds (`utils/agents/transport.py:100-126`). The turn then ends with the error text "Agent environment disconnected. Reconnect before continuing this chat."
+- At the end of the turn, also after a failure, the backend sends `DELETE {url}/agents/sessions/{id}` (`utils/agents/transport.py:182-184`).
+
+Results for warren:
+
+1. No message of the backend shows that an agent works: in a long step of the agent, the backend sends only `ack` messages, or nothing. An idle rule that counts only use messages would stop the sandbox in the middle of a turn.
+2. A new pod does not know the agent session of the previous pod (`open-terminal-api.md`, section 3.9). Thus a stop in a turn loses the work of the agent, and the backend then starts a new, empty sandbox with its next connection or with its `DELETE` request.
+3. No forgotten page of a browser can keep this WebSocket open. Thus warren uses the open WebSocket of an agent session as a use of the sandbox, as an HTTP request in progress (decision 11 of section 9.5).
 
 ## 5. Authentication modes
 
@@ -713,7 +786,7 @@ These are conclusions from the facts above. They are inputs to the design. They 
 
 ### 9.5 Decisions
 
-The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 7 to 10 are from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
+The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 7 to 11 are from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
 
 | No. | Subject | Decision |
 |---|---|---|
@@ -727,6 +800,7 @@ The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 
 | 8 | System information | Warren sends `GET /system/info` only to a sandbox that operates. For a stopped sandbox, the reply is status 409, and the sandbox does not start. The request is not activity: it does not change the idle time of the sandbox. The note below the table gives the details. |
 | 9 | WebSockets of a sandbox that stops | When warren stops a sandbox, it closes each open WebSocket of that sandbox. For a stop, restart, reset, or delete operation of the management API, the client gets the close code 1012. The note below the table gives the codes for the other reasons, and the details. |
 | 10 | WebSockets that only watch a sandbox | A WebSocket upgrade on `/events`, `/execute`, or `/execute/{process_id}/status` does not start a sandbox. It waits for a start that a different request or operation began. These routes have their own close code for the idle time. The note below the table gives the details. |
+| 11 | Use of a sandbox through a WebSocket | An open WebSocket is not a use of the sandbox. A message of the client is a use, unless it is a keepalive `ping` or a different automatic message. A message of the sandbox is not a use. Thus warren stops a sandbox for its idle time also while WebSockets are open. The WebSocket of an agent session is the exception. The note below the table gives the details. |
 
 Because the identity is in headers, warren must have these protections:
 
@@ -768,7 +842,7 @@ Note for decision 9: the owner of the project asked for the close code 1012 at a
 - Open WebUI does not send the reason text to the browser (section 4.2.1). The text is for other clients.
 - The audit record of the WebSocket has the code and the stop reason. The record for a stop of the warren process has the code 1012.
 - An HTTP request in progress gets no signal. A WebSocket that has no connection to its pod at the time of the stop gets the usual code for a connection that fails.
-- In this version, an open WebSocket is a use of the sandbox. Thus warren does not stop a sandbox with an open WebSocket for its idle time, and the code for the idle time does not occur. The code for the idle time is the only code that is different for the two classes of routes (decision 10).
+- An open WebSocket is not a use of the sandbox (decision 11). Thus warren stops a sandbox for its idle time also while WebSockets are open, and they get the code for the idle time. That code is the only code that is different for the two classes of routes (decision 10).
 - The close code does not make a stop hold. After the code 1012, the clients connect again (section 4.2.3), and Open WebUI sends requests by itself after each instance operation (section 4.1.3). Each HTTP request, and each new WebSocket on a viewer route, starts the sandbox again. A new WebSocket on a watcher route does not (decision 10).
 - While a restart operation is in progress, only the operation starts the sandbox. A request in that time waits for the start of the operation. Without this rule, a client that connects again can send the start request before the operation. The sandbox then goes on the account of the user of that client, or that user gets the error of the sandbox limit. A request for the system information also waits in that time (decision 8).
 
@@ -783,3 +857,16 @@ Note for decision 10: the owner of the project did not ask for this rule. It is 
 - The close codes of the two classes are different only for the idle time: 4004 on a viewer route, and 1012 on a watcher route (`policies.md`, section 10.2). After the code 1012 for an operation of the management API, the watchers connect again and start nothing. Thus that code does not start the sandbox again through a watcher.
 - A watcher cannot send the start request before a restart operation does. The rule of decision 9 for a restart operation stays necessary for the HTTP requests and for the viewer routes.
 - `policies.md`, section 10.3, gives the limits of this rule. The most important one: the process list of Open WebUI sends HTTP requests each second when its WebSocket closes before the first message (section 4.1.2). That occurs when the sandbox is not ready at the end of the wait.
+
+Note for decision 11: the owner of the project asked that warren counts the messages on a WebSocket as activity, and not the open connection, and that it ignores the keepalive pings of the client. If not, a page that a person forgot keeps its sandbox with no end. Before this decision, each open WebSocket was a use of the sandbox. The details are decisions of warren, and `policies.md`, section 10.4, gives them for an administrator:
+
+- The owner named no direction. Only a message from the client to the sandbox can be a use. A message of the sandbox is never a use: the output of a program is not proof that a person uses the sandbox. With the two directions, a forgotten page with a program that prints, or with the audio of a desktop, keeps its sandbox.
+- This rule is not a security property. While a client has a connection, a sandbox can make that client send requests and messages (section 4.2.4). Warren does not try to prevent that.
+- The owner named only the keepalive pings. Warren also does not count the `frameAck` message, and it counts the `ack` message only for a visible terminal: the client sends them after data of the sandbox, with no person (section 4.2.4).
+- A text message of a client is automatic if and only if its first bytes are, in this sequence: optional JSON white space, `{`, optional white space, `"type"`, optional white space, `:`, optional white space, and then exactly `"ping"`, `"ack"`, or `"frameAck"`. Warren examines a maximum of the first 64 bytes. The size of the message has no effect, because a sandbox controls the size of the `ack` message of the terminal (section 4.2.4). Each other text message, and each binary message, is a use message.
+- Warren reads the `activity` message of the interactive terminal: a text message of a maximum of 64 bytes, a JSON object with the type `activity` and a boolean `active`. An `ack` message is a use only while the last such message of the WebSocket had the value true. Thus output in a visible terminal keeps the sandbox, and output in a terminal that nobody can see does not.
+- The start of a WebSocket that gets a connection to the sandbox is a use, as each request. The end of a WebSocket is not a use. The frames of the WebSocket protocol (ping, pong, close) are not a use.
+- A WebSocket upgrade whose decoded path is `/agents/sessions/{id}/connect`, with one path segment for the ID, is different: the open WebSocket is a use, as an HTTP request in progress, and its end is a use. Section 4.7 gives the cause. It gets the stop signal of decision 9 for each other stop reason.
+- Warren records the time of a use message a maximum of one time in 10 seconds for each WebSocket, and only in memory. Thus a stream of messages does not cost one lock for each message, and no message causes a request to Kubernetes.
+- At the idle stop, a WebSocket on a viewer route gets the close code 4004, and a WebSocket on a watcher route gets the code 1012 (decisions 9 and 10). After the code 4004, the clients of Open WebUI stop: the terminal tab shows "Session no longer available" (section 4.2.3). Open WebUI does not send the reason text, thus the page does not show that the idle time was the cause.
+- Warren does not examine the data of the VNC protocol. On the desktop route and on the browser view route with that transport, each message of the client is binary, and each one is a use message. `policies.md`, section 10.4, gives this limit and the other limits.

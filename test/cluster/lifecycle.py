@@ -1,6 +1,6 @@
 # Lifecycle checks for a warren deployment on the kind cluster of setup.sh.
 # Start this script with run.sh. The file README.md gives the procedure.
-import asyncio, json, subprocess, sys, time, urllib.request, urllib.error
+import asyncio, json, subprocess, sys, threading, time, urllib.request, urllib.error
 import websockets
 
 NODE = subprocess.run(["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", "warren-dev-control-plane"], capture_output=True, text=True).stdout.strip()
@@ -160,6 +160,40 @@ for _ in range(20):
     time.sleep(2)
 check("after a restart of warren, the sandbox of alice works with the same pod", ok and "alice-private-data" in out and {x["metadata"]["name"]: x["metadata"]["uid"] for x in pods()} == uid_before, out)
 
+# ---- an open WebSocket with no use does not keep a sandbox ----
+# An open WebSocket is not a use of its sandbox: only the messages of its client are, and not the keepalive message.
+# This terminal WebSocket of alice stays open in a second thread, until the idle check at the end of this script.
+# Its client sends only the message that the terminal of Open WebUI sends on a timer. Warren must stop the sandbox
+# after its idle time, and it must close the WebSocket with the code 4004. The checks below do not use this sandbox.
+idle_ws = {"open": False, "pings": 0, "code": None, "reason": None, "error": None}
+async def ws_idle():
+    hdr = {"X-User-Id": "alice", "X-Terminal-Template-Id": "personal", "X-Session-Id": "chat-1"}
+    s, _, b = call("POST", "/api/terminals")
+    sid = json.loads(b)["id"]
+    async with websockets.connect(f"ws://{NODE}:30080/api/terminals/{sid}?user_id=alice", additional_headers=hdr, proxy=None, close_timeout=2) as c:
+        await c.send(json.dumps({"type": "auth", "token": KEY, "chat_id": "chat-1"}))
+        idle_ws["open"] = True
+        end = time.time() + 420
+        try:
+            while time.time() < end:
+                await c.send('{"type":"ping"}'); idle_ws["pings"] += 1
+                until = time.time() + 20
+                # Read and discard the output of the shell. A message of the sandbox is not a use.
+                while time.time() < until:
+                    try: await asyncio.wait_for(c.recv(), max(0.1, until - time.time()))
+                    except asyncio.TimeoutError: pass
+        except websockets.exceptions.ConnectionClosed as e:
+            if e.rcvd is not None: idle_ws["code"], idle_ws["reason"] = e.rcvd.code, e.rcvd.reason
+def ws_idle_thread():
+    try: asyncio.run(ws_idle())
+    except Exception as e: idle_ws["error"] = repr(e)
+idle_thread = threading.Thread(target=ws_idle_thread, daemon=True)
+idle_thread.start()
+for _ in range(150):
+    if idle_ws["open"] or idle_ws["error"]: break
+    time.sleep(0.1)
+check("terminal WebSocket of alice is open, with only keepalive messages", idle_ws["open"], idle_ws)
+
 # ---- stop and start by the API ----
 # A stop operation closes the open WebSockets of the sandbox with the code 1012 and a text of warren.
 # The pod gets its stop signal only after that, thus the code and the text do not come from the pod.
@@ -228,12 +262,15 @@ s, _, b = call("GET", "/metrics", user=None)
 check("metrics are not on the port for Open WebUI", s != 200 or b"warren_sandboxes" not in b, s)
 
 # ---- idle reaper (idle timeout 90 s) ----
+# The terminal WebSocket of alice is open in this time, and it sends its keepalive message each 20 seconds.
 print("INFO wait for the idle reaper (about 2.5 minutes)", flush=True)
 deadline = time.time() + 240
 while time.time() < deadline and len([x for x in pods() if "deletionTimestamp" not in x["metadata"]]) > 0:
     time.sleep(10)
 left = [x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] for x in pods() if "deletionTimestamp" not in x["metadata"]]
 check("idle sandboxes stop", left == [], left)
+idle_thread.join(30)
+check("the idle stop closes a terminal WebSocket that sent only keepalive messages with the code 4004", idle_ws["code"] == 4004 and idle_ws["reason"] == "The terminal stopped after its idle time" and idle_ws["pings"] >= 4, idle_ws)
 time.sleep(5)
 secs = json.loads(kubectl("-n", "warren-sandboxes", "get", "secrets", "-o", "json"))["items"]
 check("Secrets are gone with their pods", len(secs) == 0, [x["metadata"]["name"] for x in secs])

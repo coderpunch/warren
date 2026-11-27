@@ -84,7 +84,7 @@ The warren word for an instance is "sandbox".
 | On Kubernetes, the proxy starts after the pod is ready. | v1 | A readiness gate on the Open Terminal health route. |
 | A slow start shows in Open WebUI as a timeout message. The remedy is a larger Open WebUI timeout (default 60 seconds). | v1 | Warren holds the first request until the pod is ready or a deadline occurs. Open WebUI has shorter limits for some calls. Refer to `protocol.md`, section 9.4. |
 | Idle timeout. The orchestrator stops the instance and keeps the files. The environment default is "off". The Helm chart default is 30 minutes. | v1 | Warren has an idle timeout that an administrator can set. The default is "on". |
-| The activity time of an instance is the time of the last proxied request. | v1 | Warren also counts an open WebSocket as activity. The documentation does not define this case. A request for the system information is not activity in warren (next row). |
+| The activity time of an instance is the time of the last proxied request. | v1 | In warren, an HTTP request is activity from its start to its end. An open WebSocket is not activity. The start of a WebSocket is activity, and each message of its client that is not an automatic message: the keepalive `ping` of the terminal, the `frameAck` of a screen view, and the `ack` of a terminal that is not visible. A message of the instance is not activity. Thus a page that a person forgot does not keep an instance. The WebSocket of an agent session is the exception: it is activity while it is open. At the idle stop, warren closes the open WebSockets with the close code 4004, or 1012 on a route on which the browser only watches the instance. The documentation does not define these cases. Refer to `policies.md`, section 10.4, also for the limits. A request for the system information is not activity in warren (next row). |
 | The user interface offers the system information only for an instance that runs. The view reads the data again each 5 seconds while it is open. | v1 | Warren sends the request for the system information only to a sandbox that operates. For a stopped sandbox, the reply is status 409, and the sandbox does not start. The request is not activity. Refer to `policies.md`, section 10.1. The documentation does not say what the orchestrator does with this request. A source comment of Open WebUI says that the orchestrator does not start an instance for it (`protocol.md`, section 4.1.1). |
 | Idle timeout for each template. | v1 | Field in a policy. A change applies also to the pods that operate. |
 | Maximum lifetime, for the orchestrator and for each template. The orchestrator stops the instance, also during use. | Later | |
@@ -214,7 +214,7 @@ Warren v1 has the same minimum: Open WebUI 0.13.4.
 
 Warren must make its own decision for each of these items. No public source gives the behaviour of the orchestrator.
 
-1. If an open WebSocket with no messages counts as activity for the idle timeout. Warren proposal: it counts.
+1. If an open WebSocket with no messages counts as activity for the idle timeout, which messages on a WebSocket are activity, and what an open WebSocket gets at the idle stop. In warren, the open WebSocket does not count. The messages of the client count, without the automatic messages (section 7).
 2. The maximum wait and the error reply for a request that arrives while a pod starts.
 3. The health route of the orchestrator.
 4. The format of the instance ID. The context ID has a defined form (section 4).

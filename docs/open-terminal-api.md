@@ -177,6 +177,22 @@ Facts about the terminal WebSocket:
 - A shell continues to operate when no viewer is connected (`main.py:2523-2527`).
 - The server closes with code 4000 when more than 64 input messages or more than 1 MiB of input wait in its queue (`main.py:2652`, `main.py:2675-2677`).
 
+The messages of the client on the terminal WebSocket, after the first message:
+
+- A binary message is input for the shell (`main.py:2668-2680`).
+- The server decodes each text message as JSON, and it reads four types: `ack`, `resize`, `activity`, and `chat` (`main.py:2681-2709`). It ignores each other text message, and each text message that is not JSON (`main.py:2710-2711`).
+- Thus the server ignores the message `{"type":"ping"}` that the client of Open WebUI sends on a timer (`protocol.md`, section 4.2.4). It sends no reply.
+- `activity` has the boolean value `active`: the client tells the server if it shows the terminal. The server ignores an `activity` message whose value is not a boolean (`main.py:2698-2699`). It keeps the value for each client, to find the shell that the user used last (`main.py:2398-2402`, `:2509-2511`).
+- `ack` has the whole number `cursor`: the client confirms the output that it wrote to the screen. The server reads it only with flow control. A `cursor` that is not a whole number in the range of the output closes the WebSocket with the code 4000 (`main.py:2684-2692`).
+
+The messages of the server on the terminal WebSocket:
+
+- Flow control is on when the first message has `resume` and `flow_control` (`main.py:2580`). The server then sends `{"type":"flow_control"}` one time (`main.py:2602-2603`), and it stops the output for a client that did not confirm 256 KiB (`main.py:2605-2607`).
+- With `resume`, the server sends a text message of the type `output` before each binary message of output. It has the whole numbers `start` and `end` (`main.py:2632-2638`).
+- With `process_info`, the server sends a text message of the type `process` when the program in the foreground of the shell changes (`main.py:2609-2620`).
+- The server sends a message only for one of these events. It sends no message on a timer.
+- The server has a pattern for binary input that the terminal program of the client sends by itself, and that a person did not type: reports of the cursor position and of the status, device attributes, and replies with colours (`main.py:2379-2384`, `:2668-2672`). Thus the output of a program in the shell can cause input messages of a client.
+
 ### 3.5 Notebooks (4 routes)
 
 | Method | Path | Auth | Tool | Function | Reference |
@@ -231,6 +247,21 @@ The browser sessions:
 | WebSocket | `/desktop/stream` | First message | No | Display stream (binary) | `open_terminal/desktop/router.py:640-665` |
 | WebSocket | `/desktop/audio` | First message | No | Audio stream (binary) | `open_terminal/desktop/router.py:640-665` |
 
+Facts about the two WebSockets:
+
+- The desktop in a container is the "virtual" desktop. Its transport is `vnc`, unless the desktop environment is GNOME with no X session (`open_terminal/desktop/router.py:56-61`, `:108-109`, `:431-436`). The server starts the program `Xtigervnc` for it (`open_terminal/desktop/router.py:243-246`).
+- With the transport `vnc`, the `/desktop/stream` WebSocket is a relay of the bytes of the VNC protocol in the two directions. The server reads only binary messages of the client (`open_terminal/desktop/router.py:365-376`).
+- The transport `frames` is for a desktop of the host, and for a GNOME desktop on Wayland with no `x11vnc` program (`open_terminal/desktop/router.py:422-434`, `open_terminal/desktop/wayland.py:34`). On that transport, the client sends JSON text messages, also `frameAck` after each picture.
+- Only the full image has the desktop programs (`Dockerfile:64-67`). Without them, the server has no desktop (`open_terminal/desktop/router.py:93-105`).
+- `OPEN_TERMINAL_ENABLE_DESKTOP=false` turns the desktop routes off (`env.py:172-175`).
+- The `/desktop/audio` WebSocket sends audio data without a stop while it is open. The server reads and discards each message of the client (`open_terminal/desktop/audio.py:93-111`).
+- The Chrome view has the same two transports: `vnc` when Chrome has a display, and `frames` if not (`open_terminal/browser/chrome.py:629`). The `stream` and `vnc` WebSockets of the browser view are in `open_terminal/browser/router.py:491-510`.
+
+Results for warren:
+
+1. In each image that has a desktop, a client of the desktop sends only binary data of the VNC protocol. Warren cannot tell the input of a person from the other data of that protocol without a decoder for it. Warren has no such decoder: each binary message is a use of the sandbox (`policies.md`, section 10.4).
+2. The data of the `/desktop/audio` WebSocket come from the sandbox with no end. They are not a use of the sandbox.
+
 ### 3.9 Agents (5 routes)
 
 | Method | Path | Auth | Tool | Function | Reference |
@@ -240,6 +271,12 @@ The browser sessions:
 | GET | `/agents/sessions/{sid}` | Bearer | No | Session state | `open_terminal/agents/router.py:101-105` |
 | DELETE | `/agents/sessions/{sid}` | Bearer | No | Stop the agent | `open_terminal/agents/router.py:108-113` |
 | WebSocket | `/agents/sessions/{sid}/connect` | First message | No | JSON line relay to the agent. One message can have 16 MiB. | `open_terminal/agents/router.py:116-202` |
+
+Facts about the agent WebSocket:
+
+- The server keeps the agent sessions in the memory of its process (`open_terminal/agents/sessions.py:111`, `open_terminal/agents/router.py:25-32`). Thus a new pod knows no session of the previous pod.
+- After the first message, the client can send three types of JSON text message: `ack`, `input`, and `eof`. Each other type, also `ping`, closes the WebSocket with the code 4400 (`open_terminal/agents/router.py:136-164`, `:193-195`).
+- The server sends a message of the type `output` for each output of the agent process, and a message of the type `ack` for each `input` message (`open_terminal/agents/router.py:160`, `:166-187`). It sends no message on a timer.
 
 ### 3.10 Skills (2 routes)
 
@@ -277,6 +314,8 @@ The `fetch`, `pull`, and `push` actions use the network and can take a long time
 After authentication, the client must send a `subscribe` message in a maximum of 10 seconds (`open_terminal/utils/events.py:142-161`).
 After that message, the server waits for more `subscribe` messages with no time limit (`open_terminal/utils/events.py:142`). Each message of the client that is not a `subscribe` message closes the WebSocket with the code 4000 (`open_terminal/utils/events.py:143-145`).
 The server sends `fs:ready` one time when its watch of the files operates, and `fs:change` after each change of the files. These messages have no file names (`open_terminal/utils/events.py:60-72`, `:100-108`, `:133-136`).
+The server collects the changes of 250 milliseconds into one `fs:change` message, and it keeps a maximum of one message that waits for each client (`open_terminal/utils/events.py:51`, `:69-72`, `:99`). Thus a program that changes files in the directory makes the server send `fs:change` messages again and again.
+The server sends no message on a timer.
 A client only receives data on this WebSocket after its `subscribe` message. Warren puts the route into the class of the watcher routes (`policies.md`, section 10.3).
 
 ### 3.13 MCP
@@ -343,11 +382,17 @@ What the WebSockets get when the server stops:
 - Inference: Kubernetes sends the signal SIGTERM to the container when it deletes a pod. The start command of warren uses `tini`, which sends the signal to the server (`isolation.md`, section 2.1). The server then closes its WebSockets with the code 1012. No test on a cluster examined this.
 - A server that gets no signal, or that does not stop in the termination time of the pod, sends no close message. Its peer then sees a connection that broke.
 
+Frames of the WebSocket protocol:
+
+- The server sets no ping option of uvicorn (`cli.py:210-225`). Inference: the default values of the library apply. In version 0.54.0 they are a ping frame each 20 seconds on each WebSocket, and a close when no pong frame comes in 20 seconds (`uvicorn/config.py:209-210` of the library). No test on a pod examined this.
+- The peer of the server in a pod is warren. Warren answers a ping frame itself. A ping frame and a pong frame are not messages, and warren does not relay them.
+
 Results for warren:
 
 1. A key in the header of the upgrade request has no effect. To hide the key of a pod from the client, warren must replace the `token` value in the first message.
 2. Warren must send a correct close code to its client when the pod replies with status 403 to an upgrade request.
 3. The close code that a sandbox sends when it stops is not a reliable signal: it has no text, and it depends on the start command and on the signal. Warren closes the WebSockets of a sandbox itself before it stops the pod, with its own code and text (`policies.md`, section 10.2).
+4. A WebSocket can be open and silent with no end, and the ping frames of the two sides keep it open. Thus an open WebSocket is not proof that a person uses the sandbox. Warren counts only the messages of the client as a use, and not all of them (`policies.md`, section 10.4).
 
 ## 5. Identity inputs
 

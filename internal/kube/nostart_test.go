@@ -187,10 +187,12 @@ func TestWatcherJoinsTheStartOfADifferentRequest(t *testing.T) {
 			t.Errorf("%s: target = %s, key agrees with the Secret: %v", what, got.URL, got.APIKey == string(e.secrets()[0].Data[secretKeyName]))
 		}
 	}
-	// The lease of a watcher is the lease of a usual WebSocket: it is in the
-	// lease count, it is activity, and it gets the stop signal.
-	if got := e.leaseRecord(e.m, name); got.leases != 3 || got.coldStart || !got.last.Equal(e.clock.Now()) {
-		t.Errorf("record with three open leases = %+v, want three leases, no cold start, and the time of the leases", got)
+	// The lease of a watcher is the lease of a usual WebSocket: its start is
+	// a use of the sandbox, and it gets the stop signal. As each WebSocket
+	// lease, it is not in the number of leases that keep the sandbox. Only
+	// the usual request is.
+	if got := e.leaseRecord(e.m, name); got.leases != 1 || got.coldStart || !got.last.Equal(e.clock.Now()) {
+		t.Errorf("record with three open leases = %+v, want one lease that keeps the sandbox, no cold start, and the time of the leases", got)
 	}
 	if n := e.socketCount(name); n != 2 {
 		t.Errorf("WebSocket leases = %d, want 2", n)
@@ -205,8 +207,11 @@ func TestWatcherJoinsTheStartOfADifferentRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("watcher for a sandbox that operates: %v", err)
 	}
-	if got := e.leaseRecord(e.m, name); got.leases != 4 || !got.last.Equal(e.clock.Now()) {
-		t.Errorf("record after the lease of a new watcher = %+v, want four leases and the time of this lease", got)
+	if got := e.leaseRecord(e.m, name); got.leases != 1 || !got.last.Equal(e.clock.Now()) {
+		t.Errorf("record after the lease of a new watcher = %+v, want one lease that keeps the sandbox and the time of this lease", got)
+	}
+	if n := e.socketCount(name); n != 3 {
+		t.Errorf("WebSocket leases = %d, want 3", n)
 	}
 	leases = append(leases, third)
 

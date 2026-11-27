@@ -225,6 +225,11 @@ func TestReaperStopsTellTheReason(t *testing.T) {
 			e.storeVolume(v)
 			waitFor(t, "deletion of the volume in the cache", func() bool { c := e.m.volume(name); return c != nil && c.DeletionTimestamp != nil })
 		}},
+		{backend.StopIdle, userRef("alice"), func(t *testing.T, e *testEnv, _ backend.Request) {
+			// The WebSocket is open, and its client sends no message for more
+			// than the idle time of 30 minutes (socket_activity_test.go).
+			e.clock.Advance(31 * time.Minute)
+		}},
 		{"not_ready", userRef("alice"), func(t *testing.T, e *testEnv, req backend.Request) {
 			// The pod is not ready for more than the start time of 5 minutes.
 			name := req.Ref.Name()
@@ -256,32 +261,6 @@ func TestReaperStopsTellTheReason(t *testing.T) {
 				t.Errorf("the audit record does not have the reason %s: %s", c.reason, logs.String())
 			}
 		})
-	}
-}
-
-// In this version an open WebSocket is a use of the sandbox: its lease is in
-// the lease count. Thus the reaper does not stop the sandbox for its idle
-// time, and the lease gets no signal with the reason "idle".
-func TestOpenWebSocketKeepsTheSandbox(t *testing.T) {
-	e := newTestEnv(t, nil)
-	req := userRef("alice")
-	name := req.Ref.Name()
-	lease := e.acquire(socket(req))
-	if got := e.leaseRecord(e.m, name); got.leases != 1 {
-		t.Fatalf("leases with one open WebSocket = %d, want 1", got.leases)
-	}
-	e.clock.Advance(2 * time.Hour)
-	e.m.Reap(context.Background())
-	if hasSignal(lease) || e.podDeletes(name) != 0 {
-		t.Fatalf("the reaper stopped a sandbox with an open WebSocket: signal = %v, delete requests = %d", hasSignal(lease), e.podDeletes(name))
-	}
-	// The end of the WebSocket is the last use.
-	lease.Release()
-	e.clock.Advance(31 * time.Minute)
-	e.m.Reap(context.Background())
-	waitFor(t, "stop of the idle sandbox", func() bool { return e.m.pod(name) == nil })
-	if hasSignal(lease) {
-		t.Error("a lease that ended got a stop signal")
 	}
 }
 
@@ -399,7 +378,7 @@ func TestLeaseOfADifferentPodGetsNoSignal(t *testing.T) {
 	}
 	// The reaper has an old copy of the first pod and sends its delete
 	// request. Kubernetes refuses the request, because the UID is different.
-	if err := e.m.deletePod(context.Background(), previous, "failed", false); err == nil {
+	if err := e.m.deletePod(context.Background(), previous, "failed", notIdle); err == nil {
 		t.Error("the test is wrong: the delete request with the UID of the previous pod got no error")
 	}
 	if hasSignal(current) {

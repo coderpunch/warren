@@ -38,6 +38,9 @@ type fakeTerminal struct {
 	requests []*http.Request
 	wsFirst  []string
 	wsClosed []int
+	// wsPings is the number of ping frames of the WebSocket protocol that
+	// the terminal got.
+	wsPings int
 	// openAPI is the document that the terminal sends. The default is
 	// hostileOpenAPI.
 	openAPI string
@@ -79,6 +82,17 @@ func (f *fakeTerminal) last() *http.Request {
 }
 
 var fakeUpgrader = websocket.Upgrader{}
+
+// burstMessages is the number of messages that the terminal sends on a
+// WebSocket whose path contains "burst", immediately after the first
+// message. burstTexts are the text messages of each group of four.
+const burstMessages = 100
+
+var burstTexts = []string{
+	`{"type":"output","start":0,"end":21,"truncated":false}`,
+	`{"type":"activity","active":true}`,
+	`{"type":"resize","cols":80,"rows":24}`,
+}
 
 // hostileResponseHeaders change the state of a browser for a full origin,
 // or give instructions to a reverse proxy.
@@ -221,6 +235,12 @@ func (f *fakeTerminal) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	conn.SetPingHandler(func(data string) error {
+		f.mu.Lock()
+		f.wsPings++
+		f.mu.Unlock()
+		return conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(time.Second))
+	})
 	if !strings.HasPrefix(r.URL.Path, "/browser/view/") {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -253,6 +273,21 @@ func (f *fakeTerminal) handleWS(w http.ResponseWriter, r *http.Request) {
 		raw.Write([]byte(strings.Repeat("x", 2000)))
 		raw.Close()
 		return
+	}
+	if strings.Contains(r.URL.Path, "burst") {
+		// A sandbox that sends data with no message of the client: the
+		// output of a program, and text messages that have the form of the
+		// messages of a client.
+		for i := 0; i < burstMessages/4; i++ {
+			for _, text := range burstTexts {
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(text)); err != nil {
+					return
+				}
+			}
+			if err := conn.WriteMessage(websocket.BinaryMessage, []byte("output of a program\r\n")); err != nil {
+				return
+			}
+		}
 	}
 	if strings.Contains(r.URL.Path, "closeme") {
 		_ = conn.WriteControl(websocket.CloseMessage,
@@ -318,9 +353,27 @@ type mapLease struct {
 	// the cause. The lock of the backend guards the two fields.
 	stopped chan struct{}
 	reason  string
+	// active is the number of calls of Active.
+	active int
 }
 
-func (l *mapLease) Target() backend.Target   { return l.target }
+func (l *mapLease) Target() backend.Target { return l.target }
+
+// Active counts each call. The limit of one write in an interval is in the
+// Kubernetes backend, and not in this lease.
+func (l *mapLease) Active() {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	l.active++
+}
+
+// activeCalls returns the number of calls of Active.
+func (l *mapLease) activeCalls() int {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	return l.active
+}
+
 func (l *mapLease) Stopped() <-chan struct{} { return l.stopped }
 func (l *mapLease) StopReason() string {
 	l.m.mu.Lock()
