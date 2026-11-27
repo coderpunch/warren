@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -750,6 +751,174 @@ func TestSandboxOfAPreviousVersionWhileTheNamespaceHasNoPolicy(t *testing.T) {
 		t.Error("warren stopped the sandbox of the previous version before the namespace had its policy")
 	}
 	waitFor(t, "ready", e.m.Ready)
+}
+
+// startPrevious makes a pod as a version of warren before the network
+// policies made it: a pod of warren with no label for a network policy. It
+// returns the name of the pod.
+func (e *testEnv) startPrevious(req backend.Request, status func(*corev1.Pod)) string {
+	e.t.Helper()
+	name := req.Ref.Name()
+	old := e.m.buildPod(name, name+"-00000000", req, e.policy(req))
+	delete(old.Labels, LabelStart)
+	status(old)
+	if _, err := e.client.CoreV1().Pods(testNamespace).Create(context.Background(), old, metav1.CreateOptions{}); err != nil {
+		e.t.Fatal(err)
+	}
+	waitFor(e.t, "pod in the cache", func() bool { return e.m.pod(name) != nil })
+	return name
+}
+
+// On a cluster that ignores network policies, the policy of the namespace
+// refuses no connection, and this process is never ready. A pod of a
+// previous version can operate for a process of that version. The reaper
+// must not stop such a pod before the network test showed that the cluster
+// applies network policies: not before the first test, and not after a test
+// with the result that the cluster ignores them.
+func TestSandboxOfAPreviousVersionOnAClusterThatIgnoresNetworkPolicies(t *testing.T) {
+	var ignores atomic.Bool
+	ignores.Store(true)
+	e, _ := canaryEnv(t, func(int32) error {
+		if ignores.Load() {
+			return nil
+		}
+		return errTimeout
+	})
+	e.m.cfg.ReapInterval = 10 * time.Millisecond
+	// The state before the upgrade: the namespace has no policy.
+	if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(context.Background(), defaultDenyName, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	name := e.startPrevious(userRef("alice"), readyStatus)
+
+	e.run()
+	waitFor(t, "result of the test on a cluster that ignores network policies", func() bool {
+		return e.m.enforcement.Load() == enforcementAbsent
+	})
+	before := e.reaps()
+	waitFor(t, "three runs of the reaper after the test", func() bool { return e.reaps() >= before+3 })
+	if e.m.Ready() {
+		t.Fatal("ready on a cluster that ignores network policies")
+	}
+	if _, ok := e.networkPolicies()[defaultDenyName]; !ok {
+		t.Fatal("warren did not make the policy of the namespace")
+	}
+	if n := e.podDeletes(name); n != 0 {
+		t.Errorf("warren is not ready (%s), and it stopped a sandbox of the previous version: delete requests = %d, want 0", e.m.NotReadyReason(), n)
+	}
+	// The administrator corrects the network plugin. The policy of the
+	// namespace now refuses all connections of the old pod.
+	ignores.Store(false)
+	waitFor(t, "stop of the sandbox of the previous version", func() bool { return e.podDeletes(name) > 0 })
+	if e.m.enforcement.Load() != enforcementProven {
+		t.Error("warren stopped the sandbox of the previous version before the proof that the cluster applies network policies")
+	}
+	waitFor(t, "ready", e.m.Ready)
+}
+
+// With the network test turned off, warren has no result of a test. The
+// reaper must still stop a pod of a previous version when the namespace has
+// its policy.
+func TestSandboxOfAPreviousVersionWithNoNetworkTest(t *testing.T) {
+	e := newTestEnv(t, func(c *Config) {
+		c.ReapInterval = 10 * time.Millisecond
+		c.Network.SkipEnforcementCheck = true
+		c.Dial = func(context.Context, string) error { t.Error("warren did the test"); return nil }
+	})
+	if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(context.Background(), defaultDenyName, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	name := e.startPrevious(userRef("alice"), readyStatus)
+
+	e.run()
+	waitFor(t, "stop of the sandbox of the previous version", func() bool { return e.podDeletes(name) > 0 })
+	if _, ok := e.networkPolicies()[defaultDenyName]; !ok {
+		t.Error("warren stopped the sandbox of the previous version before the namespace had its policy")
+	}
+	waitFor(t, "ready", e.m.Ready)
+}
+
+// While the reaper does not stop a pod of a previous version because of its
+// version, the other rules of the reaper apply to the pod. Possibly no
+// process of the previous version operates, and then only this process can
+// stop the pod (docs/isolation.md, sections 4 and 8).
+func TestReaperRulesForASandboxOfAPreviousVersion(t *testing.T) {
+	states := map[string]func(t *testing.T, e *testEnv){
+		"the namespace has no policy": func(t *testing.T, e *testEnv) {
+			// The namespace has a pod of a different owner, thus warren does
+			// not make the policy of the namespace.
+			e.client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, &corev1.PodList{Items: []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "database-0", Namespace: testNamespace}}}}, nil
+			})
+			if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(context.Background(), defaultDenyName, metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"the network test has no result":       func(_ *testing.T, e *testEnv) { e.m.enforcement.Store(enforcementUnknown) },
+		"the cluster ignores network policies": func(_ *testing.T, e *testEnv) { e.m.enforcement.Store(enforcementAbsent) },
+	}
+	for state, prepare := range states {
+		t.Run(state, func(t *testing.T) {
+			logs := &syncBuffer{}
+			e := newTestEnv(t, func(c *Config) { c.Logger = slog.New(slog.NewTextHandler(logs, nil)) })
+			e.strictDeletes(corev1.SchemeGroupVersion.WithResource("pods"))
+			ctx := context.Background()
+			// The control: a sandbox of this version, with no open lease.
+			current := userRef("erin")
+			e.acquire(current).Release()
+			prepare(t, e)
+
+			idle := e.startPrevious(userRef("alice"), readyStatus)
+			slow := e.startPrevious(userRef("bob"), func(p *corev1.Pod) { p.Status.Phase = corev1.PodPending })
+			failed := e.startPrevious(userRef("carol"), func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed })
+			orphan := e.startPrevious(userRef("dave"), func(p *corev1.Pod) { readyStatus(p); p.Labels[LabelTemplate] = "removed-policy" })
+			stopped := func(name, reason string) bool {
+				return strings.Contains(logs.String(), "sandbox="+name+" reason="+reason+" ")
+			}
+
+			// The first run: no time is gone.
+			e.m.Reap(ctx)
+			if e.m.Ready() {
+				t.Fatal("warren is ready")
+			}
+			if !stopped(failed, "failed") {
+				t.Errorf("warren is not ready (%s), and it did not remove the failed sandbox of the previous version", e.m.NotReadyReason())
+			}
+			if !stopped(orphan, "no_policy") {
+				t.Errorf("warren is not ready (%s), and it did not stop the sandbox of the previous version whose policy is not in the file", e.m.NotReadyReason())
+			}
+			if a, b := e.podDeletes(idle), e.podDeletes(slow); a != 0 || b != 0 {
+				t.Errorf("warren is not ready (%s), and it stopped sandboxes of the previous version that are not idle and not late: delete requests = %d and %d, want 0",
+					e.m.NotReadyReason(), a, b)
+			}
+			waitFor(t, "end of the stopped pods", func() bool { return e.m.pod(failed) == nil && e.m.pod(orphan) == nil })
+
+			// The idle time of the policy is 30 minutes, and the start time
+			// is 5 minutes.
+			e.clock.Advance(10 * time.Hour)
+			e.m.Reap(ctx)
+			if e.m.Ready() {
+				t.Fatal("warren is ready")
+			}
+			if !stopped(current.Ref.Name(), "idle") {
+				t.Errorf("control: warren did not stop the idle sandbox of this version")
+			}
+			if !stopped(idle, "idle") {
+				t.Errorf("warren is not ready (%s), and it did not stop the idle sandbox of the previous version", e.m.NotReadyReason())
+			}
+			if !stopped(slow, "not_ready") {
+				t.Errorf("warren is not ready (%s), and it did not stop the sandbox of the previous version that is not ready after 10 hours", e.m.NotReadyReason())
+			}
+			if strings.Contains(logs.String(), "reason=no_network_policy") {
+				t.Errorf("warren is not ready (%s), and it stopped a sandbox because of its version", e.m.NotReadyReason())
+			}
+			for _, name := range []string{idle, slow, failed, orphan} {
+				if n := e.podDeletes(name); n != 1 {
+					t.Errorf("delete requests for the sandbox %s = %d, want 1", name, n)
+				}
+			}
+		})
+	}
 }
 
 // The reaper writes the cause of a problem with the policy of the namespace,

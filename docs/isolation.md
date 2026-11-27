@@ -295,14 +295,18 @@ Warren stops a pod in these conditions, in addition to the conditions of [polici
 | `unreachable` | The pod is ready, and each attempt of warren to connect to it fails for more than 60 seconds. A time of more than 60 seconds with no attempt starts the count again. |
 | `start_error` | The container cannot start, for example because the command is not in the image. The log has the message of Kubernetes. Warren stops the pod when the condition stays for 2 minutes. An image that Kubernetes cannot pull is not such a condition: warren writes the message, and the 2 minutes start at the first cause that is such a condition. |
 | `public_address` | An address of the pod is not in a blocked network. |
-| `no_network_policy` | A version of warren before the network policies started the pod. |
+| `no_network_policy` | A version of warren before the network policies started the pod. Warren uses this reason only in the conditions of section 8. |
 
 A new network permission needs no stop. Warren changes the network policy of the pod a maximum of 30 seconds after it reads the new file.
 
 ## 8. Upgrade from a version with no network policies
 
 - The upgrade stops all sandboxes. Their volumes stay. Files of a sandbox with ephemeral storage are lost.
-- The new version stops the sandboxes of the previous version only when the sandbox namespace has its policy (section 3.1). While the new version cannot make that policy, it is not ready, and those sandboxes continue to operate.
+- The new version stops the sandboxes of the previous version with the reason `no_network_policy` only when these two conditions are true:
+  - The sandbox namespace has its policy (section 3.1).
+  - The new version has the proof that the cluster applies network policies (section 4). With the flag `--skip-network-policy-test`, the new version does not wait for a test.
+- While one of the two conditions is not true, the new version is not ready, and it does not use that reason. It makes no network policy for those sandboxes.
+  It stops them with these reasons, as it stops a sandbox of the new version: `idle`, `failed`, `not_ready`, `volume_gone`, `no_policy`, and `start_error`.
 - If warren and the sandboxes are in one namespace, warren does not start. Keep the namespace with the volumes as the sandbox namespace, and move warren to a new namespace.
 - To go back to the previous version: stop the new version, then delete the network policies of warren:
 
