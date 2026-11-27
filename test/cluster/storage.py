@@ -6,7 +6,7 @@ NODE = subprocess.run(["docker", "inspect", "-f", "{{range .NetworkSettings.Netw
 W = f"http://{NODE}:30080"
 ADMIN = f"http://{NODE}:30090"
 KEY = "connection-key-0123456789abcdef0123456789"
-P = "warren.h3xcat.github.io/"
+P = "warren.coderpunch.io/"
 fails = []
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 

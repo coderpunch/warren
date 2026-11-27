@@ -59,8 +59,8 @@ p = pods()
 check("one pod for alice", len(p) == 1, len(p))
 pod = p[0]
 labels, ann = pod["metadata"]["labels"], pod["metadata"]["annotations"]
-check("pod labels", labels.get("app.kubernetes.io/managed-by") == "warren" and labels.get("warren.h3xcat.github.io/template") == "personal" and labels.get("warren.h3xcat.github.io/scope") == "user", labels)
-check("pod annotations", ann.get("warren.h3xcat.github.io/context-id") == "user:alice" and ann.get("warren.h3xcat.github.io/created-by") == "alice", ann)
+check("pod labels", labels.get("app.kubernetes.io/managed-by") == "warren" and labels.get("warren.coderpunch.io/template") == "personal" and labels.get("warren.coderpunch.io/scope") == "user", labels)
+check("pod annotations", ann.get("warren.coderpunch.io/context-id") == "user:alice" and ann.get("warren.coderpunch.io/created-by") == "alice", ann)
 check("no service account token in the pod", pod["spec"].get("automountServiceAccountToken") is False)
 secname = [e for e in pod["spec"]["containers"][0]["env"] if e["name"] == "OPEN_TERMINAL_API_KEY"][0]["valueFrom"]["secretKeyRef"]["name"]
 check("the Secret of a start has its own name", secname != pod["metadata"]["name"] and secname.startswith(pod["metadata"]["name"] + "-"), secname)
@@ -86,7 +86,7 @@ check("bob has a different sandbox and cannot read the file of alice", s == 200 
 check("two pods", len(pods()) == 2, len(pods()))
 s, out = run("cat /home/user/secret-of-alice.txt")
 check("alice reads her file", "alice-private-data" in out, out)
-ip_alice = [x for x in pods() if x["metadata"]["annotations"]["warren.h3xcat.github.io/context-id"] == "user:alice"][0]["status"]["podIP"]
+ip_alice = [x for x in pods() if x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] == "user:alice"][0]["status"]["podIP"]
 pykey = "import urllib.request,sys\ntry:\n  r=urllib.request.urlopen('http://%s:8000/files/cwd',timeout=5); print('status',r.status)\nexcept Exception as e: print('result',getattr(e,'code',e))" % ip_alice
 s, out = run("python3 -c \"%s\"" % pykey.replace('"', '\\"'), user="bob")
 check("bob cannot connect to the sandbox of alice", "timed out" in out, out)
@@ -126,7 +126,7 @@ check("third sandbox of alice is refused with 429", s2 == 429, (s2, b2))
 # ---- restart by a manager keeps the owner ----
 s, _, b = call("POST", "/api/v1/terminals/templates/by-chat/restart", user=None, body={"user_id": "manager", "chat_id": "chat-a", "model_id": None}, timeout=150)
 check("restart by a manager waits and reports running", s == 200 and json.loads(b).get("status") == "running", b)
-owner = [x["metadata"]["annotations"]["warren.h3xcat.github.io/created-by"] for x in pods() if x["metadata"]["annotations"]["warren.h3xcat.github.io/context-id"] == "chat:chat-a" and "deletionTimestamp" not in x["metadata"]]
+owner = [x["metadata"]["annotations"]["warren.coderpunch.io/created-by"] for x in pods() if x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] == "chat:chat-a" and "deletionTimestamp" not in x["metadata"]]
 check("after the restart, the sandbox stays on the account of alice", owner == ["alice"], owner)
 
 # ---- restart of warren: it finds its sandboxes ----
@@ -148,7 +148,7 @@ s, _, b = call("POST", "/api/v1/terminals/templates/personal/stop", user=None, b
 check("stop operation", s == 200, b)
 gone = False
 for _ in range(30):
-    if not any(x["metadata"]["annotations"]["warren.h3xcat.github.io/context-id"] == "user:bob" and "deletionTimestamp" not in x["metadata"] for x in pods()): gone = True; break
+    if not any(x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] == "user:bob" and "deletionTimestamp" not in x["metadata"] for x in pods()): gone = True; break
     time.sleep(1)
 check("the pod of bob stops", gone)
 
@@ -164,7 +164,7 @@ print("INFO wait for the idle reaper (about 2.5 minutes)", flush=True)
 deadline = time.time() + 240
 while time.time() < deadline and len([x for x in pods() if "deletionTimestamp" not in x["metadata"]]) > 0:
     time.sleep(10)
-left = [x["metadata"]["annotations"]["warren.h3xcat.github.io/context-id"] for x in pods() if "deletionTimestamp" not in x["metadata"]]
+left = [x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] for x in pods() if "deletionTimestamp" not in x["metadata"]]
 check("idle sandboxes stop", left == [], left)
 time.sleep(5)
 secs = json.loads(kubectl("-n", "warren-sandboxes", "get", "secrets", "-o", "json"))["items"]

@@ -5,7 +5,7 @@ import json, os, subprocess, sys, time, urllib.request, urllib.error
 NODE = subprocess.run(["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", "warren-dev-control-plane"], capture_output=True, text=True).stdout.strip()
 W = f"http://{NODE}:30080"
 KEY = "connection-key-0123456789abcdef0123456789"
-P = "warren.h3xcat.github.io/"
+P = "warren.coderpunch.io/"
 IMG = "ghcr.io/open-webui/open-terminal:0.18.1-openshift"
 PUBLIC_OK, PUBLIC_BLOCKED = "203.0.113.10", "203.0.113.20"
 fails = []

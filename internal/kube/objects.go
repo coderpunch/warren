@@ -20,7 +20,7 @@ import (
 // Warren keeps its state in these labels and annotations. It has no other
 // database.
 const (
-	prefix = "warren.h3xcat.github.io"
+	prefix = "warren.coderpunch.io"
 
 	LabelManagedBy = "app.kubernetes.io/managed-by"
 	ManagedByValue = "warren"
