@@ -305,8 +305,8 @@ If the new file is not valid, warren writes an error to its log and continues wi
 | Change | Result |
 |---|---|
 | Image, resources, storage, environment, runtime class, node selector, tolerations, command, user ID, user namespace | Applies to pods that start after the change. A pod that operates keeps its settings. Send a restart operation to apply the change. |
-| Network: a new permission | Applies a maximum of 30 seconds after warren reads the file, also to the pods that operate. |
-| Network: a removed permission | Warren stops the sandboxes of the policy. The next request starts them again with the new settings. A network plugin can let an open connection continue after a change, thus only a stop closes it. |
+| Network: a new permission. This is a new item of `allow`, `egress` from `none` to `internet`, or `dns` from `false` to `true`. | Applies a maximum of 30 seconds after warren reads the file, also to the pods that operate. |
+| Network: a removed permission. This is `egress` from `internet` to `none`, `dns` from `true` to `false`, or an item of `allow` that you remove or change. | Warren stops the sandboxes of the policy. The next request starts them again with the new settings. A network plugin can let an open connection continue after a change, thus only a stop closes it. Warren compares complete items of `allow`. Thus each change of `ports`, `cidr`, `namespace`, or `podLabels` of an item stops the sandboxes, also a change that makes the item wider. To add a port or a network with no stop, add a second item. Refer to [isolation.md](isolation.md), section 7.1. |
 | Idle time | Applies immediately, also to the pods that operate. |
 | Retention time | Applies immediately, also to the volumes that exist. Refer to section 7.1. |
 | User list | Applies to the next request. A terminal that is open stays open. Refer to section 9. |

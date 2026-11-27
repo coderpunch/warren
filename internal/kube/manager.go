@@ -80,8 +80,9 @@ type Config struct {
 
 	// Port is the port of Open Terminal in a pod. Tests change it.
 	Port int
-	// Dial opens one TCP connection, for the test of the network policies.
-	// Tests change it.
+	// Dial makes one connection attempt to the test pod, for the test of the
+	// network policies. It returns nil only when the test pod answers. Tests
+	// change it.
 	Dial func(ctx context.Context, address string) error
 	// CanaryInterval is the time between two tests of the network policies.
 	// CanaryPoll and CanaryPause are the wait times in one test.
@@ -217,7 +218,11 @@ type Manager struct {
 	// applies network policies.
 	enforcement atomic.Int32
 	// hosts has the node addresses that are in the network policies of the
-	// sandboxes. The caller must hold mu.
+	// sandboxes. The reaper records a new address after a run that wrote all
+	// policies, and it removes an address before it writes the policies
+	// without that address. A policy that warren makes between two runs gets
+	// the addresses of this record: refer to policyHosts. The caller must
+	// hold mu.
 	hosts map[string]bool
 	// kick asks Run for one run of the reaper at this time.
 	kick chan struct{}
@@ -268,7 +273,7 @@ func New(cfg Config) (*Manager, error) {
 		cfg.Port = terminalPort
 	}
 	if cfg.Dial == nil {
-		cfg.Dial = dialTCP
+		cfg.Dial = dialCanary
 	}
 	if cfg.CanaryInterval <= 0 {
 		cfg.CanaryInterval = time.Hour
@@ -394,9 +399,8 @@ func (m *Manager) Run(ctx context.Context) error {
 func (m *Manager) runEnforcementTests(ctx context.Context) {
 	for {
 		wait := m.cfg.ReapInterval
-		// The last step of the test needs the policy of the namespace. With
-		// no such policy, the test would show a cluster that applies no
-		// policies. The reaper makes the policy.
+		// The test needs the policy of the namespace. With no such policy,
+		// the test is not possible. The reaper makes the policy.
 		if m.networkReady.Load() {
 			m.examineEnforcement(ctx)
 			wait = m.cfg.CanaryRetry
@@ -614,14 +618,19 @@ const pollInterval = time.Second
 // exist, and waits until it is ready or until the context ends. When the
 // context ends first, the start continues, and a subsequent call can
 // succeed.
+//
+// Acquire returns ErrNotReady while warren is not ready, also to a caller
+// that waits at that time. A lease that a caller has stays.
 func (m *Manager) Acquire(ctx context.Context, req backend.Request) (backend.Lease, error) {
-	if !m.Ready() {
-		// Without the pod cache, warren cannot see or count the sandboxes.
-		return nil, backend.ErrNotReady
-	}
 	name := req.Ref.Name()
 	for {
 		wake := m.waiter()
+		// Without the pod cache, warren cannot see or count the sandboxes.
+		// Warren can also become not ready while the caller waits. Thus each
+		// step examines the readiness, not only the first one.
+		if !m.Ready() {
+			return nil, backend.ErrNotReady
+		}
 		l, err := m.tryAcquire(ctx, name, req)
 		if err != nil {
 			return nil, err
@@ -760,6 +769,12 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 		return nil, nil
 	}
 
+	// The key check and the write of the node address took time. Warren can
+	// be not ready now. A caller that waited must get no lease then, as a new
+	// caller gets none.
+	if !m.Ready() {
+		return nil, backend.ErrNotReady
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st = m.stateLocked(name)
@@ -815,6 +830,11 @@ func (m *Manager) start(ctx context.Context, req backend.Request, exempt bool) e
 	pol, ok := m.cfg.Policies.Get(req.Ref.TemplateID)
 	if !ok {
 		return fmt.Errorf("no policy has the ID %q", req.Ref.TemplateID)
+	}
+	// A caller can wait before this call, for example for the end of the
+	// previous pod. Warren can become not ready in that time.
+	if !m.Ready() {
+		return backend.ErrNotReady
 	}
 
 	m.mu.Lock()
@@ -1214,7 +1234,7 @@ func (m *Manager) createObjects(ctx context.Context, name string, req backend.Re
 	// a time when only the policy of the namespace applies to it: it would
 	// not be wrong, but warren could not connect to the sandbox.
 	podSpec := m.buildPod(name, secretName, req, pol)
-	madePolicy, err := networkPolicies.Create(ctx, m.buildNetworkPolicy(secretName, podSpec.Labels, pol, m.hostAddresses()), metav1.CreateOptions{})
+	madePolicy, err := networkPolicies.Create(ctx, m.buildNetworkPolicy(secretName, podSpec.Labels, pol, m.policyHosts()), metav1.CreateOptions{})
 	if err != nil {
 		removeStartObjects()
 		removeNewVolume()

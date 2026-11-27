@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,11 +35,15 @@ import (
 //     to the pod now, and it must refuse the connection: three times, one
 //     after the other. If the connection is still successful after some
 //     time, the cluster does not apply network policies, and warren starts
-//     no sandbox.
+//     no sandbox. This result needs the policy of the namespace. If that
+//     policy is absent or changes during the step, the test has no result.
 //  3. Warren makes the policy again, and it must get a connection again. A
 //     connection can fail for a different cause: the pod is gone, or warren
 //     has a fault of its own. Without this step, such a failure would look
 //     like a cluster that applies network policies.
+//
+// A connection is successful only when the HTTP server of the test pod
+// answers. Refer to dialCanary.
 
 const (
 	// LabelCanary is on the test pod. The pod does not have the label of
@@ -74,14 +80,32 @@ const (
 // errNotEnforced means that the cluster does not apply network policies.
 var errNotEnforced = errors.New("the cluster does not apply network policies")
 
-// dialTCP opens and closes one TCP connection.
-func dialTCP(ctx context.Context, address string) error {
-	d := net.Dialer{Timeout: 3 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", address)
+// dialCanary makes one connection attempt to the test pod. It opens a new TCP
+// connection and sends one HTTP request. The attempt is successful only when
+// the HTTP server of the test pod answers: that server sends the status 200.
+//
+// An open TCP connection is not sufficient. A proxy on the pod of warren, for
+// example the sidecar of a service mesh, can accept a connection that does
+// not get to the test pod. Such a proxy then closes the connection, or it
+// sends an answer of its own with a different status.
+//
+// The client of the key check has the properties that the test needs: a time
+// limit of 3 seconds, a new connection for each request, and no proxy from
+// the environment variables.
+func dialCanary(ctx context.Context, address string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://"+address+"/", nil)
 	if err != nil {
 		return err
 	}
-	return conn.Close()
+	resp, err := verifyClient.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("the answer has the status %d, and the test pod sends the status %d", resp.StatusCode, http.StatusOK)
+	}
+	return nil
 }
 
 // buildCanary makes the test pod. It has the security settings of a sandbox,
@@ -207,6 +231,20 @@ func canaryProblem(pod *corev1.Pod) string {
 // errUnreachable means that warren cannot connect to a pod whose network
 // policy permits warren.
 var errUnreachable = errors.New("warren cannot connect to a pod that its network policy permits")
+
+// namespacePolicy reads the policy of the namespace for the test. It returns
+// an error if the policy is absent, or if it is not the policy that warren
+// makes.
+func (m *Manager) namespacePolicy(ctx context.Context) (*networkingv1.NetworkPolicy, error) {
+	cur, err := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace).Get(ctx, defaultDenyName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("read the network policy %s in the middle of the test: %w", defaultDenyName, err)
+	}
+	if !apiequality.Semantic.DeepEqual(cur.Spec, m.buildDefaultDeny().Spec) {
+		return nil, fmt.Errorf("the network policy %s is not the policy that warren makes: a person or a different program changed it", defaultDenyName)
+	}
+	return cur, nil
+}
 
 // checkEnforcement does the test one time. It returns nil if the cluster
 // lets warren connect to a sandbox and refuses a connection with no
@@ -354,6 +392,13 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 	}
 
 	// Step 2: with no policy of its own, the test pod must refuse warren.
+	// Only the policy of the namespace refuses that connection. Without it,
+	// no policy selects the test pod, and each cluster permits the
+	// connection.
+	deny, err := m.namespacePolicy(ctx)
+	if err != nil {
+		return err
+	}
 	if err := removePolicy(ctx); err != nil {
 		return fmt.Errorf("delete the network policy of the test pod: %w", err)
 	}
@@ -383,6 +428,18 @@ func (m *Manager) checkEnforcement(ctx context.Context) error {
 				// The connections must be connections to the test pod.
 				if err := present(); err != nil {
 					return err
+				}
+				// The policy of the namespace must be the same object, with
+				// no change, from before the delete until this time. If it
+				// is not, a person or the reaper deleted or changed it during
+				// the step, and the connections show nothing about the
+				// network plugin.
+				cur, err := m.namespacePolicy(ctx)
+				if err != nil {
+					return err
+				}
+				if cur.UID != deny.UID || cur.ResourceVersion != deny.ResourceVersion {
+					return fmt.Errorf("the network policy %s changed in the middle of the test", defaultDenyName)
 				}
 				return errNotEnforced
 			}

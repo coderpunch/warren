@@ -353,6 +353,9 @@ func (m *Manager) ensureDefaultDeny(ctx context.Context) error {
 		m.networkReady.Store(false)
 		return err
 	}
+	// wrong is true after warren read a wrong policy in this run and
+	// Kubernetes refused the repair with a conflict.
+	wrong := false
 	for attempt := 1; ; attempt++ {
 		cur, err := policies.Get(ctx, defaultDenyName, metav1.GetOptions{})
 		switch {
@@ -368,9 +371,14 @@ func (m *Manager) ensureDefaultDeny(ctx context.Context) error {
 			}
 			m.cfg.Logger.Info("network policy made", "log", "audit", "policy", defaultDenyName)
 		case err != nil:
+			err = fmt.Errorf("read the network policy %s: %w", defaultDenyName, err)
+			if wrong {
+				// Warren read a wrong policy in this run, and it did not see
+				// a correct policy after that.
+				return absent(err)
+			}
 			// Warren does not know the state of the policy. One error of a read
 			// request does not change the result of the previous run.
-			err = fmt.Errorf("read the network policy %s: %w", defaultDenyName, err)
 			if !m.networkReady.Load() {
 				m.policyProblem.Store(err.Error())
 			}
@@ -384,6 +392,7 @@ func (m *Manager) ensureDefaultDeny(ctx context.Context) error {
 				// A different writer changed the policy after the read. A
 				// second warren process can do the same repair at the same
 				// time, and the policy is then correct. Read it again.
+				wrong = true
 				continue
 			}
 			if err != nil {
@@ -432,24 +441,41 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 	policies := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace)
 	// List all policies of the namespace, not only the policies of warren.
 	list, err := policies.List(ctx, metav1.ListOptions{})
-	// Read the node addresses after the list of the policies, not before it.
-	// blockNode adds the address of a node to a policy before the first
-	// lease of a pod. If the list has such a policy, the addresses from the
-	// cache then also have that address, and this run does not remove it.
-	hosts := m.hostAddresses()
-	// From here, a pod event asks for a run of the reaper only for a node
-	// address that this run does not have.
-	known := make(map[string]bool, len(hosts))
-	for _, cidr := range hosts {
-		known[cidr] = true
-	}
-	m.mu.Lock()
-	m.hosts = known
-	m.mu.Unlock()
 	if err != nil {
+		// The record of the node addresses in the policies stays as it is.
 		m.cfg.Logger.Warn("cannot list the network policies", "error", err.Error())
 		return
 	}
+	// Read the node addresses after the list of the policies, not before it.
+	// Before the first lease of a pod, blockNode writes the policy of the
+	// pod, and that write always changes the policy. The cache has the node
+	// of the pod before that write. Thus one of these conditions is true:
+	//   - The list has the policy from after that write. The addresses below
+	//     then have the address of that node, and this run does not remove it.
+	//   - The list has the policy from before that write. The update request
+	//     of this run then has an old resource version, and Kubernetes
+	//     refuses it.
+	//
+	// This run removes from the policies each address that is not in the
+	// addresses below. Remove such an address from the record now, before
+	// the writes, and not after them. If not, a pod that gets that node in
+	// the time of the writes, or after a run that could not write all
+	// policies, asks for no run: the record still has the address, and the
+	// policies do not. The lock makes the read and the change one step for
+	// nodeChanged. A pod event then comes before the read, and the addresses
+	// have its node, or its handler sees the smaller record.
+	m.mu.Lock()
+	hosts := m.hostAddresses()
+	kept := make(map[string]bool, len(hosts))
+	for _, cidr := range hosts {
+		if m.hosts[cidr] {
+			kept[cidr] = true
+		}
+	}
+	m.hosts = kept
+	m.mu.Unlock()
+	// complete is true while no write of a policy failed in this run.
+	complete := true
 	have := map[string]*networkingv1.NetworkPolicy{}
 	var others []string
 	for i := range list.Items {
@@ -494,6 +520,7 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 		case cur == nil:
 			if _, err := policies.Create(ctx, want, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 				m.cfg.Logger.Warn("cannot make the network policy of a sandbox", "sandbox", pod.Name, "error", err.Error())
+				complete = false
 				continue
 			}
 			m.cfg.Logger.Warn("a sandbox had no network policy. Warren made it again.", "log", "audit", "sandbox", pod.Name, "policy", start)
@@ -521,6 +548,7 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 				}
 				if _, err := policies.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
 					m.cfg.Logger.Warn("cannot change the network policy of a sandbox", "sandbox", pod.Name, "error", err.Error())
+					complete = false
 					continue
 				}
 				m.cfg.Logger.Info("network policy of a sandbox changed", "log", "audit", "sandbox", pod.Name, "policy", start,
@@ -530,6 +558,20 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 				_ = m.deletePod(ctx, pod, "network_changed", false)
 			}
 		}
+	}
+	// Record a new node address only when this run put it into the
+	// policies. From here, a pod event asks for a run of the reaper only for
+	// a node address that this run did not have. After a run that could not
+	// write a policy, the record has no new address. The next event of a pod
+	// on a new node then asks for a run again.
+	if complete {
+		known := make(map[string]bool, len(hosts))
+		for _, cidr := range hosts {
+			known[cidr] = true
+		}
+		m.mu.Lock()
+		m.hosts = known
+		m.mu.Unlock()
 	}
 
 	now := m.now()
@@ -612,6 +654,31 @@ func (m *Manager) hostAddresses() []string {
 	return out
 }
 
+// policyHosts returns the node addresses for a policy that warren makes or
+// changes between two runs of the reaper: the addresses of the cache, the
+// addresses of the record, and the addresses that the caller gives. The
+// record can have the address of a node that has no sandbox at this time. A
+// pod that gets that node later asks for no run of the reaper, because the
+// record has the address. Thus each policy must have each address of the
+// record.
+func (m *Manager) policyHosts(more ...string) []string {
+	hosts := m.hostAddresses()
+	m.mu.Lock()
+	for cidr := range m.hosts {
+		if !slices.Contains(hosts, cidr) {
+			hosts = append(hosts, cidr)
+		}
+	}
+	m.mu.Unlock()
+	for _, cidr := range more {
+		if !slices.Contains(hosts, cidr) {
+			hosts = append(hosts, cidr)
+		}
+	}
+	sort.Strings(hosts)
+	return hosts
+}
+
 // blockNode makes sure, before the first lease of a pod, that the network
 // policy of the pod does not permit a public address of the node of the pod.
 // The start request makes the policy before Kubernetes selects the node, and
@@ -625,31 +692,52 @@ func (m *Manager) blockNode(ctx context.Context, pod *corev1.Pod) error {
 		return nil
 	}
 	start := pod.Labels[LabelStart]
-	if pol, ok := m.cfg.Policies.Get(pod.Labels[LabelTemplate]); ok && len(m.podHosts(pod)) > 0 && start != "" && pol.Network.Egress == policy.EgressInternet {
+	// The address of this pod comes from the pod, not from the cache: the
+	// cache can be older. The addresses of the record are necessary also for
+	// a pod on a node with no public address: a run of the reaper can record
+	// a new node address after the start request made this policy, and
+	// before the pod of this sandbox was in the pods of that run.
+	own := m.podHosts(pod)
+	hosts := m.policyHosts(own...)
+	if pol, ok := m.cfg.Policies.Get(pod.Labels[LabelTemplate]); ok && len(hosts) > 0 && start != "" && pol.Network.Egress == policy.EgressInternet {
 		policies := m.cfg.Client.NetworkingV1().NetworkPolicies(m.cfg.Namespace)
 		cur, err := policies.Get(ctx, start, metav1.GetOptions{})
 		if err != nil {
 			// If the policy is absent, the reaper makes it again.
 			return err
 		}
+		// Read the node addresses again, after the read of the policy. A run
+		// of the reaper can write this policy with a new node address. If it
+		// wrote before the read of the policy, the addresses of this moment
+		// have that address. If it writes after that read, Kubernetes refuses
+		// the update request below, and the caller tries again. With the
+		// addresses from before the read of the policy, the update request
+		// would remove the new address, and Kubernetes would accept it.
+		hosts = m.policyHosts(own...)
 		// Change the rules only. The record of the network settings stays,
 		// thus the reaper still sees a permission that the policy file
-		// removed. The address of this pod comes from the pod, not from the
-		// cache: the cache can be older.
-		hosts := m.hostAddresses()
-		for _, cidr := range m.podHosts(pod) {
-			if !slices.Contains(hosts, cidr) {
-				hosts = append(hosts, cidr)
-			}
-		}
-		sort.Strings(hosts)
+		// removed.
 		want := m.buildNetworkPolicy(start, pod.Labels, pol, hosts)
-		if !apiequality.Semantic.DeepEqual(cur.Spec.Egress, want.Spec.Egress) {
+		// Write the policy also when its rules are correct already: the
+		// annotation gets the UID of the pod. The policy can have the address
+		// of the node from its start, because a different sandbox was on that
+		// node. A run of the reaper can be in progress with node addresses
+		// that do not have this node. Its update request has the resource
+		// version from its list of the policies. This write gives the policy
+		// a new resource version, thus Kubernetes refuses that request. An
+		// update request with no change would not give a new version.
+		// A pod on a node with no public address needs that write only when
+		// the rules are not correct.
+		if !apiequality.Semantic.DeepEqual(cur.Spec.Egress, want.Spec.Egress) || (len(own) > 0 && cur.Annotations[AnnotationNodeBlocked] != string(pod.UID)) {
 			cur.Spec.Egress = want.Spec.Egress
+			if cur.Annotations == nil {
+				cur.Annotations = map[string]string{}
+			}
+			cur.Annotations[AnnotationNodeBlocked] = string(pod.UID)
 			if _, err := policies.Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
 				return err
 			}
-			m.cfg.Logger.Info("network policy of a sandbox changed: it has the address of the node now", "log", "audit",
+			m.cfg.Logger.Info("network policy of a sandbox changed: it has the addresses of the nodes now", "log", "audit",
 				"sandbox", pod.Name, "policy", start)
 		}
 	}

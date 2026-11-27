@@ -1,17 +1,24 @@
 package kube
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8slabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -366,5 +373,458 @@ func TestOwnNodeAddressComesWithTheNextReaperRun(t *testing.T) {
 	}
 	if p := e.m.pod(alice.Ref.Name()); p == nil || p.UID != uid {
 		t.Error("the change stopped the sandbox")
+	}
+}
+
+// enforcingCluster makes a cluster whose network plugin applies network
+// policies correctly, with the ingress rules of the NetworkPolicy API:
+//
+//   - A pod that no policy with the type Ingress selects is not isolated: each
+//     connection to it is successful.
+//   - A pod that such a policy selects accepts a connection only if one of
+//     these policies has an ingress rule. The cluster does not compare the
+//     peers of a rule.
+//
+// Each write that changes a network policy gives it a new resource version,
+// as an API server does: refer to strictNetworkPolicies. afterDial runs
+// after the cluster decided on a connection attempt. ownPolicy tells it
+// whether the test pod had a policy of its own at that moment: it has none
+// in the second step of the test.
+func enforcingCluster(t *testing.T, afterDial func(e *testEnv, ownPolicy bool)) *testEnv {
+	t.Helper()
+	var e *testEnv
+	var pods atomic.Int32
+	podsResource := corev1.SchemeGroupVersion.WithResource("pods")
+	policiesResource := networkingv1.SchemeGroupVersion.WithResource("networkpolicies")
+	// Read the objects from the store of the simulated cluster, not with a
+	// list request: a test adds a reactor to the list requests of the pods.
+	target := func(address string) *corev1.Pod {
+		obj, err := e.client.Tracker().List(podsResource, corev1.SchemeGroupVersion.WithKind("Pod"), testNamespace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		list := obj.(*corev1.PodList)
+		for i := range list.Items {
+			p := &list.Items[i]
+			if p.Labels[LabelCanary] == "true" && strings.HasPrefix(address, p.Status.PodIP+":") && p.DeletionTimestamp == nil {
+				return p
+			}
+		}
+		return nil
+	}
+	selecting := func(pod *corev1.Pod) (isolated, permitted, own bool) {
+		obj, err := e.client.Tracker().List(policiesResource, networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"), testNamespace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		list := obj.(*networkingv1.NetworkPolicyList)
+		for i := range list.Items {
+			np := &list.Items[i]
+			sel, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
+			if err != nil || !sel.Matches(k8slabels.Set(pod.Labels)) || !slices.Contains(np.Spec.PolicyTypes, networkingv1.PolicyTypeIngress) {
+				continue
+			}
+			isolated = true
+			permitted = permitted || len(np.Spec.Ingress) > 0
+			own = own || np.Name == pod.Name
+		}
+		return isolated, permitted, own
+	}
+	dial := func(_ context.Context, address string) error {
+		pod := target(address)
+		if pod == nil {
+			return errNoRoute
+		}
+		isolated, permitted, own := selecting(pod)
+		if afterDial != nil {
+			afterDial(e, own)
+		}
+		if isolated && !permitted {
+			return errTimeout
+		}
+		return nil
+	}
+	e = newTestEnv(t, func(c *Config) { c.Dial = dial })
+	e.client.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		pod := a.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+		if pod.Labels[LabelCanary] == "true" {
+			readyStatus(pod)
+			pod.Status.PodIP = fmt.Sprintf("10.9.0.%d", pods.Add(1))
+		}
+		return false, nil, nil
+	})
+	// The test deletes its objects with their UID.
+	e.strictDeletes(podsResource)
+	e.strictDeletes(policiesResource)
+	e.m.enforcement.Store(enforcementUnknown)
+	return e
+}
+
+// The second step of the test shows a cluster that ignores network policies
+// only while the policy of the namespace applies to the test pod. A person
+// can delete or change that policy during the step. The network plugin is
+// correct, thus warren must not record "the cluster does not apply network
+// policies", and the proof of the previous test must stay.
+func TestNamespacePolicyThatChangesDuringTheNetworkTest(t *testing.T) {
+	ctx := context.Background()
+	remove := func(e *testEnv) {
+		if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(ctx, defaultDenyName, metav1.DeleteOptions{}); err != nil {
+			t.Error(err)
+		}
+	}
+	// permit adds a rule that permits each connection to each pod.
+	permit := func(e *testEnv) {
+		policies := e.client.NetworkingV1().NetworkPolicies(testNamespace)
+		np, err := policies.Get(ctx, defaultDenyName, metav1.GetOptions{})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		np.Spec.Ingress = []networkingv1.NetworkPolicyIngressRule{{}}
+		if _, err := policies.Update(ctx, np, metav1.UpdateOptions{}); err != nil {
+			t.Error(err)
+		}
+	}
+	// The reaper makes or repairs the policy of the namespace.
+	reap := func(e *testEnv) { e.m.Reap(ctx) }
+	cases := []struct {
+		name string
+		// first runs after the first connection attempt of the second step.
+		// last runs after the attempt that gives the result of the step.
+		first, last func(e *testEnv)
+	}{
+		{"deleted", remove, nil},
+		{"deleted, and made again before the end of the step", remove, reap},
+		{"changed", permit, nil},
+		{"changed, and repaired before the end of the step", permit, reap},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var armed atomic.Bool
+			var attempts atomic.Int32
+			e := enforcingCluster(t, func(e *testEnv, ownPolicy bool) {
+				if !armed.Load() || ownPolicy {
+					return
+				}
+				switch n := attempts.Add(1); {
+				case n == 1:
+					c.first(e)
+				case n == canaryAttempts && c.last != nil:
+					c.last(e)
+				}
+			})
+			var logs syncBuffer
+			e.m.cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+			// The first test: the simulated network plugin is correct.
+			e.m.examineEnforcement(ctx)
+			if !e.m.Ready() || e.m.enforcement.Load() != enforcementProven {
+				t.Fatalf("the simulated cluster applies network policies, but warren is not ready: %q", e.m.NotReadyReason())
+			}
+
+			// The test of the next hour.
+			armed.Store(true)
+			e.m.examineEnforcement(ctx)
+			armed.Store(false)
+			if got := attempts.Load(); got != canaryAttempts {
+				t.Fatalf("connection attempts in the second step = %d, want %d", got, canaryAttempts)
+			}
+			if got := e.m.enforcement.Load(); got != enforcementProven {
+				t.Errorf("result = %d, want %d: the network plugin is correct, and the policy of the namespace did not apply during the second step", got, enforcementProven)
+			}
+			if strings.Contains(logs.String(), "THE CLUSTER DOES NOT APPLY NETWORK POLICIES") {
+				t.Error("warren wrote the audit record that tells the administrator to install a network plugin")
+			}
+			if problem, _ := e.m.testProblem.Load().(string); !strings.Contains(problem, defaultDenyName) {
+				t.Errorf("problem of the test = %q, want the policy of the namespace as the cause", problem)
+			}
+			// The next run of the reaper makes sure that the policy is correct.
+			e.m.Reap(ctx)
+			if np, ok := e.networkPolicies()[defaultDenyName]; !ok || len(np.Spec.Ingress) != 0 || !e.m.networkReady.Load() {
+				t.Fatal("the reaper did not make or repair the policy of the namespace")
+			}
+			if reason := e.m.NotReadyReason(); reason != "" {
+				t.Errorf("not ready after the policy of the namespace is correct again: %q", reason)
+			}
+			// The next complete test shows again that the plugin is correct.
+			e.m.examineEnforcement(ctx)
+			if !e.m.Ready() {
+				t.Errorf("not ready after the next test: %q", e.m.NotReadyReason())
+			}
+		})
+	}
+}
+
+// The same condition when the reaper cannot make the policy again, because
+// the namespace has a pod of a different owner: the reaper records in the
+// same seconds that the policy is absent. The test in progress must not
+// record a result about the network plugin. After the administrator removed
+// the pod and the policy is back, the readiness report must not name the
+// network plugin.
+func TestNamespacePolicyThatCannotComeBackDuringTheNetworkTest(t *testing.T) {
+	ctx := context.Background()
+	var armed, deleted, other atomic.Bool
+	e := enforcingCluster(t, func(e *testEnv, ownPolicy bool) {
+		if !armed.Load() || ownPolicy || !deleted.CompareAndSwap(false, true) {
+			return
+		}
+		if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(ctx, defaultDenyName, metav1.DeleteOptions{}); err != nil {
+			t.Error(err)
+		}
+		// The run of the reaper in the same seconds: it finds the pod of the
+		// different owner and does not make the policy.
+		other.Store(true)
+		e.m.Reap(ctx)
+		if e.m.networkReady.Load() {
+			t.Error("the reaper made the policy in a namespace with a pod of a different owner")
+		}
+	})
+	// The pod of the different owner is only in the list that warren asks
+	// for, as in TestNamespacePolicyThatWarrenCannotMakeAgain.
+	e.client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if !other.Load() {
+			return false, nil, nil
+		}
+		return true, &corev1.PodList{Items: []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "database-0", Namespace: testNamespace}}}}, nil
+	})
+
+	e.m.examineEnforcement(ctx)
+	if !e.m.Ready() {
+		t.Fatalf("the simulated cluster applies network policies, but warren is not ready: %q", e.m.NotReadyReason())
+	}
+	armed.Store(true)
+	e.m.examineEnforcement(ctx)
+	if !deleted.Load() {
+		t.Fatal("the test did not get to its second step")
+	}
+	armed.Store(false)
+	if reason := e.m.NotReadyReason(); !strings.Contains(reason, "database-0") {
+		t.Errorf("reason = %q, want the pod of the different owner", reason)
+	}
+	if got := e.m.enforcement.Load(); got != enforcementProven {
+		t.Errorf("result = %d, want %d: the reaper knows that the policy of the namespace is absent", got, enforcementProven)
+	}
+
+	// The administrator removes the pod. The reaper makes the policy.
+	other.Store(false)
+	e.m.Reap(ctx)
+	if _, ok := e.networkPolicies()[defaultDenyName]; !ok || !e.m.networkReady.Load() {
+		t.Fatal("the reaper did not make the policy of the namespace again")
+	}
+	if reason := e.m.NotReadyReason(); reason != "" {
+		t.Errorf("not ready after the policy of the namespace is back: %q", reason)
+	}
+}
+
+// A person can change the policy of the namespace before the second step
+// starts, and the reaper can be unable to repair it. The policy is then the
+// same object with the same version from the start to the end of the step.
+// Only the rules show the change. Warren must not start the step, and the
+// proof of the previous test must stay.
+func TestNamespacePolicyWithWrongRulesBeforeTheSecondStep(t *testing.T) {
+	ctx := context.Background()
+	var armed, changed atomic.Bool
+	var second atomic.Int32
+	e := enforcingCluster(t, func(e *testEnv, ownPolicy bool) {
+		switch {
+		case !armed.Load():
+		case !ownPolicy:
+			second.Add(1)
+		case changed.CompareAndSwap(false, true):
+			// The first step: add a rule that permits each connection.
+			policies := e.client.NetworkingV1().NetworkPolicies(testNamespace)
+			np, err := policies.Get(ctx, defaultDenyName, metav1.GetOptions{})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			np.Spec.Ingress = []networkingv1.NetworkPolicyIngressRule{{}}
+			if _, err := policies.Update(ctx, np, metav1.UpdateOptions{}); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	var logs syncBuffer
+	e.m.cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	e.m.examineEnforcement(ctx)
+	if !e.m.Ready() || e.m.enforcement.Load() != enforcementProven {
+		t.Fatalf("the simulated cluster applies network policies, but warren is not ready: %q", e.m.NotReadyReason())
+	}
+
+	armed.Store(true)
+	e.m.examineEnforcement(ctx)
+	armed.Store(false)
+	if !changed.Load() {
+		t.Fatal("the test did not get to its first step")
+	}
+	if got := second.Load(); got != 0 {
+		t.Errorf("connection attempts in the second step = %d, want 0: the policy of the namespace had wrong rules", got)
+	}
+	if got := e.m.enforcement.Load(); got != enforcementProven {
+		t.Errorf("result = %d, want %d: the network plugin is correct, and the policy of the namespace permitted the connections", got, enforcementProven)
+	}
+	if strings.Contains(logs.String(), "THE CLUSTER DOES NOT APPLY NETWORK POLICIES") {
+		t.Error("warren wrote the audit record that tells the administrator to install a network plugin")
+	}
+	if problem, _ := e.m.testProblem.Load().(string); !strings.Contains(problem, "is not the policy that warren makes") {
+		t.Errorf("problem of the test = %q, want the wrong rules of the policy of the namespace as the cause", problem)
+	}
+}
+
+// meshProxy is a transparent proxy on the pod of warren, for example the
+// sidecar of a service mesh. It accepts each TCP connection of warren on the
+// pod itself. Only then does it connect to the destination.
+//
+// While reachable gives true, the proxy sends the request to the test pod,
+// and warren gets the answer of the HTTP server of the test pod. If not, the
+// network plugin drops the packets of the proxy. With ownAnswer, the proxy
+// then sends an HTTP answer of its own. Without it, the proxy resets the
+// connection of warren and sends no byte.
+type meshProxy struct {
+	listener  net.Listener
+	reachable func() bool
+	ownAnswer bool
+	// forwarded is the number of connections that got to the test pod.
+	forwarded atomic.Int32
+}
+
+func (p *meshProxy) serve() {
+	for {
+		conn, err := p.listener.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			answer := "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+			switch {
+			case p.reachable():
+				p.forwarded.Add(1)
+				// The answer of "python3 -m http.server" in the test pod.
+				answer = "HTTP/1.0 200 OK\r\nServer: SimpleHTTP/0.6 Python/3.12.3\r\nContent-type: text/html; charset=utf-8\r\nContent-Length: 0\r\n\r\n"
+			case !p.ownAnswer:
+				if tcp, ok := conn.(*net.TCPConn); ok {
+					_ = tcp.SetLinger(0)
+				}
+				return
+			}
+			// A client that only opens and closes the connection sends no
+			// request.
+			if _, err := http.ReadRequest(bufio.NewReader(conn)); err == nil {
+				_, _ = io.WriteString(conn, answer)
+			}
+		}()
+	}
+}
+
+// A transparent proxy on the pod of warren accepts each TCP connection. The
+// cluster applies network policies: without the policy of the test pod, no
+// connection gets to the test pod. An open TCP connection is thus not a
+// connection to the test pod, and an HTTP answer of the proxy is not the
+// answer of the test pod. The result of the test must be "the cluster
+// applies network policies".
+func TestNetworkTestThroughATransparentProxy(t *testing.T) {
+	ctx := context.Background()
+	for name, ownAnswer := range map[string]bool{"the proxy resets the connection": false, "the proxy sends an answer of its own": true} {
+		t.Run(name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = listener.Close() })
+			var e *testEnv
+			proxy := &meshProxy{listener: listener, ownAnswer: ownAnswer, reachable: func() bool {
+				// The policy of the test pod permits warren. The policy of
+				// the namespace refuses each connection.
+				list, err := e.client.NetworkingV1().NetworkPolicies(testNamespace).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					return false
+				}
+				for _, np := range list.Items {
+					if strings.HasPrefix(np.Name, canaryPrefix) {
+						return true
+					}
+				}
+				return false
+			}}
+			// The environment does not replace Dial: warren uses the function
+			// that it uses on a cluster.
+			e = newTestEnv(t, func(c *Config) {
+				// readyStatus gives the test pod the address 127.0.0.1.
+				c.Port = listener.Addr().(*net.TCPAddr).Port
+			})
+			go proxy.serve()
+			e.client.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				if pod := a.(k8stesting.CreateAction).GetObject().(*corev1.Pod); pod.Labels[LabelCanary] == "true" {
+					readyStatus(pod)
+				}
+				return false, nil, nil
+			})
+			e.strictDeletes(corev1.SchemeGroupVersion.WithResource("pods"))
+			e.strictDeletes(networkingv1.SchemeGroupVersion.WithResource("networkpolicies"))
+			e.m.enforcement.Store(enforcementUnknown)
+
+			if err := e.m.checkEnforcement(ctx); err != nil {
+				t.Errorf("checkEnforcement = %v on a cluster that applies network policies; %d connections got to the test pod", err, proxy.forwarded.Load())
+			}
+			// The first step and the last step each need one answer of the
+			// test pod.
+			if got := proxy.forwarded.Load(); got != 2 {
+				t.Errorf("connections that got to the test pod = %d, want 2", got)
+			}
+			e.m.examineEnforcement(ctx)
+			if !e.m.Ready() {
+				t.Errorf("not ready: %q", e.m.NotReadyReason())
+			}
+		})
+	}
+}
+
+// A connection attempt of the test is successful only when the HTTP server
+// of the test pod answers. A different program can accept the connection: a
+// proxy, or a pod that got the address of the test pod.
+func TestConnectionAttemptNeedsTheAnswerOfTheTestPod(t *testing.T) {
+	e := newTestEnv(t, nil)
+	cases := []struct {
+		name string
+		// answer is the data that the server sends after the request. An
+		// empty text means that the server closes the connection.
+		answer string
+		ok     bool
+	}{
+		{"the HTTP server of the test pod", "HTTP/1.0 200 OK\r\nServer: SimpleHTTP/0.6 Python/3.12.3\r\nContent-Length: 0\r\n\r\n", true},
+		{"a server that sends no answer", "", false},
+		{"a server with a different protocol", "SSH-2.0-OpenSSH_9.6\r\n", false},
+		{"a proxy that cannot connect to the test pod", "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", false},
+	}
+	for _, c := range cases {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+				if _, err := http.ReadRequest(bufio.NewReader(conn)); err == nil {
+					_, _ = io.WriteString(conn, c.answer)
+				}
+				_ = conn.Close()
+			}
+		}()
+		err = e.m.cfg.Dial(context.Background(), listener.Addr().String())
+		if (err == nil) != c.ok {
+			t.Errorf("%s: connection attempt = %v, want successful = %v", c.name, err, c.ok)
+		}
+		_ = listener.Close()
+		// No program listens on the address now.
+		if err := e.m.cfg.Dial(context.Background(), listener.Addr().String()); err == nil {
+			t.Errorf("%s: connection attempt to a closed port was successful", c.name)
+		}
 	}
 }

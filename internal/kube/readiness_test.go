@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/coderpunch/warren/internal/backend"
@@ -752,6 +754,174 @@ func TestSandboxOfAPreviousVersionWhileTheNamespaceHasNoPolicy(t *testing.T) {
 	waitFor(t, "ready", e.m.Ready)
 }
 
+// startPrevious makes a pod as a version of warren before the network
+// policies made it: a pod of warren with no label for a network policy. It
+// returns the name of the pod.
+func (e *testEnv) startPrevious(req backend.Request, status func(*corev1.Pod)) string {
+	e.t.Helper()
+	name := req.Ref.Name()
+	old := e.m.buildPod(name, name+"-00000000", req, e.policy(req))
+	delete(old.Labels, LabelStart)
+	status(old)
+	if _, err := e.client.CoreV1().Pods(testNamespace).Create(context.Background(), old, metav1.CreateOptions{}); err != nil {
+		e.t.Fatal(err)
+	}
+	waitFor(e.t, "pod in the cache", func() bool { return e.m.pod(name) != nil })
+	return name
+}
+
+// On a cluster that ignores network policies, the policy of the namespace
+// refuses no connection, and this process is never ready. A pod of a
+// previous version can operate for a process of that version. The reaper
+// must not stop such a pod before the network test showed that the cluster
+// applies network policies: not before the first test, and not after a test
+// with the result that the cluster ignores them.
+func TestSandboxOfAPreviousVersionOnAClusterThatIgnoresNetworkPolicies(t *testing.T) {
+	var ignores atomic.Bool
+	ignores.Store(true)
+	e, _ := canaryEnv(t, func(int32) error {
+		if ignores.Load() {
+			return nil
+		}
+		return errTimeout
+	})
+	e.m.cfg.ReapInterval = 10 * time.Millisecond
+	// The state before the upgrade: the namespace has no policy.
+	if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(context.Background(), defaultDenyName, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	name := e.startPrevious(userRef("alice"), readyStatus)
+
+	e.run()
+	waitFor(t, "result of the test on a cluster that ignores network policies", func() bool {
+		return e.m.enforcement.Load() == enforcementAbsent
+	})
+	before := e.reaps()
+	waitFor(t, "three runs of the reaper after the test", func() bool { return e.reaps() >= before+3 })
+	if e.m.Ready() {
+		t.Fatal("ready on a cluster that ignores network policies")
+	}
+	if _, ok := e.networkPolicies()[defaultDenyName]; !ok {
+		t.Fatal("warren did not make the policy of the namespace")
+	}
+	if n := e.podDeletes(name); n != 0 {
+		t.Errorf("warren is not ready (%s), and it stopped a sandbox of the previous version: delete requests = %d, want 0", e.m.NotReadyReason(), n)
+	}
+	// The administrator corrects the network plugin. The policy of the
+	// namespace now refuses all connections of the old pod.
+	ignores.Store(false)
+	waitFor(t, "stop of the sandbox of the previous version", func() bool { return e.podDeletes(name) > 0 })
+	if e.m.enforcement.Load() != enforcementProven {
+		t.Error("warren stopped the sandbox of the previous version before the proof that the cluster applies network policies")
+	}
+	waitFor(t, "ready", e.m.Ready)
+}
+
+// With the network test turned off, warren has no result of a test. The
+// reaper must still stop a pod of a previous version when the namespace has
+// its policy.
+func TestSandboxOfAPreviousVersionWithNoNetworkTest(t *testing.T) {
+	e := newTestEnv(t, func(c *Config) {
+		c.ReapInterval = 10 * time.Millisecond
+		c.Network.SkipEnforcementCheck = true
+		c.Dial = func(context.Context, string) error { t.Error("warren did the test"); return nil }
+	})
+	if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(context.Background(), defaultDenyName, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	name := e.startPrevious(userRef("alice"), readyStatus)
+
+	e.run()
+	waitFor(t, "stop of the sandbox of the previous version", func() bool { return e.podDeletes(name) > 0 })
+	if _, ok := e.networkPolicies()[defaultDenyName]; !ok {
+		t.Error("warren stopped the sandbox of the previous version before the namespace had its policy")
+	}
+	waitFor(t, "ready", e.m.Ready)
+}
+
+// While the reaper does not stop a pod of a previous version because of its
+// version, the other rules of the reaper apply to the pod. Possibly no
+// process of the previous version operates, and then only this process can
+// stop the pod (docs/isolation.md, sections 4 and 8).
+func TestReaperRulesForASandboxOfAPreviousVersion(t *testing.T) {
+	states := map[string]func(t *testing.T, e *testEnv){
+		"the namespace has no policy": func(t *testing.T, e *testEnv) {
+			// The namespace has a pod of a different owner, thus warren does
+			// not make the policy of the namespace.
+			e.client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, &corev1.PodList{Items: []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "database-0", Namespace: testNamespace}}}}, nil
+			})
+			if err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Delete(context.Background(), defaultDenyName, metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"the network test has no result":       func(_ *testing.T, e *testEnv) { e.m.enforcement.Store(enforcementUnknown) },
+		"the cluster ignores network policies": func(_ *testing.T, e *testEnv) { e.m.enforcement.Store(enforcementAbsent) },
+	}
+	for state, prepare := range states {
+		t.Run(state, func(t *testing.T) {
+			logs := &syncBuffer{}
+			e := newTestEnv(t, func(c *Config) { c.Logger = slog.New(slog.NewTextHandler(logs, nil)) })
+			e.strictDeletes(corev1.SchemeGroupVersion.WithResource("pods"))
+			ctx := context.Background()
+			// The control: a sandbox of this version, with no open lease.
+			current := userRef("erin")
+			e.acquire(current).Release()
+			prepare(t, e)
+
+			idle := e.startPrevious(userRef("alice"), readyStatus)
+			slow := e.startPrevious(userRef("bob"), func(p *corev1.Pod) { p.Status.Phase = corev1.PodPending })
+			failed := e.startPrevious(userRef("carol"), func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed })
+			orphan := e.startPrevious(userRef("dave"), func(p *corev1.Pod) { readyStatus(p); p.Labels[LabelTemplate] = "removed-policy" })
+			stopped := func(name, reason string) bool {
+				return strings.Contains(logs.String(), "sandbox="+name+" reason="+reason+" ")
+			}
+
+			// The first run: no time is gone.
+			e.m.Reap(ctx)
+			if e.m.Ready() {
+				t.Fatal("warren is ready")
+			}
+			if !stopped(failed, "failed") {
+				t.Errorf("warren is not ready (%s), and it did not remove the failed sandbox of the previous version", e.m.NotReadyReason())
+			}
+			if !stopped(orphan, "no_policy") {
+				t.Errorf("warren is not ready (%s), and it did not stop the sandbox of the previous version whose policy is not in the file", e.m.NotReadyReason())
+			}
+			if a, b := e.podDeletes(idle), e.podDeletes(slow); a != 0 || b != 0 {
+				t.Errorf("warren is not ready (%s), and it stopped sandboxes of the previous version that are not idle and not late: delete requests = %d and %d, want 0",
+					e.m.NotReadyReason(), a, b)
+			}
+			waitFor(t, "end of the stopped pods", func() bool { return e.m.pod(failed) == nil && e.m.pod(orphan) == nil })
+
+			// The idle time of the policy is 30 minutes, and the start time
+			// is 5 minutes.
+			e.clock.Advance(10 * time.Hour)
+			e.m.Reap(ctx)
+			if e.m.Ready() {
+				t.Fatal("warren is ready")
+			}
+			if !stopped(current.Ref.Name(), "idle") {
+				t.Errorf("control: warren did not stop the idle sandbox of this version")
+			}
+			if !stopped(idle, "idle") {
+				t.Errorf("warren is not ready (%s), and it did not stop the idle sandbox of the previous version", e.m.NotReadyReason())
+			}
+			if !stopped(slow, "not_ready") {
+				t.Errorf("warren is not ready (%s), and it did not stop the sandbox of the previous version that is not ready after 10 hours", e.m.NotReadyReason())
+			}
+			if strings.Contains(logs.String(), "reason=no_network_policy") {
+				t.Errorf("warren is not ready (%s), and it stopped a sandbox because of its version", e.m.NotReadyReason())
+			}
+			for _, name := range []string{idle, slow, failed, orphan} {
+				if n := e.podDeletes(name); n != 1 {
+					t.Errorf("delete requests for the sandbox %s = %d, want 1", name, n)
+				}
+			}
+		})
+	}
+}
+
 // The reaper writes the cause of a problem with the policy of the namespace,
 // and the network test writes the cause of a test that is not possible. The
 // two operate at the same time. The readiness report must give each
@@ -894,5 +1064,202 @@ func TestNotReadyRefusesEachNewRequest(t *testing.T) {
 	e.m.Reap(ctx)
 	if n := e.podDeletes(req.Ref.Name()); n != 0 {
 		t.Errorf("warren stopped a sandbox with an open terminal: delete requests = %d", n)
+	}
+}
+
+// notReadyStates has two conditions in which warren is not ready after it
+// was ready (docs/isolation.md, sections 3.1 and 4).
+var notReadyStates = map[string]func(m *Manager){
+	// A test of the network plugin showed that the cluster does not apply
+	// network policies.
+	"the cluster ignores network policies": func(m *Manager) { m.enforcement.Store(enforcementAbsent) },
+	// The reaper could not repair the policy of the namespace.
+	"the namespace has no policy": func(m *Manager) { m.networkReady.Store(false) },
+}
+
+// previousPodInDeletion puts a pod of the sandbox into the cluster that is
+// in deletion, as in the termination time of a pod. It returns the UID.
+func (e *testEnv) previousPodInDeletion(req backend.Request) types.UID {
+	e.t.Helper()
+	name := req.Ref.Name()
+	deleted := metav1.NewTime(e.clock.Now())
+	old := e.m.buildPod(name, name+"-00000000", req, e.policy(req))
+	old.DeletionTimestamp = &deleted
+	old.Finalizers = []string{"example.test/termination"}
+	made, err := e.client.CoreV1().Pods(testNamespace).Create(context.Background(), old, metav1.CreateOptions{})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	waitFor(e.t, "previous pod in the cache", func() bool { return e.m.pod(name) != nil })
+	return made.UID
+}
+
+// endTermination does the work of the kubelet at the end of the termination
+// time: the pod goes away.
+func (e *testEnv) endTermination(name string) {
+	e.t.Helper()
+	if err := e.client.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), testNamespace, name); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// startedAfter reports whether warren started a pod of the sandbox after
+// the pod with the UID previous.
+func (e *testEnv) startedAfter(name string, previous types.UID) bool {
+	e.t.Helper()
+	for _, p := range e.pods() {
+		if p.Name == name && p.UID != previous {
+			return true
+		}
+	}
+	return false
+}
+
+// A request can wait for the end of the previous pod of its sandbox. If
+// warren becomes not ready in that time, the request must not start the
+// sandbox (docs/isolation.md, section 4).
+func TestRequestThatWaitsStartsNoSandboxAfterNotReady(t *testing.T) {
+	for state, set := range notReadyStates {
+		t.Run(state, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			req := userRef("alice")
+			name := req.Ref.Name()
+			previous := e.previousPodInDeletion(req)
+
+			// The request comes while warren is ready.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			res := e.acquireAsync(ctx, e.m, req)
+			select {
+			case r := <-res:
+				t.Fatalf("Acquire did not wait for the end of the previous pod: %v", r.err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			set(e.m)
+			e.endTermination(name)
+			select {
+			case r := <-res:
+				if r.err == nil {
+					r.lease.Release()
+				}
+				if !errors.Is(r.err, backend.ErrNotReady) {
+					t.Errorf("Acquire that waited = %v, want ErrNotReady", r.err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("the request that waited did not end after warren became not ready")
+			}
+			if e.startedAfter(name, previous) {
+				t.Errorf("warren started a sandbox while it was not ready: %s", e.m.NotReadyReason())
+			}
+		})
+	}
+}
+
+// A start of the management API can also wait for the end of the previous
+// pod. If warren becomes not ready in that time, the operation must not
+// start the sandbox.
+func TestManagementStartThatWaitsStartsNoSandboxAfterNotReady(t *testing.T) {
+	for state, set := range notReadyStates {
+		t.Run(state, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			req := userRef("alice")
+			name := req.Ref.Name()
+			previous := e.previousPodInDeletion(req)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- e.m.Start(ctx, req) }()
+			select {
+			case err := <-done:
+				t.Fatalf("Start did not wait for the end of the previous pod: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			set(e.m)
+			e.endTermination(name)
+			if err := <-done; !errors.Is(err, backend.ErrNotReady) {
+				t.Errorf("Start that waited = %v, want ErrNotReady", err)
+			}
+			if e.startedAfter(name, previous) {
+				t.Errorf("warren started a sandbox while it was not ready: %s", e.m.NotReadyReason())
+			}
+		})
+	}
+}
+
+// A request can wait for a pod that starts. If warren becomes not ready in
+// that time, the request must get no lease when the pod is ready. It must
+// not wait until its time limit.
+func TestRequestThatWaitsGetsNoLeaseAfterNotReady(t *testing.T) {
+	for state, set := range notReadyStates {
+		t.Run(state, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			req := userRef("alice")
+			name := req.Ref.Name()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			res := e.acquireAsync(ctx, e.m, req)
+			waitFor(t, "pod "+name, func() bool { return e.m.pod(name) != nil })
+
+			set(e.m)
+			e.makeReady(name)
+			select {
+			case r := <-res:
+				if r.err == nil {
+					r.lease.Release()
+					t.Fatalf("Acquire gave a lease while warren was not ready: %s", e.m.NotReadyReason())
+				}
+				if !errors.Is(r.err, backend.ErrNotReady) {
+					t.Errorf("Acquire that waited = %v, want ErrNotReady", r.err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("the request that waited did not end after warren became not ready")
+			}
+		})
+	}
+}
+
+// A request can be in the key check of a ready sandbox at the moment at
+// which warren becomes not ready. That request must get no lease, as a new
+// request gets none (docs/isolation.md, section 4).
+func TestRequestInTheKeyCheckGetsNoLeaseAfterNotReady(t *testing.T) {
+	for state, set := range notReadyStates {
+		t.Run(state, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			e := newTestEnv(t, func(c *Config) {
+				c.Verify = func(context.Context, backend.Target) error {
+					close(entered)
+					<-release
+					return nil
+				}
+			})
+			req := userRef("alice")
+			name := req.Ref.Name()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			res := e.acquireAsync(ctx, e.m, req)
+			waitFor(t, "pod "+name, func() bool { return e.m.pod(name) != nil })
+			e.makeReady(name)
+			<-entered
+
+			// The key check is in progress. Warren becomes not ready.
+			set(e.m)
+			if _, err := e.m.Acquire(ctx, req); !errors.Is(err, backend.ErrNotReady) {
+				t.Fatalf("new request = %v, want ErrNotReady", err)
+			}
+			close(release)
+
+			r := <-res
+			if r.err == nil {
+				r.lease.Release()
+				t.Fatal("the request that waited got a lease while warren was not ready")
+			}
+			if !errors.Is(r.err, backend.ErrNotReady) {
+				t.Errorf("request that waited = %v, want ErrNotReady", r.err)
+			}
+		})
 	}
 }

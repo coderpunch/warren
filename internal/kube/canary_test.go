@@ -16,6 +16,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -672,10 +673,15 @@ policies:
 
 // An image that Kubernetes cannot pull for some time is not a container that
 // cannot start. The 2 minutes of start_error count from the first sight of a
-// cause that stops the pod, and the log has the message of that cause.
+// cause that stops the pod, and the log has the message of that cause. A
+// second cause that stops the pod does not start the time again.
 func TestStartErrorAfterAFailedImagePull(t *testing.T) {
 	var logs syncBuffer
-	e := newTestEnv(t, func(c *Config) { c.Logger = slog.New(slog.NewTextHandler(&logs, nil)) })
+	e := newTestEnv(t, func(c *Config) {
+		c.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		// Only the start_error rule can stop the pod in this test.
+		c.StartTimeout = time.Hour
+	})
 	req := templateRef("other-image", "alice")
 	name := req.Ref.Name()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -722,9 +728,14 @@ func TestStartErrorAfterAFailedImagePull(t *testing.T) {
 	if n := e.podDeletes(name); n != 0 {
 		t.Errorf("delete requests 1 minute after the first start error = %d, want 0", n)
 	}
+	// The next run of the reaper is 2 minutes 30 seconds after the first cause
+	// that stops the pod. It is 1 minute 30 seconds after the second cause.
 	e.clock.Advance(90 * time.Second)
 	e.m.Reap(context.Background())
 	waitFor(t, "stop of the pod that cannot start", func() bool { return e.m.pod(name) == nil })
+	if !strings.Contains(logs.String(), "sandbox="+name+" reason=start_error ") {
+		t.Errorf("the reason of the stop is not start_error: %s", logs.String())
+	}
 }
 
 // strictDeletes makes the simulated cluster apply the UID condition of a
@@ -917,36 +928,50 @@ func TestNoLeaseWhileTheNodeAddressIsNotInThePolicy(t *testing.T) {
 // The results of the connection attempts count only for the test pod that
 // warren made, while it operates. A different pod can have the name or the
 // address of a test pod that went away, and a pod in deletion stops its
-// server.
+// server. The cleanup of the test deletes only the pod that warren made.
 func TestNetworkTestWhoseTestPodChanged(t *testing.T) {
 	ctx := context.Background()
-	changes := map[string]func(e *testEnv, pod corev1.Pod){
-		"a new pod with the same name": func(e *testEnv, pod corev1.Pod) {
+	// A change returns the UID of a pod that warren did not make and that
+	// has the name of the test pod. Without such a pod, it returns no UID.
+	changes := map[string]func(e *testEnv, pod corev1.Pod) types.UID{
+		"a new pod with the same name": func(e *testEnv, pod corev1.Pod) types.UID {
 			pods := e.client.CoreV1().Pods(testNamespace)
 			if err := pods.Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
 				t.Error(err)
 			}
-			if _, err := pods.Create(ctx, e.m.buildCanary(pod.Name), metav1.CreateOptions{}); err != nil {
+			other, err := pods.Create(ctx, e.m.buildCanary(pod.Name), metav1.CreateOptions{})
+			if err != nil {
 				t.Error(err)
+				return ""
 			}
+			if other.UID == "" || other.UID == pod.UID {
+				t.Errorf("UID of the new pod = %q, UID of the test pod = %q, want two different UIDs", other.UID, pod.UID)
+			}
+			return other.UID
 		},
-		"a pod in deletion": func(e *testEnv, pod corev1.Pod) {
+		"a pod in deletion": func(e *testEnv, pod corev1.Pod) types.UID {
 			now := metav1.NewTime(e.clock.Now())
 			pod.DeletionTimestamp = &now
 			if _, err := e.client.CoreV1().Pods(testNamespace).Update(ctx, &pod, metav1.UpdateOptions{}); err != nil {
 				t.Error(err)
 			}
+			return ""
 		},
-		"a different address": func(e *testEnv, pod corev1.Pod) {
+		"a different address": func(e *testEnv, pod corev1.Pod) types.UID {
 			e.setStatus(pod.Name, func(p *corev1.Pod) { p.Status.PodIP = "127.0.0.2" })
+			return ""
 		},
 	}
 	for what, change := range changes {
 		var e *testEnv
+		// want has the UIDs of the pods that must stay after the test.
+		var want []types.UID
 		e, _ = canaryEnv(t, func(n int32) error {
 			if n == 1 {
 				for _, p := range e.canaries() {
-					change(e, p)
+					if other := change(e, p); other != "" {
+						want = append(want, other)
+					}
 				}
 			}
 			return errTimeout
@@ -957,6 +982,16 @@ func TestNetworkTestWhoseTestPodChanged(t *testing.T) {
 		}
 		if reason := e.m.NotReadyReason(); !strings.Contains(reason, "test pod") {
 			t.Errorf("%s: reason = %q, want the cause", what, reason)
+		}
+		// The delete request of the cleanup has the UID of the pod that
+		// warren made. Thus a different pod with the same name stays.
+		var left []types.UID
+		for _, p := range e.canaries() {
+			left = append(left, p.UID)
+		}
+		if !slices.Equal(left, want) {
+			t.Errorf("%s: UIDs of the pods with the label of a test pod after the test = %v, want %v: the cleanup must delete the pod that warren made, and no other pod",
+				what, left, want)
 		}
 	}
 }

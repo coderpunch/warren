@@ -186,6 +186,9 @@ Warren thus makes a test at its start, and again each hour:
 5. Warren makes the policy again and connects again. The connection must be successful. This shows that the network policy was the cause of the failures in step 4. A pod that went away, or a fault of warren, was not the cause.
 6. Warren deletes the pod.
 
+A connection is successful only when the HTTP server of the test pod answers with the status 200. An open TCP connection is not sufficient.
+A proxy of a service mesh on the pod of warren can accept a connection that does not get to the test pod.
+
 The test pod uses the image of the flag `--sandbox-image`, and the program `/usr/local/bin/python3` of that image.
 It does not use the `command` of a policy.
 It gets the `imagePullSecrets`, the node selector, and the tolerations of one policy that uses this image.
@@ -206,13 +209,20 @@ The test is not possible in these conditions, for example:
 - Kubernetes refuses the test pod.
 - The test pod does not become ready in 4 minutes.
 - The test pod goes away before the end of the test.
+- The policy of the namespace (section 3.1) is absent, or it changes before the end of step 4. Only that policy refuses the connections of step 4.
 
 A second warren process can do its test at the same time, for example during a rollout. Warren thus removes a test pod of a different test only when it stopped or when it is older than 7 minutes.
 
 While warren is not ready, it continues to stop idle sandboxes and to repair the network policies of the sandboxes that operate.
 The management API of warren still stops and deletes sandboxes. A start and a restart are not possible.
-Warren also refuses each new request to a sandbox with the status 503, also when the sandbox operates. A terminal that is open stays open.
-But if the readiness probe of the warren pod uses `/readyz`, Kubernetes sends no request to a warren that is not ready. In that condition, stop the sandboxes with `kubectl delete pod`.
+Warren also refuses each new request to a sandbox, also when the sandbox operates. A terminal that is open stays open.
+
+- An HTTP request gets the status 503.
+- A new WebSocket does not get the status 503. Warren accepts it with the status 101, and then closes it with the close code 1013. The browser client of Open WebUI tries again after that code. The log record `access` of the WebSocket has the status 101 and the detail `sandbox not ready`.
+- An HTTP request or a WebSocket that waits for the start of a sandbox gets the same result as a new one. It gets no sandbox after warren became not ready. The result can come some seconds later.
+- Warren does not refuse `GET /openapi.json`. It replies with the status 200 and its complete tool list, and it sends no request to the sandbox.
+
+But a request must get to warren first. If the readiness probe of the warren pod uses `/readyz`, Kubernetes sends no request to a warren that is not ready. In that condition, stop the sandboxes with `kubectl delete pod`.
 
 The readiness address of warren (`/readyz` on the admin port) gives the cause.
 
@@ -286,19 +296,54 @@ Warren stops a pod in these conditions, in addition to the conditions of [polici
 
 | Reason in the log and the metrics | Condition |
 |---|---|
-| `network_changed` | The policy file removed a network permission of the sandbox. A network plugin can let an open connection continue, thus only a stop closes it. |
+| `network_changed` | The policy file removed a network permission of the sandbox. Section 7.1 gives the changes that remove a permission. A network plugin can let an open connection continue, thus only a stop closes it. |
 | `no_policy` | The policy of the sandbox is not in the file, or it has a different scope. Warren does not wait for open connections. |
-| `unreachable` | The pod is ready, and each attempt of warren to connect to it fails for more than 60 seconds. A time of more than 60 seconds with no attempt starts the count again. |
+| `unreachable` | The pod is ready, and the key check of warren fails for more than 60 seconds. In the key check, warren sends one request with the key of the pod to the pod. Warren makes the check only when a request needs the sandbox. It makes the check at the first use of the pod, and again after a restart of warren or of the container. A time of more than 60 seconds with no check starts the count again. A refused key is not such a failure: warren stops that pod immediately with the reason `bad_key`. After a successful check, warren makes no new check, and a connection that fails does not stop the pod. An HTTP request then gets the status 502 or 504. Each such request is a use of the sandbox, thus the idle time starts only when the requests stop. |
 | `start_error` | The container cannot start, for example because the command is not in the image. The log has the message of Kubernetes. Warren stops the pod when the condition stays for 2 minutes. An image that Kubernetes cannot pull is not such a condition: warren writes the message, and the 2 minutes start at the first cause that is such a condition. |
 | `public_address` | An address of the pod is not in a blocked network. |
-| `no_network_policy` | A version of warren before the network policies started the pod. |
+| `no_network_policy` | A version of warren before the network policies started the pod. Warren uses this reason only in the conditions of section 8. |
 
-A new network permission needs no stop. Warren changes the network policy of the pod a maximum of 30 seconds after it reads the new file.
+### 7.1 Changes of the network settings
+
+Warren compares the network settings that a sandbox has with the settings of the new policy file.
+
+Only these changes are a new permission. A new permission needs no stop. Warren changes the network policy of the pod a maximum of 30 seconds after it reads the new file.
+
+- A new item of `allow`.
+- `egress` changes from `none` to `internet`.
+- `dns` changes from `false` to `true`.
+
+These changes remove a permission. Warren stops the sandboxes of the policy, also when the same change of the file adds a permission.
+
+- `egress` changes from `internet` to `none`.
+- `dns` changes from `true` to `false`.
+- An item of `allow` that the sandbox has is not in the new file, or it is there with a change.
+
+For `dns`, the default is a value: `true` for `internet`, and `false` for `none`.
+
+Warren compares complete items of `allow`. It does not calculate which of two items permits more.
+Thus each change of an item that exists stops the sandboxes: a change of `ports`, `cidr`, `namespace`, or `podLabels`.
+This is also the case for a change that makes the item wider. Examples are one more port, an item with no `ports` key, a larger network, and fewer labels.
+The same ports in a different sequence are also a change. A different sequence of the items is not a change.
+
+To add a port or a network with no stop, add a second item and keep the first item:
+
+```yaml
+allow:
+  - cidr: 203.0.113.0/24
+    ports: [443]
+  - cidr: 203.0.113.0/24
+    ports: [8443]
+```
 
 ## 8. Upgrade from a version with no network policies
 
 - The upgrade stops all sandboxes. Their volumes stay. Files of a sandbox with ephemeral storage are lost.
-- The new version stops the sandboxes of the previous version only when the sandbox namespace has its policy (section 3.1). While the new version cannot make that policy, it is not ready, and those sandboxes continue to operate.
+- The new version stops the sandboxes of the previous version with the reason `no_network_policy` only when these two conditions are true:
+  - The sandbox namespace has its policy (section 3.1).
+  - The new version has the proof that the cluster applies network policies (section 4). With the flag `--skip-network-policy-test`, the new version does not wait for a test.
+- While one of the two conditions is not true, the new version is not ready, and it does not use that reason. It makes no network policy for those sandboxes.
+  It stops them with these reasons, as it stops a sandbox of the new version: `idle`, `failed`, `not_ready`, `volume_gone`, `no_policy`, and `start_error`.
 - If warren and the sandboxes are in one namespace, warren does not start. Keep the namespace with the volumes as the sandbox namespace, and move warren to a new namespace.
 - To go back to the previous version: stop the new version, then delete the network policies of warren:
 

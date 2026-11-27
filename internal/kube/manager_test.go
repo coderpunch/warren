@@ -51,11 +51,14 @@ type testEnv struct {
 	// watchers is the number of managers that started a pod watch.
 	watchers int
 	// version is the last resource version that the simulated API server
-	// gave to a volume.
+	// gave to a volume or to a network policy.
 	version atomic.Int64
 	// conflicts is the number of volume requests that the simulated API
 	// server refused with the status 409.
 	conflicts atomic.Int64
+	// policyConflicts is the number of update requests for a network policy
+	// that the simulated API server refused with the status 409.
+	policyConflicts atomic.Int64
 }
 
 type fakeClock struct {
@@ -92,6 +95,7 @@ func newTestEnv(t *testing.T, mod func(*Config)) *testEnv {
 	e.client.PrependReactor("create", "persistentvolumeclaims", stamp)
 	e.client.PrependReactor("create", "networkpolicies", stamp)
 	e.strictVolumes()
+	e.strictNetworkPolicies()
 
 	cfg := Config{
 		Client:    e.client,

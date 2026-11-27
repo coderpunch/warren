@@ -111,6 +111,15 @@ func (m *Manager) Reap(ctx context.Context) {
 	// of a pod has the same name.
 	live := map[string]bool{}
 	var pods []*corev1.Pod
+	// A pod of a previous version of warren has no network policy of its
+	// own. The policy of the namespace refuses its connections only when
+	// that policy exists and the cluster applies network policies. Without
+	// the two conditions, this process starts no sandbox, and such a pod can
+	// operate for a process of the previous version, for example in a
+	// rollout that does not complete. The reaper then does not stop the pod
+	// because of its version. The other rules apply to the pod: possibly no
+	// process of the previous version operates.
+	stopPrevious := m.networkReady.Load() && m.enforcement.Load() == enforcementProven
 	previous := 0
 	defer func() {
 		if previous > 0 {
@@ -132,17 +141,10 @@ func (m *Manager) Reap(ctx context.Context) {
 			m.forceDelete(ctx, pod, now)
 			continue
 		}
-		if pod.Labels[LabelStart] == "" {
+		if pod.Labels[LabelStart] == "" && stopPrevious {
 			// A previous version of warren made this pod. It has no network
 			// policy of its own, thus the policy of the namespace refuses
 			// all its connections, also the connections from warren.
-			if !m.networkReady.Load() {
-				// The namespace does not have that policy, and this process
-				// starts no sandbox. The pod can operate for a process of the
-				// previous version, for example in a rollout that does not
-				// complete. Keep it until the policy exists.
-				continue
-			}
 			if m.deletePod(ctx, pod, "no_network_policy", false) == nil {
 				previous++
 			}
