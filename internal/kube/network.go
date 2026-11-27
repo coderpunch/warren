@@ -706,6 +706,14 @@ func (m *Manager) blockNode(ctx context.Context, pod *corev1.Pod) error {
 			// If the policy is absent, the reaper makes it again.
 			return err
 		}
+		// Read the node addresses again, after the read of the policy. A run
+		// of the reaper can write this policy with a new node address. If it
+		// wrote before the read of the policy, the addresses of this moment
+		// have that address. If it writes after that read, Kubernetes refuses
+		// the update request below, and the caller tries again. With the
+		// addresses from before the read of the policy, the update request
+		// would remove the new address, and Kubernetes would accept it.
+		hosts = m.policyHosts(own...)
 		// Change the rules only. The record of the network settings stays,
 		// thus the reaper still sees a permission that the policy file
 		// removed.

@@ -744,14 +744,16 @@ func TestNamespacePolicyThatWarrenCannotRead(t *testing.T) {
 }
 
 // slowRequests is a client whose requests for the network policies take
-// time: beforeList runs before each list request gets to the API server, and
-// beforeUpdate runs before each update request. A reactor of the simulated
+// time: beforeList runs before each list request gets to the API server,
+// beforeUpdate runs before each update request, and beforeGet runs before
+// each read request of one policy. A reactor of the simulated
 // cluster cannot do this, because the simulated cluster accepts no other
 // request while a reactor runs.
 type slowRequests struct {
 	kubernetes.Interface
 	beforeList   func()
 	beforeUpdate func(name string)
+	beforeGet    func(name string)
 }
 
 func (c slowRequests) NetworkingV1() networkingclient.NetworkingV1Interface {
@@ -777,6 +779,13 @@ func (p slowPolicies) List(ctx context.Context, opts metav1.ListOptions) (*netwo
 		p.slow.beforeList()
 	}
 	return p.NetworkPolicyInterface.List(ctx, opts)
+}
+
+func (p slowPolicies) Get(ctx context.Context, name string, opts metav1.GetOptions) (*networkingv1.NetworkPolicy, error) {
+	if p.slow.beforeGet != nil {
+		p.slow.beforeGet(name)
+	}
+	return p.NetworkPolicyInterface.Get(ctx, name, opts)
 }
 
 func (p slowPolicies) Update(ctx context.Context, np *networkingv1.NetworkPolicy, opts metav1.UpdateOptions) (*networkingv1.NetworkPolicy, error) {
@@ -1369,10 +1378,24 @@ func TestNewPolicyHasTheNodeAddressesOfTheRecord(t *testing.T) {
 	// The last sandbox of node A goes away. No run of the reaper comes.
 	e.stop(yuri)
 	waitFor(t, "pod of yuri out of the cache", func() bool { return e.m.pod(yuri.Ref.Name()) == nil })
-	// A sandbox starts on node B and gets its first lease.
-	e.startOnNode(dan, publicNodeB)
+	// A sandbox starts. The policy of the start request must have the
+	// address of node A, before the pod has a node.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res := e.acquireAsync(ctx, e.m, dan)
+	waitFor(t, "pod of dan", func() bool { return e.m.pod(dan.Ref.Name()) != nil })
 	if !e.refusesNode(dan, publicNodeA) {
-		t.Fatal("the policy of a new sandbox does not have the address of node A, which is in the record")
+		t.Error("the policy of a start request does not have the address of node A, which is in the record")
+	}
+	// The pod gets node B, and the sandbox gets its first lease.
+	e.setStatus(dan.Ref.Name(), onPublicNode(publicNodeB))
+	r := <-res
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	r.lease.Release()
+	if !e.refusesNode(dan, publicNodeA) {
+		t.Fatal("the policy of a new sandbox does not have the address of node A after the first lease")
 	}
 
 	// A sandbox starts on node A and gets its first lease. No run of the
@@ -1419,5 +1442,99 @@ func TestFirstLeasePutsTheRecordedNodeAddressesIntoThePolicy(t *testing.T) {
 	defer r.lease.Release()
 	if !e.refusesNode(req, publicNodeA) {
 		t.Error("the sandbox got its first lease, and its policy permits the address of node A")
+	}
+}
+
+// The first lease of a pod reads the policy of the pod and writes it with the
+// node addresses. A run of the reaper can write a new node address into that
+// policy in the time of that read. The first lease must not remove that
+// address: the run recorded it, and no pod event asks for one more run.
+func TestFirstLeaseKeepsANodeAddressThatTheReaperWrote(t *testing.T) {
+	nodes := map[string]func(*corev1.Pod){
+		"the pod is on a node with a public address": onPublicNode(publicNodeB),
+		"the pod is on a node with a private address": func(p *corev1.Pod) {
+			readyStatus(p)
+			p.Status.HostIP = "10.0.0.7"
+			p.Status.HostIPs = []corev1.HostIP{{IP: "10.0.0.7"}}
+		},
+	}
+	for name, bobNode := range nodes {
+		t.Run(name, func(t *testing.T) {
+			var before atomic.Pointer[func(string)]
+			e := newTestEnv(t, func(c *Config) {
+				c.Client = slowRequests{Interface: c.Client, beforeGet: func(name string) {
+					if f := before.Load(); f != nil {
+						(*f)(name)
+					}
+				}}
+			})
+			ctx := context.Background()
+			dan, bob, carol := userRef("dan"), userRef("bob"), userRef("carol")
+			e.startOnNode(dan, publicNodeB)
+			e.completeRun(dan)
+
+			c, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			resBob := e.acquireAsync(c, e.m, bob)
+			waitFor(t, "pod of bob", func() bool { return e.m.pod(bob.Ref.Name()) != nil })
+			resCarol := e.acquireAsync(c, e.m, carol)
+			waitFor(t, "pod of carol", func() bool { return e.m.pod(carol.Ref.Name()) != nil })
+			if e.refusesNode(bob, publicNodeA) {
+				t.Fatal("the test is wrong: the policy of bob has the address of node A at its start")
+			}
+
+			target := e.policyOf(bob).Name
+			var done, written atomic.Bool
+			var carolLease atomic.Pointer[acquireResult]
+			hook := func(name string) {
+				if name != target || !done.CompareAndSwap(false, true) {
+					return
+				}
+				// The first lease of bob read the node addresses, and its
+				// read of the policy is in progress. The pod of carol gets
+				// node A, and its event asks for a run of the reaper.
+				e.setStatus(carol.Ref.Name(), onPublicNode(publicNodeA))
+				r := <-resCarol
+				carolLease.Store(&r)
+				if !e.asksForRun() {
+					t.Error("the test is wrong: the pod of carol on node A asked for no run")
+				}
+				// Do the work of Run: each run that an event asks for.
+				for {
+					select {
+					case <-e.m.kick:
+						e.m.Reap(ctx)
+						time.Sleep(200 * time.Millisecond)
+						continue
+					default:
+					}
+					break
+				}
+				np, err := e.client.NetworkingV1().NetworkPolicies(testNamespace).Get(ctx, target, metav1.GetOptions{})
+				if err == nil && slices.Contains(np.Spec.Egress[1].To[0].IPBlock.Except, publicNodeA+"/32") {
+					written.Store(true)
+				}
+			}
+			before.Store(&hook)
+			e.setStatus(bob.Ref.Name(), bobNode)
+			r := <-resBob
+			before.Store(nil)
+			if r.err != nil {
+				t.Fatal(r.err)
+			}
+			defer r.lease.Release()
+			if cl := carolLease.Load(); cl != nil && cl.err == nil {
+				defer cl.lease.Release()
+			}
+			if !done.Load() {
+				t.Fatal("the test is wrong: the first lease of bob did not read the policy of bob")
+			}
+			if !written.Load() {
+				t.Fatal("the test is wrong: the run of the reaper did not put the address of node A into the policy of bob")
+			}
+			if !e.refusesNode(bob, publicNodeA) {
+				t.Error("bob has a lease, and its policy permits the address of node A, on which the sandbox of carol operates")
+			}
+		})
 	}
 }
