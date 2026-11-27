@@ -382,7 +382,10 @@ func specFields(s *Spec) map[string]field {
 			}
 			return mapping(v, "\"network\"", map[string]field{
 				"egress": func(v *yaml.Node) error {
-					mode, err := text(v, "network.egress")
+					// An empty mode is not "none". It would give the
+					// default, which is "internet".
+					var mode string
+					err := textInto(&mode, "network.egress")(v)
 					s.Network.Egress = EgressMode(mode)
 					return err
 				},

@@ -60,6 +60,7 @@ type config struct {
 	volumeDelay      time.Duration
 
 	warrenNamespace string
+	podName         string
 	warrenPodLabels string
 	ingressCIDRs    string
 	dnsNamespace    string
@@ -170,6 +171,7 @@ func parseFlags(args []string) (config, error) {
 	fs.IntVar(&c.maxVolumesTotal, "max-volumes", maxVolumesTotal, "maximum number of volumes (0 = no limit)")
 	fs.DurationVar(&c.volumeDelay, "volume-delete-delay", volumeDelay, "after a start of warren, delete no volume for this time")
 	fs.StringVar(&c.warrenNamespace, "warren-namespace", envDefault("WARREN_NAMESPACE", ownNamespace()), "namespace of the warren pods (the default is the namespace of this pod)")
+	fs.StringVar(&c.podName, "pod-name", envDefault("WARREN_POD_NAME", ""), "name of this pod, from the field metadata.name (the default is the host name, which is not the pod name for a pod with hostNetwork)")
 	fs.StringVar(&c.warrenPodLabels, "warren-pod-labels", envDefault("WARREN_POD_LABELS", "app.kubernetes.io/name=warren"), "labels of the warren pods, as key=value with commas. Only these pods can connect to a sandbox.")
 	fs.StringVar(&c.ingressCIDRs, "ingress-cidrs", envDefault("WARREN_INGRESS_CIDRS", ""), "more networks that can connect to a sandbox, with commas (for a warren that is not a pod)")
 	fs.StringVar(&c.dnsNamespace, "dns-namespace", envDefault("WARREN_DNS_NAMESPACE", "kube-system"), "namespace of the DNS pods of the cluster")
@@ -294,10 +296,10 @@ func kubeBackend(c config, policies *policy.Store, logger *slog.Logger, m *metri
 	if err != nil {
 		return nil, err
 	}
-	// Examine the pod of warren itself. The host name of a pod is its name.
-	podName := ""
+	// Examine the pod of warren itself.
+	podName := c.podName
 	if c.kubeconfig == "" {
-		podName, _ = os.Hostname()
+		podName = ownPodName(c.podName, os.Hostname)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -321,6 +323,20 @@ func kubeBackend(c config, policies *policy.Store, logger *slog.Logger, m *metri
 		logger.Warn("warren does not test if the cluster applies network policies. On a cluster that ignores them, the sandboxes have no network isolation.")
 	}
 	return manager, nil
+}
+
+// ownPodName returns the name of the pod of warren. The name from the
+// configuration comes first: a deployment sets it from the field
+// metadata.name. The host name of a pod is its name only in the usual
+// conditions. For a pod that uses the network of its node, it is the name of
+// the node. Kubernetes cuts it to 63 characters, and a pod can set a
+// different host name.
+func ownPodName(configured string, hostname func() (string, error)) string {
+	if configured != "" {
+		return configured
+	}
+	name, _ := hostname()
+	return name
 }
 
 // namespaceFile has the namespace of a pod. Kubernetes mounts it with the

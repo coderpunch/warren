@@ -672,3 +672,21 @@ policies:
 		t.Errorf("a policy that sets the mode = %+v", p.Network)
 	}
 }
+
+// An empty egress mode is not "none". It gave the default "internet", or the
+// mode of the defaults, with no message.
+func TestEmptyEgressMode(t *testing.T) {
+	for _, file := range []string{
+		"policies:\n  - {id: a, name: A, scope: user, network: {egress: \"\"}}\n",
+		"defaults: {network: {egress: none}}\npolicies:\n  - {id: a, name: A, scope: user, network: {egress: \"\"}}\n",
+		"defaults: {network: {egress: \"\"}}\npolicies:\n  - {id: a, name: A, scope: user}\n",
+	} {
+		set, err := Parse([]byte(file))
+		if err == nil {
+			p := mustGet(t, set, "a")
+			t.Errorf("Parse accepted an empty egress mode. The policy got %q with DNS %v:\n%s", p.Network.Egress, p.Network.AllowsDNS(), file)
+		} else if !strings.Contains(err.Error(), "network.egress") || !strings.Contains(err.Error(), "line ") {
+			t.Errorf("error = %v, want the key and the line", err)
+		}
+	}
+}

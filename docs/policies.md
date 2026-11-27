@@ -305,13 +305,13 @@ If the new file is not valid, warren writes an error to its log and continues wi
 | Change | Result |
 |---|---|
 | Image, resources, storage, environment, runtime class, node selector, tolerations, command, user ID, user namespace | Applies to pods that start after the change. A pod that operates keeps its settings. Send a restart operation to apply the change. |
-| Network: a new permission | Applies in 30 seconds, also to the pods that operate. |
+| Network: a new permission | Applies a maximum of 30 seconds after warren reads the file, also to the pods that operate. |
 | Network: a removed permission | Warren stops the sandboxes of the policy. The next request starts them again with the new settings. A network plugin can let an open connection continue after a change, thus only a stop closes it. |
 | Idle time | Applies immediately, also to the pods that operate. |
 | Retention time | Applies immediately, also to the volumes that exist. Refer to section 7.1. |
 | User list | Applies to the next request. A terminal that is open stays open. Refer to section 9. |
 | Storage type from persistent to ephemeral | New pods do not use the volume. The volume stays until its retention time, or until a person deletes the instance. |
-| You remove a policy | Each chat that uses the terminal gets an error. Warren stops the pods of the policy in 30 seconds, also a pod with an open terminal. Warren keeps the volumes. |
+| You remove a policy | Each chat that uses the terminal gets an error. Warren stops the pods of the policy a maximum of 30 seconds after it reads the file, also a pod with an open terminal. Warren keeps the volumes. |
 | The scope of a policy changes | Warren does the same as for a removed policy, for the pods and volumes of the previous scope. The retention time of the policy does not apply to the volumes of the previous scope. |
 
 ### 11.1 Volumes of a removed policy
@@ -403,7 +403,7 @@ An item of `allow` has one of two forms:
 The optional key `ports` limits an item to these TCP and UDP ports. Without it, the item permits all ports. A maximum of 16 ports is possible.
 For pods of the cluster, give the port of the pod, not the port of the service.
 
-- A `cidr` is a network with a prefix length, for example `10.20.0.0/16` or `2001:db8::/32`. The network of all addresses is not permitted.
+- A `cidr` is a network with a prefix length, for example `10.20.0.0/16` or `2001:db8::/32`. Warren refuses the network of all addresses.
 - `podLabels` is necessary with `namespace`. A list with no labels would select all pods of the namespace.
 - A file can have a maximum of 32 items in one `allow` list.
 
@@ -435,13 +435,14 @@ userNamespace: true
 
 | Key | Function |
 |---|---|
-| `command` | The start command. The first item must be an absolute path. Warren adds the arguments `run --host 0.0.0.0 --port 8000`. |
+| `command` | The start command. The first item must be an absolute path. Warren adds the arguments `run --host 0.0.0.0 --port 8000`. The program gets each item as the file has it: Kubernetes does not replace `$(NAME)` in an item. |
 | `runAsUser` | The user ID of the processes. It must not be 0. The group ID is always 1001. |
-| `userNamespace` | `true` gives the pod its own range of user IDs on the node. The cluster must support user namespaces. |
+| `userNamespace` | `true` gives the pod its own range of user IDs on the node. The cluster must support user namespaces. With `true`, use a `runAsUser` value from 1 to 65535. Refer to [isolation.md](isolation.md), section 2.2. |
 
 Refer to [isolation.md](isolation.md), section 2, for the default command and for the security settings that a policy cannot change.
 
 Do not change `runAsUser` for a policy that has volumes. The files of a volume keep the user ID of the sandbox that made them, and a different user ID cannot change them.
 To change the user ID, delete the instances first.
 
-If a container cannot start with the image and the command of its policy, warren writes the message of Kubernetes to its log and stops the pod after 2 minutes.
+If a container cannot start with the image and the command of its policy, warren writes the message of Kubernetes to its log.
+After 2 minutes, warren stops the pod.

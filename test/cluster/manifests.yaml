@@ -120,6 +120,8 @@ spec:
         - --warren-pod-labels=app=warren
         - --volume-delete-delay=45s
         - --log-level=debug
+        env:
+        - {name: WARREN_POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
         ports: [{containerPort: 8080}, {containerPort: 9090}]
         readinessProbe: {httpGet: {path: /readyz, port: 9090}, periodSeconds: 2}
         volumeMounts:

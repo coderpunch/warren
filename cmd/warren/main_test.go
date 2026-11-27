@@ -153,3 +153,24 @@ func TestWatchPoliciesReplacesTheSet(t *testing.T) {
 	write("policies:\n  - {id: c, name: C, scope: user}\n")
 	eventually("the corrected file", func() bool { return has("c") && !has("a") })
 }
+
+// The host name of a pod with hostNetwork is the name of its node, and
+// Kubernetes cuts a host name to 63 characters. The pod name from the
+// downward API comes first, thus the checks of the warren pod find the pod.
+func TestPodName(t *testing.T) {
+	node := func() (string, error) { return "node-1", nil }
+	if got := ownPodName("warren-6f7d8c9b5-x2x4z", node); got != "warren-6f7d8c9b5-x2x4z" {
+		t.Errorf("pod name with the variable = %q, want the name of the variable", got)
+	}
+	if got := ownPodName("", node); got != "node-1" {
+		t.Errorf("pod name with no variable = %q, want the host name", got)
+	}
+	t.Setenv("WARREN_POD_NAME", "warren-6f7d8c9b5-x2x4z")
+	if c, err := parseFlags(base); err != nil || c.podName != "warren-6f7d8c9b5-x2x4z" {
+		t.Errorf("WARREN_POD_NAME: pod name = %q, %v", c.podName, err)
+	}
+	t.Setenv("WARREN_POD_NAME", "")
+	if c, err := parseFlags(append(append([]string{}, base...), "--pod-name", "warren-0")); err != nil || c.podName != "warren-0" {
+		t.Errorf("--pod-name: pod name = %q, %v", c.podName, err)
+	}
+}
