@@ -82,7 +82,7 @@ If the file is not valid, warren does not start.
 | `resources` | No | Refer to section 6 | Requests and limits for `cpu`, `memory`, and `ephemeral-storage`. |
 | `storage` | No | Refer to section 7 | The home directory of the sandbox. |
 | `env` | No | None | Environment variables. Refer to section 8. |
-| `idleTimeout` | No | The flag `--idle-timeout` | Warren stops a sandbox after this time with no use. `0` means never. |
+| `idleTimeout` | No | The flag `--idle-timeout` | Warren stops a sandbox after this time with no use. `0` means never. A request for the system information is not a use (section 10.1). |
 | `nodeSelector` | No | None | Node labels that the pod of the sandbox requires. |
 | `tolerations` | No | None | A list of tolerations with the keys `key`, `operator`, `value`, `effect`, and `tolerationSeconds`. |
 | `network` | No | Refer to section 14 | The connections that the sandbox can open. |
@@ -313,6 +313,7 @@ A person who manages a terminal in Open WebUI can see its instances and send ope
 
 After a delete or a reset, the next request of a user starts the sandbox again with an empty home directory.
 The two operations do not start the sandbox.
+A request for the system information is not such a request. Refer to section 10.1.
 
 - After a reset, the sandbox stays in the instance list as a stopped instance. Its empty volume counts for the limits. Warren has no database, thus the volume is the record of an instance that has no pod.
 - The retention time of the policy applies to the empty volume, as to each volume that no sandbox uses (section 7.1). When warren deletes the volume, the sandbox is not in the instance list.
@@ -328,6 +329,20 @@ The instance list shows a sandbox that has a volume and no pod as stopped.
 A sandbox stays on the account of the user that started it first, also when a different person starts it again.
 If a manager starts a new sandbox of the scope `chat`, `model`, or `shared`, the sandbox is on the account of no user. It does not count for the limits of a user.
 A start or restart operation waits while warren deletes the volume of the sandbox.
+
+### 10.1 System information
+
+Open WebUI has a view with the system information of an instance. While the view is open, Open WebUI sends the request `GET /system/info` again each 5 seconds (`protocol.md`, section 4.1.1).
+Warren has a special rule for this request. Without the rule, a view that stays open keeps its sandbox with no end, and starts it again after each stop.
+
+- Warren sends the request only to a sandbox that operates. The data come from Open Terminal.
+- The request does not start a sandbox. For a stopped sandbox, the reply is status 409 with the text "The terminal is stopped. It starts when you use it." Open WebUI shows this text and stops its timer.
+- The request is not a use of the sandbox. It does not start the idle time again, and warren can stop the sandbox while the request is in progress.
+- When a different request or operation started the sandbox, the request waits until the pod is ready, for a maximum of 50 seconds. After that time the reply is status 503.
+- The limits on the number of sandboxes and volumes do not apply to this request.
+- A sandbox is stopped for this rule in these conditions: it has no pod and no start is in progress, its pod is in deletion, its pod failed, or a reset or a delete operation is in progress.
+
+Each other request for a sandbox, also each other request that Open WebUI sends with no action of a person, is a use of the sandbox (`protocol.md`, section 4.1.2).
 
 ## 11. Changes of the policy file
 

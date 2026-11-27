@@ -27,10 +27,17 @@ type Request struct {
 	UserID string
 	// WebSocket is true for a connection that can stay open for a long time.
 	WebSocket bool
+	// Passive is true for a request that only reads the state of a sandbox
+	// (docs/protocol.md, section 4.1.1). Such a request never starts the
+	// sandbox, and it is not a use of the sandbox: the backend does not count
+	// it as activity, and the lease does not keep the sandbox. The request
+	// waits only for a start that a different request or operation began.
+	Passive bool
 }
 
 // Lease is the permission to use a sandbox for one request or connection.
-// While a lease is open, the backend must not stop the sandbox.
+// While a lease is open, the backend must not stop the sandbox. The lease of
+// a passive request is different: it does not keep the sandbox.
 type Lease interface {
 	Target() Target
 	// Release ends the lease. The caller must call it one time.
@@ -51,6 +58,9 @@ var (
 	// ErrCapacity means that warren has its maximum number of sandboxes.
 	// The user cannot correct this.
 	ErrCapacity = errors.New("no capacity for a new sandbox")
+	// ErrStopped means that the sandbox does not operate and that no start
+	// is in progress. Only a passive request gets this error.
+	ErrStopped = errors.New("sandbox is stopped")
 )
 
 // Backend gives leases on sandboxes. An implementation can start a sandbox
@@ -71,7 +81,8 @@ type staticLease struct{ target Target }
 func (l staticLease) Target() Target { return l.target }
 func (staticLease) Release()         {}
 
-// Acquire returns a lease on the one server.
+// Acquire returns a lease on the one server. The one server always operates,
+// thus a passive request gets the same lease.
 func (s Static) Acquire(context.Context, Request) (Lease, error) {
 	return staticLease{s.Server}, nil
 }

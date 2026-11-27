@@ -88,6 +88,20 @@ Some routes exist only when a setting is on:
 | GET | `/system` | Bearer | No | System prompt for a model | `main.py:536-545` |
 | GET | `/info` | Bearer | Yes | Operator text | `main.py:548-558` |
 
+The route `/system/info`:
+
+- The route has only the GET method, and it is not in the OpenAPI document (`main.py:525`). The reply has the header `Cache-Control: no-store` (`main.py:533`).
+- The reply is a JSON object with these fields: `sampled_at`, `hostname`, `os`, `arch`, `environment`, `service_uptime_seconds`, `uptime_seconds`, `cpu`, `memory`, `network`, `processes`, `process_scope`, and `disk` (`open_terminal/utils/system.py:93-105`, `:198-203`). It has the field `setup` when the home directory has the record of a setup script (`main.py:530-532`).
+- One sample reads the processor times, the memory, the control group, the network interfaces, and all processes (`open_terminal/utils/system.py:89-181`). All callers share one sample, and the server makes a new sample when the last one is 2 seconds old (`open_terminal/utils/system.py:184-189`). Thus a caller that sends one request each 5 seconds causes a new sample each time.
+- The processor percentage, and the percentage of each process, is a difference between two samples. It is `null` in the first sample after the start of the server (`open_terminal/utils/system.py:116-119`, `:139-142`, `:170-171`).
+- The request changes no terminal session, no browser session, and no agent session. It can change one record only: if the header `X-Session-Id` names a session with a recorded working directory, the life of that record starts again (`main.py:408-416`, `:526-527`).
+- Section 8.6 gives the values that come from the control group.
+
+Results for warren:
+
+1. The route is a read of data. It gives no proof that a person uses the sandbox.
+2. Warren sends a request for this route only to a sandbox that operates, and the request is not activity (`protocol.md`, section 9.5, decision 8).
+
 ### 3.2 Command execution (7 routes)
 
 | Method | Path | Auth | Tool | Function | Proxy notes | Reference |
@@ -185,6 +199,14 @@ Refer to section 7.1 for the port proxy.
 | WebSocket | `/browser/view/{sid}/{token}/ws` | Path token | No | Relay to a remote WebSocket | `open_terminal/browser/router.py:408-488` |
 | WebSocket | `/browser/view/{sid}/{token}/stream` | Path token | No | Screen stream and input | `open_terminal/browser/router.py:491-510` |
 | WebSocket | `/browser/view/{sid}/{token}/vnc` | Path token | No | VNC byte relay | `open_terminal/browser/router.py:491-510` |
+
+The browser sessions:
+
+- The server keeps the browser sessions in the memory of its process (`open_terminal/browser/router.py:72`). Thus a new pod does not know a session of the previous pod.
+- A request for a session that the server does not know gets the status 404 (`open_terminal/browser/router.py:130-137`).
+- Each request for a session records the time of the request (`open_terminal/browser/router.py:138`, `:146`). The server removes a session 24 hours after the last such time (`open_terminal/browser/router.py:74`, `:87-92`).
+- The body of `PATCH /browser/sessions/{sid}` has five fields, and each field is optional: `url`, `title`, `mode`, `active`, and `chat_id` (`open_terminal/browser/router.py:167-172`). With the body `{}`, the request only records the time.
+- `protocol.md`, section 4.1.2, gives the bodies that Open WebUI sends.
 
 ### 3.8 Desktop (5 routes)
 

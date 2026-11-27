@@ -132,6 +132,78 @@ Response properties:
 - Open WebUI reads all other responses into memory first (`routers/terminals.py:478`).
 - When Open WebUI cannot connect, it replies with status 502 and a JSON object with an `error` field (`routers/terminals.py:510-517`).
 
+#### 4.1.1 The system information view
+
+The browser has a view that shows the system information of an instance: the processor, the memory, the disk, the network, and the processes.
+
+The request:
+
+- The view sends `GET {base}/system/info` through path A. The request has no query string and no body (`src/lib/components/chat/TerminalSystemInfoModal.svelte:35-37`).
+- No other code of Open WebUI v0.13.4 sends this request. The request `GET {url}/system` of paths C and E is for a different route.
+- Before each path A request for a template terminal, Open WebUI reads the template from the orchestrator (`utils/terminals.py:341`). Thus an orchestrator gets two requests for each request of the view.
+
+The timer:
+
+- The view sends the first request when it opens (`TerminalSystemInfoModal.svelte:94-96`).
+- After a request with no error, the view starts a timer of 5000 milliseconds for the next request (`TerminalSystemInfoModal.svelte:47`). Thus the time between two requests is 5 seconds and the time of the reply.
+- The view sends no request while the document of the browser is hidden (`TerminalSystemInfoModal.svelte:30`). Each change of the visibility calls the request function (`TerminalSystemInfoModal.svelte:104`).
+- When the view closes, it stops the timer and the request that is in progress (`TerminalSystemInfoModal.svelte:97-101`).
+- While the first request is in progress, the view shows a wait symbol (`TerminalSystemInfoModal.svelte:33`, `:153-155`). The browser sets no time limit for the request. The limit of 300 seconds of path A applies.
+
+A reply with an error status:
+
+- Open WebUI sends the status and the body of the terminal server to the browser (`routers/terminals.py:478`, `:498-502`).
+- For each status that is not 2xx, the browser reads the body as JSON. The error text is the `detail` field if it is a string. If not, it is the `error` field if that is a string. If not, it is a fixed text with the status (`src/lib/apis/terminal/index.ts:231-241`).
+- The view shows the line "System info unavailable" and the error text (`TerminalSystemInfoModal.svelte:149-152`). It keeps the data of an earlier reply on the screen: only a reply with no error changes the data (`TerminalSystemInfoModal.svelte:38-40`).
+- After an error, the view starts no timer (`TerminalSystemInfoModal.svelte:41-49`). All error statuses have the same effect. The view does not read the `Retry-After` header.
+- The view then sends the next request only when the user uses the "Refresh" control, when the visibility of the document changes, or when the user opens the view again (`TerminalSystemInfoModal.svelte:104`, `:127-131`).
+
+Where the user opens the view:
+
+- The instance list of a manager offers the view only for an instance with the status `running` (`src/lib/components/chat/UserTerminalsModal.svelte:278-279`, `:697-705`).
+- A source comment at that place says that the orchestrator does not start an instance for the system information (`UserTerminalsModal.svelte:276-277`).
+- The terminal menu of the chat input asks for the instance status only when the user manages the terminal (`src/lib/components/chat/MessageInput/TerminalMenu.svelte:277`). It then offers the view only for the status `running` (`src/lib/components/chat/MessageInput/TerminalItemMenu.svelte:32-33`, `:88-93`).
+- For a user who does not manage the terminal, the menu does no status check and always offers the view (`TerminalItemMenu.svelte:33`, `TerminalMenu.svelte:281`).
+- Thus the first request of the view can come for an instance that is stopped, or that starts.
+
+Section 9.5, decision 8, gives the replies of warren.
+
+#### 4.1.2 Requests that the browser sends with no action of the user
+
+Three timers send path A requests:
+
+| Request | Time | Conditions | Reference |
+|---|---|---|---|
+| `GET /system/info` | 5 seconds after each reply with no error | Only while the system information view is open and the document is visible. An error stops the timer. | Section 4.1.1 |
+| `GET /execute`, and `GET /execute/{id}/status?wait=0&offset=...&tail=1000` for an open process tab | 1 second | Only after the `/execute` WebSocket closed before its first message, with a code that is not 4001 or 4003. Not while the process dock is not active, and not while the document is hidden. An error does not stop the timer. | `src/lib/components/chat/TerminalDock.svelte:122-148`, `:196-202`, `src/lib/apis/terminal/socket.ts:98-102` |
+| `PATCH /browser/sessions/{sid}` with the body `{}` | 60 seconds | While a Browser tab exists, also while the document is hidden. The browser ignores the reply and each error. | `src/lib/components/chat/Tabs/Browser.svelte:256-259` |
+
+One function sends each `PATCH /browser/sessions/{sid}` request. The body is a JSON object with the fields that change (`src/lib/apis/terminal/browser.ts:30-42`). The same method and path thus carry the timer and the actions of the user:
+
+| Body | Cause | Reference |
+|---|---|---|
+| `{}` | The timer of 60 seconds | `Tabs/Browser.svelte:256-259` |
+| `{active}` | A change of the tab state. `{active: false}` also when the page goes away and when the tab closes. | `Tabs/Browser.svelte:52-54`, `:250-255`, `:261`, `:284-286` |
+| `{url, title}` | A change of the page that the tab shows | `Tabs/Browser.svelte:56-59`, `:168`, `:238` |
+| `{mode, url}` | A change of the view mode | `Tabs/Browser.svelte:64-67` |
+| `{mode}` | Immediately after the browser made the session | `src/lib/apis/terminal/browser.ts:21-27` |
+| `{chat_id}` | The session gets its saved chat | `Tabs/Browser.svelte:34` |
+
+These requests come one time for an event, with no action of the user in the terminal:
+
+- `GET /skills`, when the selected terminal, the terminal list, the chat, or the first model changes (`src/lib/components/chat/Chat.svelte:1339-1350`, `src/lib/apis/terminal/index.ts:464-469`).
+- `GET /api/config`, when the selected terminal or the chat changes (`src/lib/components/chat/Tabs.svelte:1565-1573`, `:1602-1625`).
+- `GET /files/cwd`, then `GET /files/list` and a maximum of 8 `GET /files/read` requests for the list of recent directories, when the directory menu of the chat input loads (`src/lib/components/chat/MessageInput/WorkingDirectoryMenu.svelte:58-99`, `src/lib/apis/terminal/recentFolders.ts:16-57`).
+- `GET /files/cwd` and `GET /agents` from the Open WebUI backend (path D), for each load of the model list while a terminal is selected (`main.py:933-941`, `utils/agents/discovery.py:36-48`).
+
+Results for warren:
+
+1. Warren has no special rule for the requests of the last list. Each one is a use of the sandbox, and it starts a stopped sandbox.
+2. The system information is different: a view that stays open sends requests with no end, and the data are not proof that a person uses the sandbox. Decision 8 of section 9.5 is the rule of warren for it.
+3. Warren has no rule for the timer of the Browser tab. Each such request is a use of the sandbox, and it starts a stopped sandbox. A forgotten Browser tab thus keeps its sandbox with no end.
+4. A new sandbox does not know the browser session of the previous pod, thus the reply to the timer is then status 404 (`open-terminal-api.md`, section 3.7). The browser ignores the reply, and the timer continues.
+5. A rule for the method and the path cannot be the remedy: the same method and path carry the actions of the user. A rule must read the body. Open WebUI sends the body as a stream (`routers/terminals.py:424-425`), thus the `Content-Length` header is not a sufficient test.
+
 ### 4.2 Path B: WebSocket proxy for the browser
 
 Open WebUI has these WebSocket routes below `/api/v1/terminals/{server_id}`:
@@ -549,10 +621,11 @@ These are conclusions from the facts above. They are inputs to the design. They 
 3. `GET /files/cwd`, `GET /api/config`, and `GET /system` have limits of 5 and 3 seconds. A late reply causes no error, but the model then has no working directory and no system prompt.
 4. Helper calls have a limit of 60 seconds, and browser HTTP requests have a limit of 300 seconds. These calls can wait for a sandbox start.
 5. `GET /api/config` and `GET /openapi.json` arrive with no user on a plain connection (path E). Warren must answer them without a sandbox.
+6. `GET /system/info` has the browser limit of 300 seconds, and each error status stops the timer of the view (section 4.1.1). Thus this request must wait for a sandbox that starts: an error reply in that time stays on the screen. The request itself must never start a sandbox (section 9.5, decision 8).
 
 ### 9.5 Decisions
 
-The owner of the project made the decisions 1 to 6 on 2026-11-25. Decision 7 is from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
+The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 7 and 8 are from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
 
 | No. | Subject | Decision |
 |---|---|---|
@@ -563,6 +636,7 @@ The owner of the project made the decisions 1 to 6 on 2026-11-25. Decision 7 is 
 | 5 | Groups | Warren has no group data. An administrator gives a template to users and groups with the access grants of Open WebUI. |
 | 6 | Management API | Warren implements the template read calls, the status call, and the instance calls. Templates are read-only. An administrator defines them in the warren configuration. |
 | 7 | Limit variables | Warren sets four variables on the container of each sandbox, from the limits of the policy. `OPEN_TERMINAL_CPU_LIMIT` and `OPEN_TERMINAL_MEMORY_LIMIT` have the form in which Kubernetes shows a quantity, for example `500m` and `2Gi`. `OPEN_TERMINAL_CPU_COUNT` is the CPU limit as a whole number, rounded up, with a minimum of 1. `OPEN_TERMINAL_MEMORY_BYTES` is the memory limit as a whole number of bytes. A policy cannot set these variables. The note below the table gives the source. |
+| 8 | System information | Warren sends `GET /system/info` only to a sandbox that operates. For a stopped sandbox, the reply is status 409, and the sandbox does not start. The request is not activity: it does not change the idle time of the sandbox. The note below the table gives the details. |
 
 Because the identity is in headers, warren must have these protections:
 
@@ -582,3 +656,15 @@ Note for decision 7: the four names are not in the source code of Open WebUI v0.
 - An earlier text of the same lines, at the commit `14a0f2f7bdbe5d59a4cf975d984bf6b43a178dba`, says that the variables come from the CPU limit and the memory limit of a policy, and that a user does not set them. It also gives no form of a value.
 
 Thus the forms of decision 7 are a decision of warren. Warren gives each policy the two limits, thus it always sets the four variables.
+
+Note for decision 8: the owner of the project asked for the three rules of the table row, because the view of section 4.1.1 sends its request each 5 seconds. The details are decisions of warren:
+
+- The rule is for a request that is not a WebSocket upgrade, and whose decoded path is exactly `/system/info`. The query string has no effect.
+- Open Terminal has only the GET method on this path. For each other method, warren replies with status 405 and the header `Allow: GET`. No method on this path starts a sandbox.
+- The checks of the key, the path, the identity, the policy, the context, and the user list come first, with their usual replies. The status 409 is thus also the reply for a chat scope with no saved chat. The `detail` text is different.
+- A stopped sandbox has no pod and no start in progress, or its pod is in deletion or in a final phase, or a reset or a delete operation is in progress. The reply is status 409 with the body `{"detail":"The terminal is stopped. It starts when you use it."}`. Open WebUI shows this text to the user (section 4.1.1).
+- The request waits when a different request or operation started the sandbox and the pod is not ready. It waits a maximum of 50 seconds, as each request. At the end of that time, and while warren is not ready, the reply is status 503 with the header `Retry-After: 5`. An immediate error is not correct here: it stops the timer of the view, and the error stays on the screen after the sandbox is ready.
+- If the sandbox stops in that time, the reply is status 409 immediately.
+- In the full time of the wait and of the relay, the request is not a use of the sandbox. Warren can stop the sandbox, also for the idle time, while the request is in progress. The reply is then status 502 or 504.
+- The limits on the number of sandboxes do not apply: the request starts nothing.
+- The first request for a pod makes the checks of `isolation.md`, section 7, before warren sends data to the pod. This request makes them also. They can stop a pod, with the same reasons as for each request.

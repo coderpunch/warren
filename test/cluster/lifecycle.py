@@ -92,6 +92,10 @@ s, _, b = call("GET", "/openapi.json")
 check("warm tool list is filtered by the sandbox", s == 200 and "/execute" in json.loads(b)["paths"], s)
 s, _, b = call("POST", "/files/write", body={"path": "/home/user/secret-of-alice.txt", "content": "alice-private-data\n"})
 check("alice writes a file", s == 200, b)
+# Open WebUI reads the system information again each 5 seconds while a person has it open.
+s, _, b = call("GET", "/system/info")
+info = json.loads(b) if s == 200 else {}
+check("system information comes from a running sandbox", s == 200 and "cpu" in info and "memory" in info and "hostname" in info, (s, b[:120]))
 
 # ---- isolation between users ----
 s, out = run("cat /home/user/secret-of-alice.txt 2>&1; ls /home/user", user="bob")
@@ -164,6 +168,14 @@ for _ in range(30):
     if not any(x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] == "user:bob" and "deletionTimestamp" not in x["metadata"] for x in pods()): gone = True; break
     time.sleep(1)
 check("the pod of bob stops", gone)
+
+# ---- system information of a stopped sandbox ----
+# The request for the system information does not start a sandbox. The reply has the text that Open WebUI shows.
+t0 = time.time(); s, _, b = call("GET", "/system/info", user="bob"); dt = time.time() - t0
+check("system information of a stopped sandbox gives 409 immediately", s == 409 and dt < 5 and json.loads(b) == {"detail": "The terminal is stopped. It starts when you use it."}, (s, round(dt, 1), b))
+time.sleep(5)
+live = [x["metadata"]["name"] for x in pods() if x["metadata"]["annotations"]["warren.coderpunch.io/context-id"] == "user:bob" and "deletionTimestamp" not in x["metadata"]]
+check("the request for the system information starts no sandbox", live == [], live)
 
 # ---- metrics ----
 s, _, b = call("GET", "/metrics", user=None, key=None, base=ADMIN)

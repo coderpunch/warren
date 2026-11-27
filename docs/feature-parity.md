@@ -84,7 +84,8 @@ The warren word for an instance is "sandbox".
 | On Kubernetes, the proxy starts after the pod is ready. | v1 | A readiness gate on the Open Terminal health route. |
 | A slow start shows in Open WebUI as a timeout message. The remedy is a larger Open WebUI timeout (default 60 seconds). | v1 | Warren holds the first request until the pod is ready or a deadline occurs. Open WebUI has shorter limits for some calls. Refer to `protocol.md`, section 9.4. |
 | Idle timeout. The orchestrator stops the instance and keeps the files. The environment default is "off". The Helm chart default is 30 minutes. | v1 | Warren has an idle timeout that an administrator can set. The default is "on". |
-| The activity time of an instance is the time of the last proxied request. | v1 | Warren also counts an open WebSocket as activity. The documentation does not define this case. |
+| The activity time of an instance is the time of the last proxied request. | v1 | Warren also counts an open WebSocket as activity. The documentation does not define this case. A request for the system information is not activity in warren (next row). |
+| The user interface offers the system information only for an instance that runs. The view reads the data again each 5 seconds while it is open. | v1 | Warren sends the request for the system information only to a sandbox that operates. For a stopped sandbox, the reply is status 409, and the sandbox does not start. The request is not activity. Refer to `policies.md`, section 10.1. The documentation does not say what the orchestrator does with this request. A source comment of Open WebUI says that the orchestrator does not start an instance for it (`protocol.md`, section 4.1.1). |
 | Idle timeout for each template. | v1 | Field in a policy. A change applies also to the pods that operate. |
 | Maximum lifetime, for the orchestrator and for each template. The orchestrator stops the instance, also during use. | Later | |
 | Scheduled reset. The orchestrator clears the files at a set time, each week, each month, or on a cron schedule. An administrator sets it in the orchestrator interface. | Later | |
@@ -171,7 +172,7 @@ Warren must show values in these forms.
 |---|---|---|
 | Web interface at `/` with template and instance views, and a setting to turn it off. | Later | The warren specification puts the administrator interface in a subsequent release. |
 | Template API. The documentation does not list its paths. | v1 | Read calls, status call, and instance calls. Templates are read-only. Warren uses only the client behaviour in `protocol.md`, section 4.6. |
-| Instance list with state, and system information for each instance. | v1 | Open Terminal supplies the system information through the proxy. |
+| Instance list with state, and system information for each instance. | v1 | Open Terminal supplies the system information through the proxy. Warren sends the request only to a sandbox that operates (section 7). |
 
 ## 14. Network and isolation
 
@@ -221,3 +222,4 @@ Warren must make its own decision for each of these items. No public source give
 6. The behaviour with more than one replica.
 7. The storage modes (section 8).
 8. The forms of the values of the four limit variables, and the rule to round the CPU count (section 11).
+9. If a request for the system information is activity, and the reply to that request for an instance that is stopped or that starts. A source comment of Open WebUI says only that the orchestrator does not start the instance (section 7).

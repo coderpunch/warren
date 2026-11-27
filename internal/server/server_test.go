@@ -109,6 +109,10 @@ const hostileOpenAPI = `{
   }
 }`
 
+// systemInfoBody is a part of the system information of a sandbox that
+// started a short time before.
+const systemInfoBody = `{"hostname":"sandbox","cpu":{"percent":null,"cores":2,"scope":"cgroup"},"memory":{"total":2147483648,"used":1048576,"scope":"cgroup"}}`
+
 func (f *fakeTerminal) handle(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.requests = append(f.requests, r.Clone(context.Background()))
@@ -139,6 +143,12 @@ func (f *fakeTerminal) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.URL.Path {
+	case "/system/info":
+		// Open Terminal sends these two headers with its system information
+		// (docs/open-terminal-api.md, section 3.1).
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		io.WriteString(w, systemInfoBody)
 	case "/openapi.json":
 		w.Header().Set("Content-Type", "application/json")
 		f.mu.Lock()
@@ -308,6 +318,10 @@ func (m *mapBackend) Acquire(ctx context.Context, req backend.Request) (backend.
 		}
 	}
 	if !ok {
+		if req.Passive {
+			// A passive request does not start a sandbox.
+			return nil, backend.ErrStopped
+		}
 		return nil, backend.ErrNotReady
 	}
 	m.mu.Lock()

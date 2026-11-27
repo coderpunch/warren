@@ -111,9 +111,11 @@ var errBadKey = errors.New("the sandbox refused its key")
 
 // state is the data that warren keeps in memory for one sandbox.
 type state struct {
-	// leases is the number of open requests and WebSockets.
+	// leases is the number of open requests and WebSockets. A passive
+	// request does not count.
 	leases int
-	// lastActivity is the time of the last start or end of a lease.
+	// lastActivity is the time of the last start or end of a lease that
+	// counts.
 	lastActivity time.Time
 	// persisted is the activity time that is in the pod annotation.
 	persisted time.Time
@@ -621,6 +623,12 @@ const pollInterval = time.Second
 //
 // Acquire returns ErrNotReady while warren is not ready, also to a caller
 // that waits at that time. A lease that a caller has stays.
+//
+// A passive request (backend.Request.Passive) never starts the sandbox. It
+// waits only while a start that a different caller began is in progress, or
+// while a pod is not ready or not usable. In all other conditions with no
+// usable pod it gets ErrStopped immediately, also in the middle of the wait.
+// Its lease is not a use of the sandbox: refer to tryAcquire.
 func (m *Manager) Acquire(ctx context.Context, req backend.Request) (backend.Lease, error) {
 	name := req.Ref.Name()
 	for {
@@ -656,15 +664,41 @@ func (m *Manager) Acquire(ctx context.Context, req backend.Request) (backend.Lea
 // tryAcquire does one step. It returns a lease, or nil if the caller must
 // wait.
 func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Request) (backend.Lease, error) {
-	pod := m.pod(name)
 	m.mu.Lock()
 	// Read the state, but do not make it. A request that the limit
 	// refuses must not leave a record.
 	st := m.sandboxes[name]
+	// Read the pod after the state. The mark of a start in progress goes
+	// away only after the cache has the pod. In the opposite sequence, a
+	// passive request could see no pod and no start while a pod starts.
+	pod := m.pod(name)
 	deleting := pod != nil && st != nil && st.deleting == pod.UID
 	resetting := st != nil && st.resetting
+	starting := st != nil && st.startInProgress(m.now())
 	bad := m.badKeys[name]
 	m.mu.Unlock()
+
+	if req.Passive {
+		// A passive request does not start a sandbox, does not delete a pod,
+		// and does not wait for the end of a stop or a reset. It waits only
+		// for a start that is in progress, and for a pod that is not ready
+		// or not usable: the switch and the checks below are the same for
+		// each request in these conditions.
+		switch {
+		case resetting:
+			return nil, backend.ErrStopped
+		case pod == nil && starting:
+			// A different caller began the start. Wait for its pod.
+			return nil, nil
+		case pod == nil:
+			return nil, backend.ErrStopped
+		case pod.Labels[LabelManagedBy] != ManagedByValue:
+			// The switch below gives the error.
+		case pod.DeletionTimestamp != nil || deleting || podTerminal(pod):
+			// The reaper deletes a pod in a final phase.
+			return nil, backend.ErrStopped
+		}
+	}
 
 	switch {
 	case resetting:
@@ -782,6 +816,13 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 	if cur := m.pod(name); cur == nil || cur.UID != pod.UID || cur.DeletionTimestamp != nil || st.deleting == pod.UID || st.resetting {
 		return nil, nil
 	}
+	if req.Passive {
+		// This lease is not a use of the sandbox. It is not in the lease
+		// count, it does not change the activity time, and it is not the
+		// first lease of a cold start. Thus the idle stop does not wait for
+		// it.
+		return &lease{m: m, name: name, target: target, passive: true}, nil
+	}
 	st.leases++
 	st.lastActivity = m.now()
 	if st.coldStart {
@@ -795,12 +836,18 @@ type lease struct {
 	m      *Manager
 	name   string
 	target backend.Target
-	once   sync.Once
+	// passive is true for the lease of a passive request. Such a lease has
+	// only the target.
+	passive bool
+	once    sync.Once
 }
 
 func (l *lease) Target() backend.Target { return l.target }
 
 func (l *lease) Release() {
+	if l.passive {
+		return
+	}
 	l.once.Do(func() {
 		l.m.mu.Lock()
 		defer l.m.mu.Unlock()
@@ -817,6 +864,13 @@ func (l *lease) Release() {
 // createStale is the time after which warren does not wait for the pod of
 // a start request to show in the cache.
 const createStale = 20 * time.Second
+
+// startInProgress reports whether a start request for the sandbox runs, or
+// whether warren waits for the pod of a start request to show in the cache.
+// The caller must hold the lock of the Manager.
+func (st *state) startInProgress(now time.Time) bool {
+	return st.starting || (st.creating && now.Sub(st.createStart) < createStale)
+}
 
 // start sends the start request for a sandbox, if no start is in progress.
 // It waits for the result until ctx ends. The start request continues after
@@ -839,7 +893,7 @@ func (m *Manager) start(ctx context.Context, req backend.Request, exempt bool) e
 
 	m.mu.Lock()
 	st := m.stateLocked(name)
-	if st.starting || (st.creating && m.now().Sub(st.createStart) < createStale) {
+	if st.startInProgress(m.now()) {
 		m.mu.Unlock()
 		return nil
 	}
@@ -1775,7 +1829,7 @@ func (m *Manager) remove(ctx context.Context, name string, keep bool) (*corev1.P
 		pod := m.pod(name)
 		m.mu.Lock()
 		st := m.sandboxes[name]
-		starting := st != nil && (st.starting || (st.creating && m.now().Sub(st.createStart) < createStale))
+		starting := st != nil && st.startInProgress(m.now())
 		m.mu.Unlock()
 		if pod == nil && !starting {
 			break
