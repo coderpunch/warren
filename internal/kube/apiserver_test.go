@@ -11,6 +11,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -150,6 +152,44 @@ func (e *testEnv) strictVolumes() {
 				e.storeVolume(cur)
 			}
 			return true, nil, nil
+		}
+		return false, nil, nil
+	})
+}
+
+var policyResource = networkingv1.SchemeGroupVersion.WithResource("networkpolicies")
+
+// strictNetworkPolicies makes the simulated API server do for a network
+// policy what the API server of Kubernetes does, and what the simulated
+// cluster of client-go does not do:
+//
+//   - Each write that changes the policy gives it a new resource version.
+//   - An update with no change keeps the resource version.
+//   - An update with a resource version that is not the current version gets
+//     the status 409. An update with no resource version has no condition.
+//
+// Without these rules, a test cannot find an update that a different writer
+// made too old.
+func (e *testEnv) strictNetworkPolicies() {
+	e.client.PrependReactor("create", "networkpolicies", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		np := action.(k8stesting.CreateAction).GetObject().(*networkingv1.NetworkPolicy)
+		np.ResourceVersion = strconv.FormatInt(e.version.Add(1), 10)
+		return false, nil, nil
+	})
+	e.client.PrependReactor("update", "networkpolicies", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		np := action.(k8stesting.UpdateAction).GetObject().(*networkingv1.NetworkPolicy)
+		obj, err := e.client.Tracker().Get(policyResource, testNamespace, np.Name)
+		if err != nil {
+			return false, nil, nil
+		}
+		cur := obj.(*networkingv1.NetworkPolicy)
+		if np.ResourceVersion != "" && np.ResourceVersion != cur.ResourceVersion {
+			e.policyConflicts.Add(1)
+			return true, nil, apierrors.NewConflict(networkingv1.Resource("networkpolicies"), np.Name, errors.New("the object has been modified"))
+		}
+		np.ResourceVersion = cur.ResourceVersion
+		if !apiequality.Semantic.DeepEqual(np, cur) {
+			np.ResourceVersion = strconv.FormatInt(e.version.Add(1), 10)
 		}
 		return false, nil, nil
 	})

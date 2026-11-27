@@ -51,6 +51,10 @@ const (
 	// AnnotationNetwork is on a network policy. It has the network settings
 	// of the sandbox policy from which warren made the network policy.
 	AnnotationNetwork = prefix + "/network"
+	// AnnotationNodeBlocked is on a network policy. It has the UID of the
+	// pod for which warren made sure, before the first lease, that the
+	// policy does not permit the addresses of the node of the pod.
+	AnnotationNodeBlocked = prefix + "/node-blocked"
 	// AnnotationUnusedSince is on a volume. It is the time at which warren
 	// found that no sandbox uses the volume, in RFC 3339 form.
 	AnnotationUnusedSince = prefix + "/unused-since"

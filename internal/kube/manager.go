@@ -218,7 +218,8 @@ type Manager struct {
 	// applies network policies.
 	enforcement atomic.Int32
 	// hosts has the node addresses that are in the network policies of the
-	// sandboxes. The caller must hold mu.
+	// sandboxes. The reaper records them after a run that wrote all policies.
+	// The caller must hold mu.
 	hosts map[string]bool
 	// kick asks Run for one run of the reaper at this time.
 	kick chan struct{}

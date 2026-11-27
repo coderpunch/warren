@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -386,10 +385,11 @@ func TestOwnNodeAddressComesWithTheNextReaperRun(t *testing.T) {
 //     these policies has an ingress rule. The cluster does not compare the
 //     peers of a rule.
 //
-// Each write gives a network policy a new resource version, as an API server
-// does. afterDial runs after the cluster decided on a connection attempt.
-// ownPolicy tells it whether the test pod had a policy of its own at that
-// moment: it has none in the second step of the test.
+// Each write that changes a network policy gives it a new resource version,
+// as an API server does: refer to strictNetworkPolicies. afterDial runs
+// after the cluster decided on a connection attempt. ownPolicy tells it
+// whether the test pod had a policy of its own at that moment: it has none
+// in the second step of the test.
 func enforcingCluster(t *testing.T, afterDial func(e *testEnv, ownPolicy bool)) *testEnv {
 	t.Helper()
 	var e *testEnv
@@ -453,13 +453,6 @@ func enforcingCluster(t *testing.T, afterDial func(e *testEnv, ownPolicy bool)) 
 		}
 		return false, nil, nil
 	})
-	version := func(a k8stesting.Action) (bool, runtime.Object, error) {
-		np := a.(interface{ GetObject() runtime.Object }).GetObject().(*networkingv1.NetworkPolicy)
-		np.ResourceVersion = strconv.FormatInt(e.version.Add(1), 10)
-		return false, nil, nil
-	}
-	e.client.PrependReactor("create", "networkpolicies", version)
-	e.client.PrependReactor("update", "networkpolicies", version)
 	// The test deletes its objects with their UID.
 	e.strictDeletes(podsResource)
 	e.strictDeletes(policiesResource)
