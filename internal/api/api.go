@@ -15,11 +15,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/httpx"
-	"github.com/h3xcat/warren/internal/kube"
-	"github.com/h3xcat/warren/internal/policy"
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/httpx"
+	"github.com/coderpunch/warren/internal/kube"
+	"github.com/coderpunch/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // Prefix is the path prefix of the management API. Warren never sends a

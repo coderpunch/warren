@@ -19,8 +19,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/policy"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )

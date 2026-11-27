@@ -6,7 +6,7 @@ import (
 	"errors"
 	"net/url"
 
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // Target is one Open Terminal server that warren can call.

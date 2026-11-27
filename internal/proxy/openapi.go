@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/httpx"
-	"github.com/h3xcat/warren/internal/openapi"
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/httpx"
+	"github.com/coderpunch/warren/internal/openapi"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // openAPIReads limits the number of sandbox documents that warren reads at

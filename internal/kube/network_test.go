@@ -22,8 +22,8 @@ import (
 	networkingclient "k8s.io/client-go/kubernetes/typed/networking/v1"
 	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/policy"
 )
 
 func (e *testEnv) networkPolicies() map[string]networkingv1.NetworkPolicy {

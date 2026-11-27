@@ -12,10 +12,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/kube"
-	"github.com/h3xcat/warren/internal/policy"
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/kube"
+	"github.com/coderpunch/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // fakeInstances records the calls of the handler.

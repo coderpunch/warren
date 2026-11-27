@@ -22,7 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/h3xcat/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/policy"
 )
 
 // NetworkConfig has the data that warren needs to make the network policies

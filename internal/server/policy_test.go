@@ -7,8 +7,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // A policy with a user list gives a sandbox only to the users of the list.

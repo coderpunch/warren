@@ -15,13 +15,13 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/h3xcat/warren/internal/api"
-	"github.com/h3xcat/warren/internal/auth"
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/policy"
-	"github.com/h3xcat/warren/internal/proxy"
-	"github.com/h3xcat/warren/internal/scope"
-	"github.com/h3xcat/warren/internal/server"
+	"github.com/coderpunch/warren/internal/api"
+	"github.com/coderpunch/warren/internal/auth"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/proxy"
+	"github.com/coderpunch/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/server"
 )
 
 const connectionKey = "connection-key-0123456789abcdef0123456789"

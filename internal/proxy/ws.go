@@ -15,9 +15,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/httpx"
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/httpx"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // wsAuth is the method by which a WebSocket route gets its credential.

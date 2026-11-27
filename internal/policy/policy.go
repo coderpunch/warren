@@ -22,7 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
 
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // Policy is one named set of sandbox settings.

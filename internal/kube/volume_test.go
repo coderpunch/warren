@@ -15,8 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/h3xcat/warren/internal/backend"
-	"github.com/h3xcat/warren/internal/scope"
+	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 func (e *testEnv) volumes() []corev1.PersistentVolumeClaim {
