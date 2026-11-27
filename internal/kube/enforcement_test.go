@@ -616,6 +616,62 @@ func TestNamespacePolicyThatCannotComeBackDuringTheNetworkTest(t *testing.T) {
 	}
 }
 
+// A person can change the policy of the namespace before the second step
+// starts, and the reaper can be unable to repair it. The policy is then the
+// same object with the same version from the start to the end of the step.
+// Only the rules show the change. Warren must not start the step, and the
+// proof of the previous test must stay.
+func TestNamespacePolicyWithWrongRulesBeforeTheSecondStep(t *testing.T) {
+	ctx := context.Background()
+	var armed, changed atomic.Bool
+	var second atomic.Int32
+	e := enforcingCluster(t, func(e *testEnv, ownPolicy bool) {
+		switch {
+		case !armed.Load():
+		case !ownPolicy:
+			second.Add(1)
+		case changed.CompareAndSwap(false, true):
+			// The first step: add a rule that permits each connection.
+			policies := e.client.NetworkingV1().NetworkPolicies(testNamespace)
+			np, err := policies.Get(ctx, defaultDenyName, metav1.GetOptions{})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			np.Spec.Ingress = []networkingv1.NetworkPolicyIngressRule{{}}
+			if _, err := policies.Update(ctx, np, metav1.UpdateOptions{}); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	var logs syncBuffer
+	e.m.cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	e.m.examineEnforcement(ctx)
+	if !e.m.Ready() || e.m.enforcement.Load() != enforcementProven {
+		t.Fatalf("the simulated cluster applies network policies, but warren is not ready: %q", e.m.NotReadyReason())
+	}
+
+	armed.Store(true)
+	e.m.examineEnforcement(ctx)
+	armed.Store(false)
+	if !changed.Load() {
+		t.Fatal("the test did not get to its first step")
+	}
+	if got := second.Load(); got != 0 {
+		t.Errorf("connection attempts in the second step = %d, want 0: the policy of the namespace had wrong rules", got)
+	}
+	if got := e.m.enforcement.Load(); got != enforcementProven {
+		t.Errorf("result = %d, want %d: the network plugin is correct, and the policy of the namespace permitted the connections", got, enforcementProven)
+	}
+	if strings.Contains(logs.String(), "THE CLUSTER DOES NOT APPLY NETWORK POLICIES") {
+		t.Error("warren wrote the audit record that tells the administrator to install a network plugin")
+	}
+	if problem, _ := e.m.testProblem.Load().(string); !strings.Contains(problem, "is not the policy that warren makes") {
+		t.Errorf("problem of the test = %q, want the wrong rules of the policy of the namespace as the cause", problem)
+	}
+}
+
 // meshProxy is a transparent proxy on the pod of warren, for example the
 // sidecar of a service mesh. It accepts each TCP connection of warren on the
 // pod itself. Only then does it connect to the destination.

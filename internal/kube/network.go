@@ -455,7 +455,25 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 	//   - The list has the policy from before that write. The update request
 	//     of this run then has an old resource version, and Kubernetes
 	//     refuses it.
+	//
+	// This run removes from the policies each address that is not in the
+	// addresses below. Remove such an address from the record now, before
+	// the writes, and not after them. If not, a pod that gets that node in
+	// the time of the writes, or after a run that could not write all
+	// policies, asks for no run: the record still has the address, and the
+	// policies do not. The lock makes the read and the change one step for
+	// nodeChanged. A pod event then comes before the read, and the addresses
+	// have its node, or its handler sees the smaller record.
+	m.mu.Lock()
 	hosts := m.hostAddresses()
+	kept := make(map[string]bool, len(hosts))
+	for _, cidr := range hosts {
+		if m.hosts[cidr] {
+			kept[cidr] = true
+		}
+	}
+	m.hosts = kept
+	m.mu.Unlock()
 	// complete is true while no write of a policy failed in this run.
 	complete := true
 	have := map[string]*networkingv1.NetworkPolicy{}
@@ -541,11 +559,11 @@ func (m *Manager) reconcileNetworkPolicies(ctx context.Context, pods []*corev1.P
 			}
 		}
 	}
-	// Record the node addresses only when this run put them into the
+	// Record a new node address only when this run put it into the
 	// policies. From here, a pod event asks for a run of the reaper only for
 	// a node address that this run did not have. After a run that could not
-	// write a policy, the previous record stays. The next event of a pod on
-	// a new node then asks for a run again.
+	// write a policy, the record has no new address. The next event of a pod
+	// on a new node then asks for a run again.
 	if complete {
 		known := make(map[string]bool, len(hosts))
 		for _, cidr := range hosts {

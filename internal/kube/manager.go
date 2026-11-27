@@ -218,8 +218,9 @@ type Manager struct {
 	// applies network policies.
 	enforcement atomic.Int32
 	// hosts has the node addresses that are in the network policies of the
-	// sandboxes. The reaper records them after a run that wrote all policies.
-	// The caller must hold mu.
+	// sandboxes. The reaper records a new address after a run that wrote all
+	// policies, and it removes an address before it writes the policies
+	// without that address. The caller must hold mu.
 	hosts map[string]bool
 	// kick asks Run for one run of the reaper at this time.
 	kick chan struct{}
@@ -766,6 +767,12 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 		return nil, nil
 	}
 
+	// The key check and the write of the node address took time. Warren can
+	// be not ready now. A caller that waited must get no lease then, as a new
+	// caller gets none.
+	if !m.Ready() {
+		return nil, backend.ErrNotReady
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st = m.stateLocked(name)

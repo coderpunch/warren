@@ -1155,3 +1155,199 @@ func TestNamespacePolicyConflictAndThenAReadThatFails(t *testing.T) {
 		t.Errorf("rules of the policy after the repair: %+v", np.Spec)
 	}
 }
+
+const (
+	publicNodeA = "203.0.113.5"
+	publicNodeB = "203.0.113.9"
+)
+
+// onPublicNode gives a pod the ready status on a node with a public address.
+func onPublicNode(address string) func(*corev1.Pod) {
+	return func(p *corev1.Pod) {
+		readyStatus(p)
+		p.Status.HostIP = address
+		p.Status.HostIPs = []corev1.HostIP{{IP: address}}
+	}
+}
+
+// refusesNode reports whether the policy of a sandbox does not permit the
+// address of a node.
+func (e *testEnv) refusesNode(req backend.Request, address string) bool {
+	e.t.Helper()
+	return slices.Contains(e.policyOf(req).Spec.Egress[1].To[0].IPBlock.Except, address+"/32")
+}
+
+// startOnNode starts a sandbox on a node and releases its lease.
+func (e *testEnv) startOnNode(req backend.Request, node string) {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res := e.acquireAsync(ctx, e.m, req)
+	waitFor(e.t, "pod", func() bool { return e.m.pod(req.Ref.Name()) != nil })
+	e.setStatus(req.Ref.Name(), onPublicNode(node))
+	r := <-res
+	if r.err != nil {
+		e.t.Fatal(r.err)
+	}
+	r.lease.Release()
+}
+
+// completeRun does one complete run of the reaper, and waits until the pod
+// events of that run (the activity time) are in the cache. It then removes
+// a request for a run that is pending.
+func (e *testEnv) completeRun(reqs ...backend.Request) {
+	e.t.Helper()
+	e.m.Reap(context.Background())
+	for _, req := range reqs {
+		waitFor(e.t, "activity time in the cache", func() bool {
+			p := e.m.pod(req.Ref.Name())
+			return p != nil && p.Annotations[AnnotationActivity] != ""
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-e.m.kick:
+	default:
+	}
+}
+
+// asksForRun reports whether a pod event asked for a run of the reaper.
+func (e *testEnv) asksForRun() bool {
+	e.t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(e.m.kick) > 0 {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// A run of the reaper removes the address of a node that has no sandbox from
+// the policies. If one of its writes fails, the record of the node addresses
+// must not keep that address: some policies do not have it. A new pod on that
+// node must then ask for a run of the reaper.
+func TestNewPodOnANodeThatAnIncompleteRunRemoved(t *testing.T) {
+	e := newTestEnv(t, nil)
+	ctx := context.Background()
+	carol, dan, yuri, xena := userRef("carol"), userRef("dan"), userRef("yuri"), userRef("xena")
+	e.startOnNode(carol, publicNodeB)
+	e.startOnNode(dan, publicNodeB)
+	e.startOnNode(yuri, publicNodeA)
+	e.completeRun(carol, dan, yuri)
+	if !e.refusesNode(carol, publicNodeA) || !e.refusesNode(dan, publicNodeA) {
+		t.Fatal("the test is wrong: the policies do not have the address of node A")
+	}
+
+	// The last sandbox of node A goes away. The next run removes the address
+	// of node A. Its update request for the policy of dan fails.
+	e.stop(yuri)
+	refused := e.policyOf(dan).Name
+	var refuse atomic.Bool
+	refuse.Store(true)
+	e.client.PrependReactor("update", "networkpolicies", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if refuse.Load() && a.(k8stesting.UpdateAction).GetObject().(*networkingv1.NetworkPolicy).Name == refused {
+			return true, nil, errors.New("the server is not available")
+		}
+		return false, nil, nil
+	})
+	e.m.Reap(ctx)
+	refuse.Store(false)
+	if e.refusesNode(carol, publicNodeA) {
+		t.Fatal("the test is wrong: the run did not remove the address of node A from the policy of carol")
+	}
+	if n := len(e.m.kick); n != 0 {
+		t.Fatalf("the test is wrong: %d request for a run is pending before the new pod", n)
+	}
+
+	// A new sandbox starts on node A, and it gets its first lease.
+	c, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	res := e.acquireAsync(c, e.m, xena)
+	waitFor(t, "pod of xena", func() bool { return e.m.pod(xena.Ref.Name()) != nil })
+	e.setStatus(xena.Ref.Name(), onPublicNode(publicNodeA))
+	r := <-res
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	defer r.lease.Release()
+	if !e.asksForRun() {
+		t.Error("no event of the pod on node A asked for a run of the reaper, and the policy of carol permits the address of node A")
+	}
+	// That run puts the address into the policies of the other sandboxes.
+	e.m.Reap(ctx)
+	if !e.refusesNode(carol, publicNodeA) || !e.refusesNode(dan, publicNodeA) {
+		t.Error("the policies of the other sandboxes permit the address of node A after the next run")
+	}
+}
+
+// A new pod can get a node, become ready, and get its first lease while a
+// run of the reaper writes the policies without the address of that node.
+// The record of the node addresses must not have the address in that time:
+// the event of the pod must ask for one more run.
+func TestNewPodOnANodeThatARunRemovesAtThisTime(t *testing.T) {
+	var before atomic.Pointer[func(string)]
+	e := newTestEnv(t, func(c *Config) {
+		c.Client = slowRequests{Interface: c.Client, beforeUpdate: func(name string) {
+			if f := before.Load(); f != nil {
+				(*f)(name)
+			}
+		}}
+	})
+	ctx := context.Background()
+	carol, yuri, xena := userRef("carol"), userRef("yuri"), userRef("xena")
+	e.startOnNode(carol, publicNodeB)
+	e.startOnNode(yuri, publicNodeA)
+	e.completeRun(carol, yuri)
+	if !e.refusesNode(carol, publicNodeA) {
+		t.Fatal("the test is wrong: the policy of carol does not have the address of node A")
+	}
+
+	// The last sandbox of node A goes away. A new sandbox starts: its pod
+	// has no node.
+	e.stop(yuri)
+	c, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	res := e.acquireAsync(c, e.m, xena)
+	waitFor(t, "pod of xena", func() bool { return e.m.pod(xena.Ref.Name()) != nil })
+	if n := len(e.m.kick); n != 0 {
+		t.Fatalf("the test is wrong: %d request for a run is pending before the run", n)
+	}
+
+	target := e.policyOf(carol).Name
+	var done atomic.Bool
+	var lease atomic.Pointer[backend.Lease]
+	hook := func(name string) {
+		if name != target || !done.CompareAndSwap(false, true) {
+			return
+		}
+		// The update request of the reaper for the policy of carol is in
+		// progress: the run removes the address of node A.
+		e.setStatus(xena.Ref.Name(), onPublicNode(publicNodeA))
+		r := <-res
+		if r.err != nil {
+			t.Error(r.err)
+			return
+		}
+		lease.Store(&r.lease)
+	}
+	before.Store(&hook)
+	e.m.Reap(ctx)
+	before.Store(nil)
+	l := lease.Load()
+	if l == nil {
+		t.Fatal("no lease")
+	}
+	defer (*l).Release()
+	if e.refusesNode(carol, publicNodeA) {
+		t.Fatal("the test is wrong: the policy of carol has the address of node A after the run")
+	}
+	if !e.asksForRun() {
+		t.Error("no event of the pod on node A asked for a run of the reaper, and the policy of carol permits the address of node A")
+	}
+	e.m.Reap(ctx)
+	if !e.refusesNode(carol, publicNodeA) {
+		t.Error("the policy of carol permits the address of node A after the next run")
+	}
+}

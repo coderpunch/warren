@@ -219,7 +219,7 @@ Warren also refuses each new request to a sandbox, also when the sandbox operate
 
 - An HTTP request gets the status 503.
 - A new WebSocket does not get the status 503. Warren accepts it with the status 101, and then closes it with the close code 1013. The browser client of Open WebUI tries again after that code. The log record `access` of the WebSocket has the status 101 and the detail `sandbox not ready`.
-- An HTTP request or a WebSocket that waits for the start of a sandbox gets the same result as a new one. It gets the result a maximum of one second after warren became not ready.
+- An HTTP request or a WebSocket that waits for the start of a sandbox gets the same result as a new one. It gets no sandbox after warren became not ready. The result can come some seconds later.
 - Warren does not refuse `GET /openapi.json`. It replies with the status 200 and its complete tool list, and it sends no request to the sandbox.
 
 But a request must get to warren first. If the readiness probe of the warren pod uses `/readyz`, Kubernetes sends no request to a warren that is not ready. In that condition, stop the sandboxes with `kubectl delete pod`.

@@ -1220,3 +1220,46 @@ func TestRequestThatWaitsGetsNoLeaseAfterNotReady(t *testing.T) {
 		})
 	}
 }
+
+// A request can be in the key check of a ready sandbox at the moment at
+// which warren becomes not ready. That request must get no lease, as a new
+// request gets none (docs/isolation.md, section 4).
+func TestRequestInTheKeyCheckGetsNoLeaseAfterNotReady(t *testing.T) {
+	for state, set := range notReadyStates {
+		t.Run(state, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			e := newTestEnv(t, func(c *Config) {
+				c.Verify = func(context.Context, backend.Target) error {
+					close(entered)
+					<-release
+					return nil
+				}
+			})
+			req := userRef("alice")
+			name := req.Ref.Name()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			res := e.acquireAsync(ctx, e.m, req)
+			waitFor(t, "pod "+name, func() bool { return e.m.pod(name) != nil })
+			e.makeReady(name)
+			<-entered
+
+			// The key check is in progress. Warren becomes not ready.
+			set(e.m)
+			if _, err := e.m.Acquire(ctx, req); !errors.Is(err, backend.ErrNotReady) {
+				t.Fatalf("new request = %v, want ErrNotReady", err)
+			}
+			close(release)
+
+			r := <-res
+			if r.err == nil {
+				r.lease.Release()
+				t.Fatal("the request that waited got a lease while warren was not ready")
+			}
+			if !errors.Is(r.err, backend.ErrNotReady) {
+				t.Errorf("request that waited = %v, want ErrNotReady", r.err)
+			}
+		})
+	}
+}
