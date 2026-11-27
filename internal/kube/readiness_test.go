@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/coderpunch/warren/internal/backend"
@@ -1063,5 +1064,159 @@ func TestNotReadyRefusesEachNewRequest(t *testing.T) {
 	e.m.Reap(ctx)
 	if n := e.podDeletes(req.Ref.Name()); n != 0 {
 		t.Errorf("warren stopped a sandbox with an open terminal: delete requests = %d", n)
+	}
+}
+
+// notReadyStates has two conditions in which warren is not ready after it
+// was ready (docs/isolation.md, sections 3.1 and 4).
+var notReadyStates = map[string]func(m *Manager){
+	// A test of the network plugin showed that the cluster does not apply
+	// network policies.
+	"the cluster ignores network policies": func(m *Manager) { m.enforcement.Store(enforcementAbsent) },
+	// The reaper could not repair the policy of the namespace.
+	"the namespace has no policy": func(m *Manager) { m.networkReady.Store(false) },
+}
+
+// previousPodInDeletion puts a pod of the sandbox into the cluster that is
+// in deletion, as in the termination time of a pod. It returns the UID.
+func (e *testEnv) previousPodInDeletion(req backend.Request) types.UID {
+	e.t.Helper()
+	name := req.Ref.Name()
+	deleted := metav1.NewTime(e.clock.Now())
+	old := e.m.buildPod(name, name+"-00000000", req, e.policy(req))
+	old.DeletionTimestamp = &deleted
+	old.Finalizers = []string{"example.test/termination"}
+	made, err := e.client.CoreV1().Pods(testNamespace).Create(context.Background(), old, metav1.CreateOptions{})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	waitFor(e.t, "previous pod in the cache", func() bool { return e.m.pod(name) != nil })
+	return made.UID
+}
+
+// endTermination does the work of the kubelet at the end of the termination
+// time: the pod goes away.
+func (e *testEnv) endTermination(name string) {
+	e.t.Helper()
+	if err := e.client.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), testNamespace, name); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// startedAfter reports whether warren started a pod of the sandbox after
+// the pod with the UID previous.
+func (e *testEnv) startedAfter(name string, previous types.UID) bool {
+	e.t.Helper()
+	for _, p := range e.pods() {
+		if p.Name == name && p.UID != previous {
+			return true
+		}
+	}
+	return false
+}
+
+// A request can wait for the end of the previous pod of its sandbox. If
+// warren becomes not ready in that time, the request must not start the
+// sandbox (docs/isolation.md, section 4).
+func TestRequestThatWaitsStartsNoSandboxAfterNotReady(t *testing.T) {
+	for state, set := range notReadyStates {
+		t.Run(state, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			req := userRef("alice")
+			name := req.Ref.Name()
+			previous := e.previousPodInDeletion(req)
+
+			// The request comes while warren is ready.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			res := e.acquireAsync(ctx, e.m, req)
+			select {
+			case r := <-res:
+				t.Fatalf("Acquire did not wait for the end of the previous pod: %v", r.err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			set(e.m)
+			e.endTermination(name)
+			select {
+			case r := <-res:
+				if r.err == nil {
+					r.lease.Release()
+				}
+				if !errors.Is(r.err, backend.ErrNotReady) {
+					t.Errorf("Acquire that waited = %v, want ErrNotReady", r.err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("the request that waited did not end after warren became not ready")
+			}
+			if e.startedAfter(name, previous) {
+				t.Errorf("warren started a sandbox while it was not ready: %s", e.m.NotReadyReason())
+			}
+		})
+	}
+}
+
+// A start of the management API can also wait for the end of the previous
+// pod. If warren becomes not ready in that time, the operation must not
+// start the sandbox.
+func TestManagementStartThatWaitsStartsNoSandboxAfterNotReady(t *testing.T) {
+	for state, set := range notReadyStates {
+		t.Run(state, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			req := userRef("alice")
+			name := req.Ref.Name()
+			previous := e.previousPodInDeletion(req)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- e.m.Start(ctx, req) }()
+			select {
+			case err := <-done:
+				t.Fatalf("Start did not wait for the end of the previous pod: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			set(e.m)
+			e.endTermination(name)
+			if err := <-done; !errors.Is(err, backend.ErrNotReady) {
+				t.Errorf("Start that waited = %v, want ErrNotReady", err)
+			}
+			if e.startedAfter(name, previous) {
+				t.Errorf("warren started a sandbox while it was not ready: %s", e.m.NotReadyReason())
+			}
+		})
+	}
+}
+
+// A request can wait for a pod that starts. If warren becomes not ready in
+// that time, the request must get no lease when the pod is ready. It must
+// not wait until its time limit.
+func TestRequestThatWaitsGetsNoLeaseAfterNotReady(t *testing.T) {
+	for state, set := range notReadyStates {
+		t.Run(state, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			req := userRef("alice")
+			name := req.Ref.Name()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			res := e.acquireAsync(ctx, e.m, req)
+			waitFor(t, "pod "+name, func() bool { return e.m.pod(name) != nil })
+
+			set(e.m)
+			e.makeReady(name)
+			select {
+			case r := <-res:
+				if r.err == nil {
+					r.lease.Release()
+					t.Fatalf("Acquire gave a lease while warren was not ready: %s", e.m.NotReadyReason())
+				}
+				if !errors.Is(r.err, backend.ErrNotReady) {
+					t.Errorf("Acquire that waited = %v, want ErrNotReady", r.err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("the request that waited did not end after warren became not ready")
+			}
+		})
 	}
 }

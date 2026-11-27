@@ -615,14 +615,19 @@ const pollInterval = time.Second
 // exist, and waits until it is ready or until the context ends. When the
 // context ends first, the start continues, and a subsequent call can
 // succeed.
+//
+// Acquire returns ErrNotReady while warren is not ready, also to a caller
+// that waits at that time. A lease that a caller has stays.
 func (m *Manager) Acquire(ctx context.Context, req backend.Request) (backend.Lease, error) {
-	if !m.Ready() {
-		// Without the pod cache, warren cannot see or count the sandboxes.
-		return nil, backend.ErrNotReady
-	}
 	name := req.Ref.Name()
 	for {
 		wake := m.waiter()
+		// Without the pod cache, warren cannot see or count the sandboxes.
+		// Warren can also become not ready while the caller waits. Thus each
+		// step examines the readiness, not only the first one.
+		if !m.Ready() {
+			return nil, backend.ErrNotReady
+		}
 		l, err := m.tryAcquire(ctx, name, req)
 		if err != nil {
 			return nil, err
@@ -816,6 +821,11 @@ func (m *Manager) start(ctx context.Context, req backend.Request, exempt bool) e
 	pol, ok := m.cfg.Policies.Get(req.Ref.TemplateID)
 	if !ok {
 		return fmt.Errorf("no policy has the ID %q", req.Ref.TemplateID)
+	}
+	// A caller can wait before this call, for example for the end of the
+	// previous pod. Warren can become not ready in that time.
+	if !m.Ready() {
+		return backend.ErrNotReady
 	}
 
 	m.mu.Lock()
