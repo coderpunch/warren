@@ -447,6 +447,38 @@ func TestParseRejectsBadSettings(t *testing.T) {
 	}
 }
 
+// Warren sets the four limit variables from the limits of the policy
+// (docs/policies.md, section 6.1). A policy and the defaults cannot set them.
+func TestPolicyCannotSetLimitVariables(t *testing.T) {
+	for _, name := range []string{"OPEN_TERMINAL_CPU_LIMIT", "OPEN_TERMINAL_CPU_COUNT", "OPEN_TERMINAL_MEMORY_LIMIT", "OPEN_TERMINAL_MEMORY_BYTES"} {
+		files := map[string]string{
+			"policy":   "policies:\n  - id: a\n    name: A\n    scope: user\n    env: {" + name + ": \"64\"}\n",
+			"defaults": "defaults:\n  env: {" + name + ": \"64\"}\npolicies:\n  - id: a\n    name: A\n    scope: user\n",
+		}
+		for place, content := range files {
+			_, err := Parse([]byte(content))
+			if err == nil {
+				t.Errorf("%s in the %s: Parse gave no error", name, place)
+				continue
+			}
+			for _, part := range []string{"a policy cannot set " + name + ":", "warren sets it from the limits of the policy"} {
+				if !strings.Contains(err.Error(), part) {
+					t.Errorf("%s in the %s: error = %v, want the text %q", name, place, err, part)
+				}
+			}
+		}
+		// A policy that does not come from a file has the same rule.
+		_, err := NewSet([]Policy{{ID: "a", Name: "A", Scope: scope.KindUser, Spec: Spec{Env: map[string]string{name: "64"}}}})
+		if err == nil || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s in a policy from code: error = %v", name, err)
+		}
+	}
+	// A name that only starts with the same text is a usual variable.
+	if _, err := Parse([]byte("policies:\n  - id: a\n    name: A\n    scope: user\n    env: {OPEN_TERMINAL_CPU_LIMITS: \"64\", CPU_LIMIT: \"2\"}\n")); err != nil {
+		t.Errorf("a different name: %v", err)
+	}
+}
+
 func TestErrorsHaveLineNumbers(t *testing.T) {
 	_, err := Parse([]byte("policies:\n  - id: a\n    name: A\n    scope: user\n    resources:\n      limits:\n        memory: lots\n"))
 	if err == nil || !strings.Contains(err.Error(), "line 7") {

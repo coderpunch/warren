@@ -8,7 +8,7 @@ The checks are manual. The CI of this repository does not run them. They call wa
 
 | Script | Subject |
 |---|---|
-| `lifecycle.py` | The start, the stop, the idle time, and the limits of a sandbox. The authentication of each request. |
+| `lifecycle.py` | The start, the stop, the idle time, and the limits of a sandbox. The limit variables of the pod. The authentication of each request. |
 | `storage.py` | Volumes, the policy file, the instance operations, the retention time, and the user list of a policy. |
 | `isolation.py` | The network rules of a sandbox, the security settings of the pod, and the separation between two users. |
 

@@ -137,6 +137,37 @@ A sandbox always has a limit for each of the three resources. A sandbox with no 
 If a sandbox uses more memory than its limit, Kubernetes stops the process.
 If a sandbox uses more ephemeral storage than its limit, Kubernetes stops the pod. Warren then starts a new pod at the next request.
 
+### 6.1 Limit variables
+
+Warren gives the CPU limit and the memory limit of a sandbox to the container in four environment variables.
+Warren sets them at the start of the pod, from the limits that the container gets. Thus they always agree with the real limits of that pod.
+
+| Variable | Value | Examples |
+|---|---|---|
+| `OPEN_TERMINAL_CPU_LIMIT` | The CPU limit, in the form in which Kubernetes shows a quantity. | `2`, `500m`, `1500m` |
+| `OPEN_TERMINAL_CPU_COUNT` | The CPU limit as a whole number of processors. Warren rounds up. The minimum is 1. | `2` for the limit `2`, `1` for `500m`, `2` for `1500m` |
+| `OPEN_TERMINAL_MEMORY_LIMIT` | The memory limit, in the form in which Kubernetes shows a quantity. | `2Gi`, `512Mi`, `1G` |
+| `OPEN_TERMINAL_MEMORY_BYTES` | The memory limit as a whole number of bytes, with no unit. | `2147483648` for the limit `2Gi`, `1000000000` for `1G` |
+
+- Kubernetes shows a quantity with the largest unit that gives a whole number. The policy value `0.5` gives `500m`, the value `1000m` gives `1`, and the value `1024Mi` gives `1Gi`.
+- Kubernetes keeps a decimal unit, a binary unit, and an exponent. The value `1G` stays `1G`, and the CPU value `1e3` stays `1e3`.
+- A policy with no limits gets the limits of warren. Thus each sandbox has the four variables.
+- A policy cannot set these variables. Refer to section 8.
+- A change of the limits applies to the pods that start after the change. Refer to section 11.
+- The forms of the values are a decision of warren. The public documentation of the enterprise orchestrator gives the four names, but it gives no form of a value and no rule to round a number (`protocol.md`, section 9.5, decision 7).
+- The template that Open WebUI shows has the CPU limit in a different form: a decimal number, for example `0.5`.
+
+The variables stay in the environment of the server process of the sandbox:
+
+- Open Terminal 0.18.1 does not read them.
+- Open Terminal 0.18.1 does not give them to the programs that it starts. A shell of the user, a command of a tool, the setup script, a notebook, and an agent do not have them in their environment (`open-terminal-api.md`, section 8.6).
+- The template of the system prompt of Open Terminal has no placeholder for them.
+
+Thus the variables have a function only for an image whose server or start command reads them.
+
+To tell a model the limits, write the numbers into the text of the system prompt, with the variable `OPEN_TERMINAL_SYSTEM_PROMPT` in the `env` of the policy.
+The route `GET /system/info` of a sandbox gives the real limits. Open Terminal reads them from the control group of the container (`open-terminal-api.md`, section 8.6).
+
 ## 7. Storage
 
 ```yaml
@@ -236,6 +267,7 @@ A policy cannot set these variables:
 |---|---|
 | `OPEN_TERMINAL_API_KEY`, `OPEN_TERMINAL_API_KEY_FILE` | Warren makes a new key for each pod. |
 | `OPEN_TERMINAL_ISOLATED`, `OPEN_TERMINAL_MULTI_USER`, `OPEN_TERMINAL_USER_PREFIX` | Warren sets the isolation mode. One sandbox for each scope key gives the isolation. |
+| `OPEN_TERMINAL_CPU_LIMIT`, `OPEN_TERMINAL_CPU_COUNT`, `OPEN_TERMINAL_MEMORY_LIMIT`, `OPEN_TERMINAL_MEMORY_BYTES` | Warren sets them from the limits of the policy. Refer to section 6.1. |
 | `OPEN_TERMINAL_PACKAGES`, `OPEN_TERMINAL_PIP_PACKAGES`, `OPEN_TERMINAL_NPM_PACKAGES`, `OPEN_TERMINAL_ALLOWED_DOMAINS` | They need root privilege or a network download at each start. Put packages into the image. |
 | `OPEN_TERMINAL_UVICORN_TIMEOUT_KEEP_ALIVE` | Warren depends on the default value. |
 | `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME` | Warren mounts the home directory at a fixed path. |
@@ -243,7 +275,8 @@ A policy cannot set these variables:
 
 `OPEN_TERMINAL_EXECUTE_TIMEOUT` must be a number of seconds from 1 to 300. Open WebUI stops a request after 300 seconds.
 
-Open Terminal does not give the variables that start with `OPEN_TERMINAL_` to the shells of the user.
+Open Terminal does not give the variables that start with `OPEN_TERMINAL_` to the programs that it starts: the shells of the user, the commands of a tool, the setup script, the notebooks, and the agents (`open-terminal-api.md`, section 8.6).
+This rule applies also to a variable of a policy with such a name, and to the four limit variables of section 6.1.
 
 ## 9. User lists
 

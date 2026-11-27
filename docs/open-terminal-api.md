@@ -499,6 +499,48 @@ Result for warren: the pod must mount the volume at `$HOME` (`/home/user`). The 
 
 Items 4, 6, 7, and the `slim` entry point need a test on a cluster before the implementation selects the default image.
 
+### 8.6 Variables that the server gives to the programs that it starts
+
+The server makes the environment of each program that it starts with one function (`env.py:7-15`):
+
+- The function copies the environment of the server. It removes each variable whose name starts with `OPEN_TERMINAL_` (`env.py:9`).
+- One exception: if the setting `OPEN_TERMINAL_BROWSER_NO_SANDBOX` is on, the function adds that variable with the value `true` (`env.py:10-12`).
+- The function then adds the variables that the caller gives (`env.py:13-14`). `POST /execute` has the body field `env` for such variables (`main.py:260-263`, `:1857-1866`).
+- Version 0.14.3 added this rule (`CHANGELOG.md:448-455`).
+
+| Program | Reference |
+|---|---|
+| Shell of an interactive terminal | `main.py:2263`, `:2296` |
+| Command of `POST /execute` | `open_terminal/utils/runner.py:123`, `:198`, `:274` |
+| Setup script | `open_terminal/utils/setup.py:86` |
+| Notebook kernel | `open_terminal/utils/notebooks.py:188` |
+| Agent | `open_terminal/agents/sessions.py:130` |
+| `git` | `open_terminal/utils/git.py:29` |
+| Desktop | `open_terminal/desktop/native.py:174`, `open_terminal/desktop/router.py:152`, `open_terminal/desktop/portal.py:329`, `open_terminal/desktop/vnc.py:102`, `open_terminal/desktop/wayland.py:74` |
+| Browser in Chrome mode | `open_terminal/browser/chrome.py:259`, `:383` |
+
+The system prompt:
+
+- The template of `OPEN_TERMINAL_SYSTEM_PROMPT` has eight placeholders: `os`, `kernel`, `arch`, `hostname`, `user`, `shell`, `python_version`, and `home` (`main.py:89-99`).
+- The server does not change a placeholder with a different name (`main.py:102-109`). The template has no placeholder for an environment variable.
+- The server adds the text of `OPEN_TERMINAL_INFO` to the prompt that it generates. It does not add it to a template (`main.py:112-137`).
+
+The limits of the container:
+
+- The public documentation of the enterprise orchestrator names four variables for the limits of an instance: `OPEN_TERMINAL_CPU_LIMIT`, `OPEN_TERMINAL_CPU_COUNT`, `OPEN_TERMINAL_MEMORY_LIMIT`, and `OPEN_TERMINAL_MEMORY_BYTES` (`feature-parity.md`, section 11).
+- These four names are in no file of the repository at the commit of section 1. No code of the server reads them.
+- `GET /system/info` reads the limits from the control group of the process. It reads only a version 2 control group (`open_terminal/utils/system.py:51-82`).
+- With a memory limit, the reply gives the limit as the total memory. With a CPU limit, the reply gives the smaller value of the limit and the number of processors of the process. This value can be a fraction, for example `0.5`. The reply then gives the scope `cgroup` for the value (`open_terminal/utils/system.py:127-142`).
+- Version 0.17.4 added this function (`CHANGELOG.md:202-207`).
+
+Results for warren:
+
+1. A variable with the prefix `OPEN_TERMINAL_` stays in the environment of the server process. A shell of the user, a command of a tool, and an agent do not have it in their environment.
+2. Inference: a program in the pod operates as the same user as the server. Thus it can read the environment of the server process from the `/proc` file system. The function is not a protection for a secret (section 8.5, item 11).
+3. Warren sets the four limit variables (`policies.md`, section 6.1). With Open Terminal 0.18.1 they have a function only for an image whose server or start command reads them.
+4. The system prompt can give the limits to a model only when the policy has the numbers in the text of the prompt.
+5. `GET /system/info` is the source of the real limits in a sandbox.
+
 ## 9. Proxy requirements
 
 | Subject | Requirement | Reference |

@@ -419,6 +419,15 @@ func TestPodSpecGivesNoAccessToTheCluster(t *testing.T) {
 	if env["OPEN_TERMINAL_ISOLATED"].Value != "true" || env["OPEN_TERMINAL_MULTI_USER"].Value != "false" {
 		t.Errorf("env = %v", c.Env)
 	}
+	// The policy "personal" sets no limits, thus it has the limits of warren.
+	for name, want := range map[string]string{
+		"OPEN_TERMINAL_CPU_LIMIT": "2", "OPEN_TERMINAL_CPU_COUNT": "2",
+		"OPEN_TERMINAL_MEMORY_LIMIT": "2Gi", "OPEN_TERMINAL_MEMORY_BYTES": "2147483648",
+	} {
+		if env[name].Value != want {
+			t.Errorf("%s = %q, want %q", name, env[name].Value, want)
+		}
+	}
 	if got := fmt.Sprint(c.Args); got != "[run --host 0.0.0.0 --port 8000]" {
 		t.Errorf("args = %s", got)
 	}

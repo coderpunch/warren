@@ -506,6 +506,10 @@ const (
 	maxExecuteTimeout = 300
 )
 
+// limitVariableCause is the cause for the four variables that give the
+// limits of the sandbox (docs/policies.md, section 6.1).
+const limitVariableCause = "warren sets it from the limits of the policy"
+
 // reservedEnv has the variables that a policy cannot set, with the cause.
 var reservedEnv = map[string]string{
 	"OPEN_TERMINAL_API_KEY":         "warren makes the key of each sandbox",
@@ -517,6 +521,10 @@ var reservedEnv = map[string]string{
 	"OPEN_TERMINAL_NPM_PACKAGES":    "it needs a writable package directory and network access at each start",
 	"OPEN_TERMINAL_ALLOWED_DOMAINS": "it needs root privilege in the sandbox",
 	"OPEN_TERMINAL_USER_PREFIX":     "it is for the multi-user mode",
+	"OPEN_TERMINAL_CPU_LIMIT":       limitVariableCause,
+	"OPEN_TERMINAL_CPU_COUNT":       limitVariableCause,
+	"OPEN_TERMINAL_MEMORY_LIMIT":    limitVariableCause,
+	"OPEN_TERMINAL_MEMORY_BYTES":    limitVariableCause,
 	// The proxy closes an idle connection before the server does. A
 	// different time on the server breaks requests.
 	"OPEN_TERMINAL_UVICORN_TIMEOUT_KEEP_ALIVE": "warren depends on the default value",

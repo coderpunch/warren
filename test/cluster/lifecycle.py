@@ -66,10 +66,23 @@ secname = [e for e in pod["spec"]["containers"][0]["env"] if e["name"] == "OPEN_
 check("the Secret of a start has its own name", secname != pod["metadata"]["name"] and secname.startswith(pod["metadata"]["name"] + "-"), secname)
 sec = json.loads(kubectl("-n", "warren-sandboxes", "get", "secret", secname, "-o", "json"))
 check("Secret is owned by the pod", sec["metadata"].get("ownerReferences", [{}])[0].get("uid") == pod["metadata"]["uid"])
+# The policy "personal" sets no limits, thus the pod has the limits of warren: 2 processors and 2Gi.
+LIMITS = ["OPEN_TERMINAL_CPU_LIMIT", "OPEN_TERMINAL_CPU_COUNT", "OPEN_TERMINAL_MEMORY_LIMIT", "OPEN_TERMINAL_MEMORY_BYTES"]
+names = [e["name"] for e in pod["spec"]["containers"][0]["env"]]
+limenv = {e["name"]: e.get("value") for e in pod["spec"]["containers"][0]["env"] if e["name"] in LIMITS}
+check("limit variables in the pod", limenv == dict(zip(LIMITS, ["2", "2", "2Gi", "2147483648"])), limenv)
+at = names.index("OPEN_TERMINAL_MULTI_USER") + 1 if "OPEN_TERMINAL_MULTI_USER" in names else -1
+check("limit variables come after the variables of warren and before the variables of the policy", at > 0 and names[at:at + 4] == LIMITS and "SHARED_SETTING" in names[at + 4:], names)
+reslim = pod["spec"]["containers"][0]["resources"]["limits"]
+check("limit variables agree with the limits of the container", reslim.get("cpu") == limenv.get("OPEN_TERMINAL_CPU_LIMIT") and reslim.get("memory") == limenv.get("OPEN_TERMINAL_MEMORY_LIMIT"), reslim)
 
 s, out = run("echo found=$(env | grep -c 0123456789abcdef); ls /var/run/secrets/kubernetes.io 2>&1 | head -1")
 text = "".join(o["data"] for o in json.loads(out)["output"]) if s == 200 else out
 check("sandbox has no connection key and no service account token", s == 200 and "found=0" in text and "No such file" in text, text)
+# Open Terminal removes the variables that start with OPEN_TERMINAL_ from the commands that it starts.
+s, out = run("echo limits=$(env | grep -c -E '^OPEN_TERMINAL_(CPU|MEMORY)_')")
+text = "".join(o["data"] for o in json.loads(out)["output"]) if s == 200 else out
+check("a command in the sandbox does not get the limit variables", s == 200 and "limits=0" in text, text)
 
 # ---- warm path ----
 t0 = time.time(); s, _, b = call("GET", "/files/cwd"); warm = time.time() - t0

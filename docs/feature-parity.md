@@ -147,7 +147,7 @@ Warren must show values in these forms.
 |---|---|---|
 | The orchestrator passes the template variables to each instance. | v1 | |
 | The orchestrator removes the Open Terminal API key variable from a template. | v1 | |
-| The orchestrator adds variables that give the CPU and memory limits to the processes in the instance. | v1 | Open Terminal 0.18.1 does not read these variables. A system prompt or a tool can read them. |
+| The orchestrator adds variables that give the CPU and memory limits to the processes in the instance. The documentation says that a system prompt or a tool can read them. | v1 | Warren sets the four variables on each sandbox (`policies.md`, section 6.1). The documentation gives no form of the values, thus the forms are a decision of warren (`protocol.md`, section 9.5, decision 7). Open Terminal 0.18.1 does not read these variables, and it removes them from the environment of the programs that it starts (`open-terminal-api.md`, section 8.6). Thus, with Open Terminal 0.18.1, a shell, a command of a tool, and the system prompt do not get them. The documentation does not say how the orchestrator gives them to a system prompt or a tool. |
 | A system prompt variable in the orchestrator environment becomes the default for all instances. | Later | An administrator can set the variable in each policy. |
 | The documentation warns that all users of a terminal can see its environment variables. | Not applicable | The warren documentation must give the same warning. A policy is not a place for secrets. |
 
@@ -220,3 +220,4 @@ Warren must make its own decision for each of these items. No public source give
 5. The limits on the number of instances.
 6. The behaviour with more than one replica.
 7. The storage modes (section 8).
+8. The forms of the values of the four limit variables, and the rule to round the CPU count (section 11).

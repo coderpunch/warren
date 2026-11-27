@@ -552,7 +552,7 @@ These are conclusions from the facts above. They are inputs to the design. They 
 
 ### 9.5 Decisions
 
-The owner of the project made these decisions on 2026-11-25. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
+The owner of the project made the decisions 1 to 6 on 2026-11-25. Decision 7 is from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
 
 | No. | Subject | Decision |
 |---|---|---|
@@ -562,6 +562,7 @@ The owner of the project made these decisions on 2026-11-25. The rule for all de
 | 4 | Verification of a user token | Not in warren. The current protocol sends no user token on an orchestrator connection (section 9.1, item 9). |
 | 5 | Groups | Warren has no group data. An administrator gives a template to users and groups with the access grants of Open WebUI. |
 | 6 | Management API | Warren implements the template read calls, the status call, and the instance calls. Templates are read-only. An administrator defines them in the warren configuration. |
+| 7 | Limit variables | Warren sets four variables on the container of each sandbox, from the limits of the policy. `OPEN_TERMINAL_CPU_LIMIT` and `OPEN_TERMINAL_MEMORY_LIMIT` have the form in which Kubernetes shows a quantity, for example `500m` and `2Gi`. `OPEN_TERMINAL_CPU_COUNT` is the CPU limit as a whole number, rounded up, with a minimum of 1. `OPEN_TERMINAL_MEMORY_BYTES` is the memory limit as a whole number of bytes. A policy cannot set these variables. The note below the table gives the source. |
 
 Because the identity is in headers, warren must have these protections:
 
@@ -573,3 +574,11 @@ Because the identity is in headers, warren must have these protections:
 6. Warren logs a warning at start-up. The warning says that warren trusts the identity headers of each client that has the key.
 
 Note: the management API paths contain the word `terminals`. The paths are part of the wire protocol and are not a brand name.
+
+Note for decision 7: the four names are not in the source code of Open WebUI v0.13.4. Their only source is the public documentation, in the repository `github.com/open-webui/docs` at the commit `ee47d77ed76357560568dd5a1b0898fd514e96d3` (2026-11-26):
+
+- The page `docs/features/open-terminal/terminals/orchestration/environment-variables.md`, lines 45-54, gives the four names. It says that the orchestrator sets a variable for each CPU or memory field of a terminal that has a value.
+- The page says that the two `LIMIT` variables come from the fields, and that the orchestrator calculates the count and the number of bytes from the fields. It gives no form of a value, no example of a value, and no rule to round a number.
+- An earlier text of the same lines, at the commit `14a0f2f7bdbe5d59a4cf975d984bf6b43a178dba`, says that the variables come from the CPU limit and the memory limit of a policy, and that a user does not set them. It also gives no form of a value.
+
+Thus the forms of decision 7 are a decision of warren. Warren gives each policy the two limits, thus it always sets the four variables.
