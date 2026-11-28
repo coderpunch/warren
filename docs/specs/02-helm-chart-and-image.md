@@ -164,6 +164,7 @@ File: `.github/workflows/release.yml`. It starts on a tag of the form `v*.*.*`.
 | Checks | The jobs of `ci.yml`. The nightly end-to-end run of specification 01 must be successful for the same commit. |
 | Image | Build for `linux/amd64` and `linux/arm64`. Push `ghcr.io/coderpunch/warren:<version>`. Do not push the tag `latest`. |
 | Attestation | Make a build provenance attestation and an SBOM for the image digest. |
+| Signature | Sign the image digest with cosign. The signature uses the identity of the workflow, thus the project keeps no key. |
 | Chart | Set `version` and `appVersion` to the version of the tag, and the default image digest to the digest of the new image. Push the chart to the chart registry. |
 | GitHub release | Make a release with the image digest and the chart reference in its text. |
 
@@ -188,6 +189,7 @@ Add `deploy/` to `.dockerignore`. The image does not need the chart.
 ## 8. Documentation
 
 - New document `docs/install.md`: requirements, the installation steps, the connection in Open WebUI, the upgrade, and the removal. It refers to the checklist of `threat-model.md`, section 6.
+- `docs/install.md` also gives the command that examines the signature of the image, with the identity of the release workflow.
 - `README.md`: add the installation document to the table. Remove "the Helm chart" from the list of work that is not complete.
 - `policies.md`, section 12, and `isolation.md`, section 9: say that the chart makes the Role.
 - `feature-parity.md`, section 5: the row about the subchart stays "Won't do". Add that warren has its own chart.
@@ -197,13 +199,13 @@ Add `deploy/` to `.dockerignore`. The image does not need the chart.
 | No. | Item |
 |---|---|
 | O1 | Decided on 2026-11-28: the GitHub registry for the image and for the chart, with the names of section 3. |
-| O2 | Decision of the owner: a signature of the image (cosign) in the first release, or later. |
+| O2 | Decided on 2026-11-28: the first release signs the image with cosign (section 6). |
 | O3 | Decided on 2026-11-28: the chart refuses an installation with no network policy selectors (section 4.7). An administrator who needs no rule sets `networkPolicy.enabled` to `false`. |
 
 ## 10. Acceptance
 
 1. On a new kind cluster, `helm install` with a key Secret and the Open WebUI selectors gives a warren that is ready.
 2. All cluster checks pass with the chart.
-3. A tag makes an image for two architectures, a chart, and a release.
+3. A tag makes an image for two architectures, a chart, and a release. The command of the installation document accepts the signature of the image.
 4. `helm uninstall` keeps the sandbox namespace and its volumes.
 5. `warren --version` prints the version of the tag.
