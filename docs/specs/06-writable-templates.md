@@ -339,6 +339,7 @@ Each phase is one pull request, and each one keeps R1.
 | O3 | Fact to get from specification 01, questions Q1 and Q2: how Open WebUI gives access to a template that it did not make. The answer can change the priority of this work. |
 | O4 | Decision of the owner: the default of `scopes`. This document leaves out `model`. |
 | O5 | Decision of the owner: a template that does not agree with the rules of this time stays in the list and cannot start (section 7.2). The alternative is to stop its pods immediately. |
+| O6 | Decided on 2026-11-28: a user template can set only an image that agrees with a pattern of `allowedImages`. An empty list permits no image (section 4). |
 
 ## 14. Acceptance
 
