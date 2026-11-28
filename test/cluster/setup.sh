@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 
 NAME=warren-dev
 NODE="$NAME-control-plane"
-CALICO_VERSION="${CALICO_VERSION:-v3.31.0}"
+CALICO_VERSION="${CALICO_VERSION:-v3.33.1}"
 # Set CALICO_REGISTRY=docker.io when the network cannot connect to quay.io.
 CALICO_REGISTRY="${CALICO_REGISTRY:-quay.io}"
 K="docker exec -i $NODE kubectl"
