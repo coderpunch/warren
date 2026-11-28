@@ -337,7 +337,7 @@ Each phase is one pull request, and each one keeps R1.
 | O1 | Decided on 2026-11-28: the delete of a user template stops its sandboxes and deletes their volumes (R10). The public documentation says the same for the orchestrator. For a file policy, warren keeps the opposite rule (`policies.md`, section 11.1), because a change of a file can be an error. |
 | O2 | Fact to get from the Open WebUI source code: the type of `cpu_limit` in the request (text or number), if the `PATCH` body has all fields or only the changed fields, and the status values for which the user interface shows the `detail`. Specification 01 gives these facts. |
 | O3 | Fact to get from specification 01, questions Q1 and Q2: how Open WebUI gives access to a template that it did not make. The answer can change the priority of this work. |
-| O4 | Decision of the owner: the default of `scopes`. This document leaves out `model`. |
+| O4 | Decided on 2026-11-28: warren supports the four scopes for a user template. The default of `scopes` does not have `model`. An administrator adds it to permit it (section 4). |
 | O5 | Decision of the owner: a template that does not agree with the rules of this time stays in the list and cannot start (section 7.2). The alternative is to stop its pods immediately. |
 | O6 | Decided on 2026-11-28: a user template can set only an image that agrees with a pattern of `allowedImages`. An empty list permits no image (section 4). |
 
