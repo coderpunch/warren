@@ -717,7 +717,9 @@ func visibility(msg []byte) (active, ok bool) {
 // clientUse finds the messages of the client of one relay that are a use of
 // the sandbox, and tells the lease about each one (backend.Lease.Active). An
 // open WebSocket is not a use of the sandbox: only these messages are
-// (docs/policies.md, section 10.4). The rules:
+// (docs/policies.md, section 10.4). The WebSocket of an agent session is the
+// exception: it keeps its sandbox while it is open, and its lease ignores
+// the call of Active (refer to holdRoute). The rules:
 //
 //   - A binary message is always a use message.
 //   - A text message is a use message unless it is automatic: refer to

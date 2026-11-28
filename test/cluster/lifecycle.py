@@ -160,8 +160,9 @@ for _ in range(20):
     time.sleep(2)
 check("after a restart of warren, the sandbox of alice works with the same pod", ok and "alice-private-data" in out and {x["metadata"]["name"]: x["metadata"]["uid"] for x in pods()} == uid_before, out)
 
-# ---- an open WebSocket with no use does not keep a sandbox ----
-# An open WebSocket is not a use of its sandbox: only the messages of its client are, and not the keepalive message.
+# ---- an open terminal WebSocket with no use does not keep a sandbox ----
+# An open terminal WebSocket is not a use of its sandbox: only the messages of its client are, and not the keepalive message.
+# The WebSocket of an agent session is the exception: it keeps its sandbox while it is open (docs/policies.md, section 10.4).
 # This terminal WebSocket of alice stays open in a second thread, until the idle check at the end of this script.
 # Its client sends only the message that the terminal of Open WebUI sends on a timer. Warren must stop the sandbox
 # after its idle time, and it must close the WebSocket with the code 4004. The checks below do not use this sandbox.

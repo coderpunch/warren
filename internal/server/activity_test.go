@@ -16,7 +16,8 @@ import (
 // sends with no action of a person are not a use: "ping", "frameAck", and
 // "ack" while the terminal is not visible (docs/protocol.md, section 4.2.4).
 // A message of the sandbox is never a use. Warren relays each message with no
-// change.
+// change. The WebSocket of an agent session is the exception: it keeps its
+// sandbox while it is open (backend.Request.Hold).
 
 // exchange sends one message on a WebSocket whose terminal echoes, and makes
 // sure that the terminal got the message with no change.
