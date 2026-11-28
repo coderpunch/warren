@@ -951,6 +951,123 @@ func TestStartAfterTheDeleteRequestOfWarren(t *testing.T) {
 	}
 }
 
+// refusePodDelete stops the first delete request for the pod of a sandbox in
+// the simulated API server: refer to holdPodDelete. When the test calls
+// refuse, the simulated API server refuses that request. It handles each
+// subsequent delete request as usual.
+func (e *testEnv) refusePodDelete(name string) (entered <-chan struct{}, refuse func()) {
+	var first atomic.Bool
+	e.client.PrependReactor("delete", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.(k8stesting.DeleteAction).GetName() == name && first.CompareAndSwap(false, true) {
+			return forbidden(a)
+		}
+		return false, nil, nil
+	})
+	// This reactor is before the reactor above in the sequence.
+	return e.holdPodDelete(name)
+}
+
+// A start operation that comes while the delete request of warren is in the
+// API server waits for the end of the pod. If Kubernetes then refuses that
+// request, the pod continues, and no event comes for it. The operation must
+// see that the delete mark is gone, and it must return: the sandbox operates.
+// Before this rule, the operation examined only the pod in the cache, and it
+// waited until its context ended.
+func TestStartWhenTheDeleteRequestOfWarrenFails(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	uid := e.m.pod(name).UID
+	in, refuse := e.refusePodDelete(name)
+	stopped := make(chan error, 1)
+	go func() { stopped <- e.m.Stop(context.Background(), req.Ref) }()
+	<-in
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	started := make(chan error, 1)
+	go func() { started <- e.m.Start(ctx, req) }()
+	select {
+	case err := <-started:
+		t.Fatalf("Start returned while the delete request was in the API server: error = %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	refuse()
+	if err := <-stopped; err == nil {
+		t.Fatal("Stop = nil, want the error of the API")
+	}
+	if err := <-started; err != nil {
+		t.Fatalf("Start = %v for a sandbox whose pod continues", err)
+	}
+	if p := e.m.pod(name); p == nil || p.UID != uid || p.DeletionTimestamp != nil {
+		t.Errorf("pod after the start operation = %+v, want the pod that continues", p)
+	}
+	if s := e.m.InstanceStatus(req.Ref); s != StatusRunning {
+		t.Errorf("status = %q, want %q", s, StatusRunning)
+	}
+	if n := e.creates(); n != 1 {
+		t.Errorf("pod create requests = %d, want 1", n)
+	}
+	// The start operation does not send a delete request for a pod that
+	// operates.
+	if n := e.podDeletes(name); n != 1 {
+		t.Errorf("pod delete requests = %d, want 1", n)
+	}
+}
+
+// A delete request that fails changes the record of the sandbox, and no event
+// comes for it. Thus the request must wake the callers that wait for the end
+// of the pod. Without the signal, a caller sees the change only at the end of
+// its poll interval.
+func TestDeleteRequestThatFailsWakesTheCallers(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	in, refuse := e.refusePodDelete(name)
+	stopped := make(chan error, 1)
+	go func() { stopped <- e.m.Stop(context.Background(), req.Ref) }()
+	<-in
+	// A caller that starts to wait now has this channel.
+	wake := e.m.waiter()
+	refuse()
+	if err := <-stopped; err == nil {
+		t.Fatal("Stop = nil, want the error of the API")
+	}
+	select {
+	case <-wake:
+	default:
+		t.Error("the delete request that failed did not wake the callers that wait")
+	}
+}
+
+// A start operation sends the delete request for a pod in a final phase. If
+// the API server has no such pod, the cache is late. The operation waits for
+// the cache, and it does not send the request again and again.
+func TestStartOfAFailedPodWhenTheCacheIsLate(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	e.setStatus(name, func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed })
+	waitFor(t, "failed pod in the cache", func() bool { p := e.m.pod(name); return p != nil && podTerminal(p) })
+	e.client.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), name)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := e.m.Start(ctx, req); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Start = %v, want the end of its context", err)
+	}
+	if n := e.podDeletes(name); n != 1 {
+		t.Errorf("pod delete requests = %d, want 1", n)
+	}
+	if n := e.creates(); n != 1 {
+		t.Errorf("pod create requests = %d, want 1", n)
+	}
+}
+
 func TestStartFailureIsReported(t *testing.T) {
 	e := newTestEnv(t, nil)
 	e.client.PrependReactor("create", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {

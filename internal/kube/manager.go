@@ -1680,6 +1680,8 @@ func (m *Manager) deletePod(ctx context.Context, pod *corev1.Pod, reason string,
 			st.deleting = ""
 			m.dropLocked(pod.Name)
 		}
+		// A caller that waits for the end of the pod reads the mark again.
+		m.wakeLocked()
 		m.mu.Unlock()
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -1820,7 +1822,8 @@ func (m *Manager) Instances(templateID string) []Instance {
 // Start sends the start request for a sandbox, for the management API. It
 // does not wait until the sandbox is ready. If the previous pod is failed
 // or in deletion, or if warren sent the delete request for it, Start waits
-// until that pod is gone.
+// until that pod is gone. If that delete request of warren fails, the pod
+// continues, and Start does not wait for its end.
 func (m *Manager) Start(ctx context.Context, req backend.Request) error {
 	return m.startBy(ctx, req, "")
 }
@@ -1870,9 +1873,23 @@ func (m *Manager) startBy(ctx context.Context, req backend.Request, by string) e
 			if err := m.deletePod(ctx, pod, "failed", notIdle); err != nil {
 				return fmt.Errorf("stop sandbox: %w", err)
 			}
-		}
-		if err := m.waitGone(ctx, name, pod.UID); err != nil {
-			return err
+			// The API server accepted the request, or it has no such pod.
+			// In the two cases, the pod goes out of the cache.
+			if err := m.waitGone(ctx, name, pod.UID); err != nil {
+				return err
+			}
+		} else {
+			gone, err := m.waitEnd(ctx, name, pod.UID)
+			if err != nil {
+				return err
+			}
+			if !gone {
+				// The delete request of a different caller failed, and the
+				// pod continues. Make the decision again: a pod that
+				// operates needs no start, and a pod in a final phase gets
+				// the delete request of this operation.
+				return m.startBy(ctx, req, by)
+			}
 		}
 		if m.pod(name) != nil {
 			return nil
@@ -1912,6 +1929,35 @@ func (m *Manager) Stop(ctx context.Context, ref scope.Ref) error {
 		return m.deletePod(ctx, pod, backend.StopAPI, notIdle)
 	}
 	return nil
+}
+
+// waitEnd waits for the end of a pod that a different caller deletes. It
+// reports true when the pod with this UID is not in the cache. It reports
+// false when the pod stays: the pod has no deletion time and no delete mark,
+// because the delete request of warren failed. No event comes for a request
+// that failed, thus the function reads the mark again at each step.
+func (m *Manager) waitEnd(ctx context.Context, name string, uid types.UID) (gone bool, err error) {
+	for {
+		wake := m.waiter()
+		// Read the mark before the pod: refer to deleteSent.
+		sent := m.deleteMark(name)
+		p := m.pod(name)
+		if p == nil || p.UID != uid {
+			return true, nil
+		}
+		if p.DeletionTimestamp == nil && !deleteSent(p, sent) {
+			return false, nil
+		}
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, ctx.Err()
+		case <-wake:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
 }
 
 // waitGone waits until the pod with this UID is not in the cache.
