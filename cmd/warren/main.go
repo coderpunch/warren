@@ -76,7 +76,7 @@ type config struct {
 
 // defaultImage is the image variant of Open Terminal that needs no root
 // privilege (docs/open-terminal-api.md, section 8.5).
-const defaultImage = "ghcr.io/open-webui/open-terminal:0.18.1-openshift"
+const defaultImage = "ghcr.io/open-webui/open-terminal:0.18.8-openshift"
 
 func envDuration(name string, def time.Duration) (time.Duration, error) {
 	v := os.Getenv(name)
