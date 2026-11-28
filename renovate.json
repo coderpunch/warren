@@ -8,6 +8,10 @@
   "commitMessagePrefix": "chore(deps):",
   "minimumReleaseAge": "3 days",
   "platformAutomerge": false,
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "labels": ["security"]
+  },
   "ignorePaths": [
     "**/node_modules/**",
     "**/bower_components/**",
