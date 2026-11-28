@@ -196,7 +196,7 @@ Add `deploy/` to `.dockerignore`. The image does not need the chart.
 
 | No. | Item |
 |---|---|
-| O1 | Decision of the owner: the registry names of section 3. |
+| O1 | Decided on 2026-11-28: the GitHub registry for the image and for the chart, with the names of section 3. |
 | O2 | Decision of the owner: a signature of the image (cosign) in the first release, or later. |
 | O3 | Decided on 2026-11-28: the chart refuses an installation with no network policy selectors (section 4.7). An administrator who needs no rule sets `networkPolicy.enabled` to `false`. |
 
