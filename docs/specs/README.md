@@ -17,6 +17,7 @@ The gaps come from a review of the code against [feature-parity.md](../feature-p
 | 04 | [04-maximum-lifetime.md](04-maximum-lifetime.md) | A maximum lifetime for a sandbox pod | Small | None |
 | 05 | [05-scheduled-reset.md](05-scheduled-reset.md) | A schedule that clears the files of the sandboxes of a policy | Medium | None |
 | 06 | [06-writable-templates.md](06-writable-templates.md) | Templates that a user makes and changes in Open WebUI | Large | 01 |
+| 07 | [07-kata-microvm.md](07-kata-microvm.md) | Sandboxes in Kata microVMs | Small in the code. It needs a cluster with Kata for its check. | None |
 
 Do the work in the sequence of the numbers.
 The owner decided on 2026-11-28 that users must be able to make terminals. Thus specification 06 is planned work, and not an option.
