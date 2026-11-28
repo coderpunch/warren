@@ -8,6 +8,13 @@ Status: proposal. The owner of the project must approve it.
 
 > Maximum lifetime, for the orchestrator and for each template. The orchestrator stops the instance, also during use.
 
+The public documentation says the same (`docs.openwebui.com/features/open-terminal/terminals/orchestration/`, section "Idle Cleanup, Lifetime and Scheduled Resets", read on 2026-11-28):
+
+- The orchestrator has the setting `TERMINALS_MAX_LIFETIME_MINUTES`. The default is 0, which turns the function off.
+- A terminal can have its own value, `max_lifetime_minutes`, which replaces the value of the server. The value 0 turns the function off for that terminal.
+- The stop keeps the files.
+- The documentation describes no notice to the user before the stop.
+
 Warren stops a sandbox only when it is idle. A sandbox with an open terminal can operate with no end.
 A maximum lifetime gives each pod an end. The next pod starts with the current image, the current policy, and a clean container file system.
 
@@ -32,6 +39,8 @@ A maximum lifetime gives each pod an end. The next pod starts with the current i
 | Variable | `WARREN_MAX_LIFETIME` | | The same as the flag. |
 | Policy key | `maxLifetime` | The flag | A time, as `idleTimeout`. `0` means no maximum lifetime for this policy. |
 | `defaults` of the policy file | `maxLifetime` | | A policy uses it when it sets no value. |
+
+If the maximum lifetime of a policy is less than its idle time, the idle time never applies. Warren then writes one warning to its log when it reads the policy file. This is not an error.
 
 Rules for the value:
 
@@ -79,7 +88,8 @@ The documentation must give this warning: with ephemeral storage, the maximum li
 
 ### 3.6 Management API
 
-The template data of Open WebUI has no field for a lifetime (`protocol.md`, section 4.6). Warren does not show the value to Open WebUI.
+The documentation names the template fields `idle_timeout_minutes` and `max_lifetime_minutes`. The terminal dialog of Open WebUI does not have them: the documentation lists the fields of the dialog on the page `creating-terminals`.
+Warren does not show the two values to Open WebUI in the first version. Specification 06 decides if a template of a user can set them.
 
 ## 4. Changes
 
@@ -108,6 +118,7 @@ All unit tests use the simulated clock of the package `internal/kube`.
 | A new manager with a new start time stops an old pod at its first run. | R4 |
 | A change of the policy from no value to `1h` stops a pod that is 2 hours old at the next run. | R5 |
 | `maxLifetime: 30s` and `maxLifetime: -1h` are errors that give the line. | Section 3.1 |
+| A policy with `maxLifetime: 10m` and `idleTimeout: 30m` is valid, and the log has one warning. | Section 3.1 |
 | The metric `warren_sandbox_reaps_total{reason="max_lifetime"}` increases. | Section 3.3 |
 | Cluster check: a policy with `maxLifetime: 2m`. A terminal WebSocket closes after 2 to 3 minutes. A new request starts a new pod with the file of the first pod. | R2, R3 on a cluster |
 
@@ -115,8 +126,8 @@ All unit tests use the simulated clock of the package `internal/kube`.
 
 | No. | Item |
 |---|---|
-| O1 | Decision of the owner: warren can close the WebSockets of the pod with the code 1012 and a clear text before it deletes the pod. This needs a path from the manager to the proxy. The proposal is to not do this in the first version. |
-| O2 | Decision of the owner: a warning in the log when the maximum lifetime of a policy is less than its idle time. |
+| O1 | Decided on 2026-11-28: the first version deletes the pod with no notice to the open WebSockets, as section 3.4 describes. A close with the code 1012 before the delete is a possible later change. It needs a path from the manager to the proxy. |
+| O2 | Decided on 2026-11-28: warren writes a warning when the maximum lifetime of a policy is less than its idle time (section 3.1). |
 
 ## 7. Acceptance
 
