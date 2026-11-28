@@ -46,7 +46,7 @@ For the proxy and the backend, a user template is a policy. Only its source is d
 | R7 | User templates are in Kubernetes objects. Warren has no database. |
 | R8 | The template read calls answer from memory (`protocol.md`, section 9.4, item 1). |
 | R9 | A file policy cannot change through the management API. |
-| R10 | The delete of a user template stops its sandboxes and deletes their volumes. Refer to open item O1. |
+| R10 | The delete of a user template stops its sandboxes and deletes their volumes. |
 
 ## 4. Template rules in the policy file
 
@@ -334,7 +334,7 @@ Each phase is one pull request, and each one keeps R1.
 
 | No. | Item |
 |---|---|
-| O1 | Decision of the owner: R10 deletes the volumes of a deleted template. The public documentation says the same for the orchestrator: the delete of a terminal removes its instances and its files. For a file policy, warren has the opposite rule (`policies.md`, section 11.1), because a change of a file can be an error. |
+| O1 | Decided on 2026-11-28: the delete of a user template stops its sandboxes and deletes their volumes (R10). The public documentation says the same for the orchestrator. For a file policy, warren keeps the opposite rule (`policies.md`, section 11.1), because a change of a file can be an error. |
 | O2 | Fact to get from the Open WebUI source code: the type of `cpu_limit` in the request (text or number), if the `PATCH` body has all fields or only the changed fields, and the status values for which the user interface shows the `detail`. Specification 01 gives these facts. |
 | O3 | Fact to get from specification 01, questions Q1 and Q2: how Open WebUI gives access to a template that it did not make. The answer can change the priority of this work. |
 | O4 | Decision of the owner: the default of `scopes`. This document leaves out `model`. |
