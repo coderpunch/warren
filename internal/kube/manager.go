@@ -1819,7 +1819,8 @@ func (m *Manager) Instances(templateID string) []Instance {
 
 // Start sends the start request for a sandbox, for the management API. It
 // does not wait until the sandbox is ready. If the previous pod is failed
-// or in deletion, it waits until that pod is gone.
+// or in deletion, or if warren sent the delete request for it, Start waits
+// until that pod is gone.
 func (m *Manager) Start(ctx context.Context, req backend.Request) error {
 	return m.startBy(ctx, req, "")
 }
@@ -1831,8 +1832,12 @@ func (m *Manager) startBy(ctx context.Context, req backend.Request, by string) e
 		return backend.ErrNotReady
 	}
 	name := req.Ref.Name()
+	sent := m.deleteMark(name)
 	pod := m.pod(name)
-	if pod != nil && pod.DeletionTimestamp == nil && !podTerminal(pod) {
+	// A pod for which warren sent the delete request stops, also while the
+	// cache does not have its deletion time: refer to deleteSent. The steps
+	// below wait for its end, as for a pod in deletion.
+	if pod != nil && pod.DeletionTimestamp == nil && !deleteSent(pod, sent) && !podTerminal(pod) {
 		return nil
 	}
 	// The sandbox stays on the account of the user that started it first.
@@ -1860,7 +1865,8 @@ func (m *Manager) startBy(ctx context.Context, req backend.Request, by string) e
 		req.UserID = ""
 	}
 	if pod != nil {
-		if pod.DeletionTimestamp == nil {
+		if pod.DeletionTimestamp == nil && !deleteSent(pod, sent) {
+			// The pod is in a final phase, and nothing deletes it.
 			if err := m.deletePod(ctx, pod, "failed", notIdle); err != nil {
 				return fmt.Errorf("stop sandbox: %w", err)
 			}

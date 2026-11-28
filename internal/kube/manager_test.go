@@ -899,6 +899,58 @@ func TestStatusAfterTheDeleteRequestOfWarren(t *testing.T) {
 	})
 }
 
+// A start operation that comes after the delete request of warren, and before
+// the event with the deletion time, must start the sandbox. The pod in the
+// cache shows a sandbox that operates, but that pod stops. The operation waits
+// for the end of the pod and then starts a new pod, as it does for a pod in
+// deletion. Before this rule, the operation did nothing, and the sandbox
+// stayed stopped.
+func TestStartAfterTheDeleteRequestOfWarren(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	uid := e.m.pod(name).UID
+	send := e.holdPodEvent(name)
+	if err := e.m.Stop(context.Background(), req.Ref); err != nil {
+		t.Fatal(err)
+	}
+	if p := e.m.pod(name); p == nil || p.UID != uid || p.DeletionTimestamp != nil {
+		t.Fatal("the test is wrong: the cache does not show the pod as it was before the delete request")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	started := make(chan error, 1)
+	go func() { started <- e.m.Start(ctx, req) }()
+	select {
+	case err := <-started:
+		t.Fatalf("Start returned before the end of the pod that stops: error = %v, pod create requests = %d", err, e.creates())
+	case <-time.After(100 * time.Millisecond):
+	}
+	if n := e.creates(); n != 1 {
+		t.Fatalf("pod create requests before the end of the pod = %d, want 1", n)
+	}
+	send()
+	e.endTermination(name)
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after the end of the pod")
+	}
+	e.newPod(name, uid)
+	if n := e.creates(); n != 2 {
+		t.Errorf("pod create requests = %d, want 2", n)
+	}
+	// The new pod stays on the account of the user that started the sandbox.
+	if by := e.m.pod(name).Annotations[AnnotationCreatedBy]; by != "alice" {
+		t.Errorf("user of the new pod = %q, want alice", by)
+	}
+}
+
 func TestStartFailureIsReported(t *testing.T) {
 	e := newTestEnv(t, nil)
 	e.client.PrependReactor("create", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
