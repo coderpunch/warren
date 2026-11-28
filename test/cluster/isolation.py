@@ -6,7 +6,7 @@ NODE = subprocess.run(["docker", "inspect", "-f", "{{range .NetworkSettings.Netw
 W = f"http://{NODE}:30080"
 KEY = "connection-key-0123456789abcdef0123456789"
 P = "warren.coderpunch.io/"
-IMG = "ghcr.io/open-webui/open-terminal:0.18.1-openshift"
+IMG = "ghcr.io/open-webui/open-terminal:0.18.8-openshift"
 PUBLIC_OK, PUBLIC_BLOCKED = "203.0.113.10", "203.0.113.20"
 fails = []
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -115,7 +115,7 @@ extra = f'''      - id: closed
       - id: alpine
         name: Image with a different layout
         scope: user
-        image: ghcr.io/open-webui/open-terminal:0.18.1-alpine
+        image: ghcr.io/open-webui/open-terminal:0.18.8-alpine
         command: ["/sbin/tini", "--", "/usr/local/bin/python3", "-I", "-u", "-m", "open_terminal"]
         storage: {{type: ephemeral}}
       - id: wrong-command
@@ -126,7 +126,7 @@ extra = f'''      - id: closed
       - id: slim
         name: Other image
         scope: user
-        image: ghcr.io/open-webui/open-terminal:0.18.1-slim
+        image: ghcr.io/open-webui/open-terminal:0.18.8-slim
         runAsUser: 1000
         storage: {{type: ephemeral}}
 '''

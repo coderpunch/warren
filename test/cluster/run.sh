@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 NODE=warren-dev-control-plane
 K="docker exec -i $NODE kubectl"
 PYTHON="${PYTHON:-python3}"
-TERMINAL=ghcr.io/open-webui/open-terminal:0.18.1
+TERMINAL=ghcr.io/open-webui/open-terminal:0.18.8
 checks=("$@")
 [ ${#checks[@]} -eq 0 ] && checks=(isolation storage lifecycle)
 
