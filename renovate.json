@@ -1,0 +1,76 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "commitMessagePrefix": "chore(deps):",
+  "minimumReleaseAge": "3 days",
+  "platformAutomerge": false,
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "**/vendor/**",
+    "**/examples/**",
+    "**/__tests__/**",
+    "**/tests/**",
+    "**/__fixtures__/**"
+  ],
+  "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"],
+  "packageRules": [
+    {
+      "description": "Automerge digest, patch and pin updates after CI passes. platformAutomerge is off: main has no required checks. Minor and major updates wait for a person",
+      "matchUpdateTypes": ["digest", "patch", "pin"],
+      "automerge": true
+    },
+    {
+      "description": "Docker Hub (golang, 1000+ tags), gcr.io and ghcr.io serve no tag timestamps, so under the default timestamp-required every image update would wait forever (renovatebot/renovate#46925)",
+      "matchDatasources": ["docker"],
+      "minimumReleaseAgeBehaviour": "timestamp-optional"
+    },
+    {
+      "description": "Renovate disables '// indirect' Go modules by default. Enable them in one PR, so golang.org/x/* and the other transitive modules do not stay old",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "enabled": true,
+      "groupName": "Go indirect modules"
+    },
+    {
+      "description": "One PR for all GitHub Actions updates. Never automerge",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "automerge": false
+    },
+    {
+      "description": "Open Terminal: the default sandbox image and the cluster check images move together. Never automerge: refresh internal/openapi/open-terminal.json and the 0.18.1 statements in the docs by hand",
+      "matchPackageNames": ["ghcr.io/open-webui/open-terminal"],
+      "groupName": "Open Terminal",
+      "automerge": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Open Terminal image: the default of --sandbox-image (Go source) and the images of the cluster checks",
+      "managerFilePatterns": ["/^cmd/warren/main\\.go$/", "/^test/cluster/run\\.sh$/", "/^test/cluster/isolation\\.py$/"],
+      "matchStrings": ["(?<depName>ghcr\\.io/open-webui/open-terminal):(?<currentValue>\\d[\\w.-]*)"],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Staticcheck, run with go run in CI and in CONTRIBUTING.md",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/", "/^CONTRIBUTING\\.md$/"],
+      "matchStrings": ["go run (?<depName>honnef\\.co/go/tools)/cmd/staticcheck@(?<currentValue>v\\S+)"],
+      "datasourceTemplate": "go"
+    },
+    {
+      "customType": "regex",
+      "description": "Calico of the kind cluster for the cluster checks",
+      "managerFilePatterns": ["/^test/cluster/setup\\.sh$/"],
+      "matchStrings": ["CALICO_VERSION:-(?<currentValue>v[^}]+)\\}"],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "projectcalico/calico"
+    }
+  ]
+}
