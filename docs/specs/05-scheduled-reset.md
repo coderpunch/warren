@@ -8,6 +8,12 @@ Status: proposal. The owner of the project must approve it.
 
 > Scheduled reset. The orchestrator clears the files at a set time, each week, each month, or on a cron schedule. An administrator sets it in the orchestrator interface.
 
+The public documentation gives these facts (`docs.openwebui.com/features/open-terminal/terminals/orchestration/`, section "Idle Cleanup, Lifetime and Scheduled Resets", read on 2026-11-28):
+
+- A reset schedule clears the files of a terminal and refreshes its instances, also the instances that are in use.
+- The schedule is a date and time for one reset, `@weekly`, `@monthly`, or a cron expression with five fields. A time zone is optional.
+- An administrator sets the schedule in the template editor of the administrator interface of the orchestrator.
+
 Warren can clear the files of a sandbox only when a client sends the reset or the delete operation.
 This work lets an administrator give a schedule to a policy. At each time of the schedule, warren clears the files of all sandboxes of that policy.
 
@@ -15,7 +21,7 @@ This work lets an administrator give a schedule to a policy. At each time of the
 
 | No. | Requirement |
 |---|---|
-| R1 | A policy can have a schedule: each week, each month, or a cron expression, with a time zone. |
+| R1 | A policy can have a schedule: one date and time, each week, each month, or a cron expression, with a time zone. |
 | R2 | At a time of the schedule, warren stops each sandbox of the policy and deletes its files. Open requests and open WebSockets do not prevent this. |
 | R3 | The next request of a user starts the sandbox again with an empty home directory. |
 | R4 | A schedule never deletes files that are newer than its last time. |
@@ -39,7 +45,7 @@ policies:
 
 | Key | Necessary | Default | Function |
 |---|---|---|---|
-| `reset.schedule` | Yes, if `reset` is there | | `weekly`, `monthly`, or a cron expression with 5 fields. |
+| `reset.schedule` | Yes, if `reset` is there | | `@weekly`, `@monthly`, a cron expression with 5 fields, or one date and time. |
 | `reset.timeZone` | No | `UTC` | A name of the IANA time zone database. |
 
 The key `reset` is also possible in `defaults`. A policy that sets `reset` replaces the two values of `defaults`.
@@ -49,14 +55,22 @@ A policy can turn off the schedule of `defaults` with `reset: {schedule: none}`.
 
 | Value | Meaning |
 |---|---|
-| `weekly` | Monday at 00:00. The same as `0 0 * * 1`. |
-| `monthly` | Day 1 of the month at 00:00. The same as `0 0 1 * *`. |
-| `none` | No schedule. |
+| `@weekly` | Sunday at 00:00. The same as `0 0 * * 0`. |
+| `@monthly` | Day 1 of the month at 00:00. The same as `0 0 1 * *`. |
 | Cron expression | Five fields: minute, hour, day of the month, month, day of the week. |
+| One date and time | One reset at that time, for example `2027-01-04T04:00`. The form is ISO 8601, with seconds or with no seconds. |
+| `none` | No schedule. |
+
+The documentation does not give the day and the time of `@weekly` and `@monthly`. Warren uses the usual meaning of these words in cron.
+
+Rules for one date and time:
+
+- A value with no offset is a local time in the time zone of `reset.timeZone`. A value with an offset or with `Z` is an exact time, and `reset.timeZone` has no effect.
+- A time that is in the past when warren reads it the first time causes no reset. Rule 2 of section 4.2 gives this result.
 
 Rules for a cron expression:
 
-- A field is `*`, a number, a list with `,`, a range with `-`, or a step with `/`. Names of months and days, and words that start with `@`, are not permitted.
+- A field is `*`, a number, a list with `,`, a range with `-`, or a step with `/`. Names of months and days are not permitted. The only permitted words that start with `@` are `@weekly` and `@monthly`.
 - The day of the week is a number from 0 to 7. The numbers 0 and 7 are Sunday.
 - The minute field must be one number. Thus a schedule has a maximum of one time in each hour.
 - If the day of the month and the day of the week are not `*`, a day agrees when one of the two fields agrees. This is the usual cron rule.
@@ -87,7 +101,8 @@ func (s *Schedule) Prev(t time.Time) time.Time
 func (s *Schedule) String() string
 ```
 
-`Prev` looks back a maximum of 5 years. `Parse` refuses a schedule for which `Prev` finds no time.
+`Prev` looks back a maximum of 5 years. `Parse` refuses a cron expression for which `Prev` finds no time.
+For one date and time, `Prev` returns that time if it is not after `t`. If it is after `t`, `Prev` returns the zero time, and no object is due.
 
 ### 4.2 The mark of a sandbox
 
@@ -186,7 +201,8 @@ The service account of warren needs no new permission. It can already change pod
 | Test | What it shows |
 |---|---|
 | A table of expressions and times with the expected result of `Prev` | The fields, the lists, the ranges, and the steps |
-| `weekly` and `monthly` give the times of section 3.1 | The two words |
+| `@weekly` and `@monthly` give the times of section 3.1 | The two words |
+| One date and time, with an offset and with a time zone: `Prev` before and after that time | The form for one reset |
 | The last day of a month, 29 February, and a change of the year | The calendar |
 | The two days of a year on which the clocks change, in `Europe/Berlin` and `America/New_York` | The time zone rules |
 | Day of the month and day of the week together | The cron rule |
@@ -223,7 +239,7 @@ The file of a user is there before that time and is gone after it. A file that t
 |---|---|
 | O1 | Decision of the owner: section 4.3 uses the delete operation, and the sandbox leaves the instance list. The alternative is the reset operation, which keeps an empty volume for each sandbox. |
 | O2 | Decision of the owner: the limit of one time in each hour (section 3.1). |
-| O3 | Fact to get: the days and the times that the public documentation gives for "each week" and "each month". Section 3.1 uses Monday at 00:00 and day 1 at 00:00 as a proposal. |
+| O3 | Answered on 2026-11-28: the public documentation gives the forms `@weekly`, `@monthly`, a cron expression, and one date and time. It does not give the day and the time of the two words. Section 3.1 uses their usual meaning in cron. |
 | O4 | Decision of the owner: after a long time with no warren process, R6 does a reset that can be many days late. The alternative is a maximum delay, after which warren waits for the next time of the schedule. |
 
 ## 8. Acceptance
