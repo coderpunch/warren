@@ -4,7 +4,7 @@ Status: proposal. The owner of the project must approve it.
 
 ## 1. Purpose
 
-`feature-parity.md`, section 7, has this row with the plan value "Later":
+`feature-parity.md`, section 7, had this row with the plan value "Later" before the decisions of 2026-11-28:
 
 > Scheduled reset. The orchestrator clears the files at a set time, each week, each month, or on a cron schedule. An administrator sets it in the orchestrator interface.
 
@@ -198,7 +198,7 @@ The name of the policy in Open WebUI must tell the users about the schedule. The
 | `internal/kube/manager.go` | A reason parameter for `clear`. A parameter of `emptyVolume` for the `unused-since` value. The workers stop with the context of `Run`. |
 | `internal/metrics/metrics.go` | No change. The two metrics have a `reason` label. |
 | `docs/policies.md` | A new section "Scheduled reset". Section 4: the key. Section 11: one row. Section 13: the two reasons. |
-| `docs/feature-parity.md`, section 7 | Change the plan value of the row to "v1". Note the difference: the schedule is in the policy file, and not in an interface. |
+| `docs/feature-parity.md`, section 7 | The row has the plan value "v1" and the differences. Remove the words "Not in the code at this time" from the note of the row. |
 | `docs/threat-model.md`, section 4.5 | A wrong schedule deletes files. The protection is the delete delay and the log record. |
 
 The service account of warren needs no new permission. It can already change pods and volumes with `patch`.

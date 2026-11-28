@@ -4,7 +4,7 @@ Status: proposal. The owner of the project must approve it.
 
 ## 1. Purpose
 
-`feature-parity.md`, section 11, has this row with the plan value "v1":
+`feature-parity.md`, section 11, had this row with the plan value "v1" before the review:
 
 > The orchestrator adds variables that give the CPU and memory limits to the processes in the instance.
 
@@ -82,7 +82,7 @@ The four names start with that prefix. Thus a shell of the user does not see the
 | `internal/policy/policy.go` | The four names in `reservedEnv`. |
 | `internal/api/api.go` | Use the shared CPU format function. |
 | `docs/policies.md`, section 8 | One row in the table of variables that a policy cannot set. One paragraph about the variables that warren sets. |
-| `docs/feature-parity.md`, section 11 | The names and the source. |
+| `docs/feature-parity.md`, section 11 | The row has the names and the source. Remove the words "Not in the code at this time" from the note of the row. |
 
 ## 5. Tests
 
@@ -105,4 +105,4 @@ The four names start with that prefix. Thus a shell of the user does not see the
 ## 7. Acceptance
 
 1. The tests of section 5 pass.
-2. `feature-parity.md`, section 11, has the four names with their source.
+2. The note of the row in `feature-parity.md`, section 11, does not say that the code does not have the function.

@@ -10,12 +10,16 @@ Status: research record and proposal. The owner of the project must approve the 
 | Commit | `1bcfdcdbf33f6dce876c1d6cdb4ad92cb71f4188` (2026-11-25) |
 | Main pages | `/features/open-terminal/terminals/` and the pages below it |
 | Other pages | `/features/open-terminal/setup/connecting`, `/features/open-terminal/setup/updating`, `/features/open-terminal/advanced/multi-user`, `/features/open-terminal/advanced/security`, `/reference/env-configuration`, `/reference/server-side-tool-calling` |
+| Second read | The website `docs.openwebui.com` on 2026-11-28: `/features/open-terminal/terminals/` and the pages below `/features/open-terminal/terminals/orchestration/` |
 
 Clean-room rules that apply to this document:
 
 - This document lists features only. It contains no code and no configuration that came from the documentation.
 - No person read the `open-webui/terminals` repository for this document. The public documentation refers to the README of that repository for some settings. This document does not use that README.
 - Names of settings, headers, and fields are facts. This document gives them where they are necessary to identify a feature.
+
+The owner made decisions about the open work on 2026-11-28. The documents in [specs/](specs/README.md) describe that work.
+A note with the words "Not in the code at this time" marks a row whose work is planned and not complete.
 
 In this document, "the orchestrator" means the enterprise product that the public documentation describes.
 "The documentation" means the public documentation.
@@ -28,6 +32,7 @@ In this document, "the orchestrator" means the enterprise product that the publi
 | Template | The same object, as the orchestrator stores it. |
 | Instance | One container or pod that the orchestrator starts from a template. |
 | Policy | The old object (before orchestrator version 0.4.0). A policy belonged to a connection. The documentation says that templates replaced policies. |
+| Machine | The word for a terminal in the documentation of 2026-11-28. |
 
 The warren specification uses the word "policy" for a named set of sandbox settings.
 One warren policy has the same function as one template.
@@ -62,8 +67,8 @@ The warren word for an instance is "sandbox".
 | Kubernetes operator backend with a custom resource and a second controller. | Won't do | Warren is the controller. Warren keeps its state in labels and annotations. A custom resource is not necessary. |
 | Instance phases in the status of the custom resource. | Won't do | Warren shows the state in pod annotations, metrics, and the instance list. |
 | OpenShift restricted mode (pods that are not root). | Later | Warren always applies the restricted Pod Security Standard. A test on OpenShift is not in the first release. |
-| A kubeconfig setting for an orchestrator that is not in the cluster. | Later | Warren v1 operates in the cluster. |
-| Deployment as a subchart of the Open WebUI Helm chart, with a key that the chart makes. | Won't do | Warren has its own Helm chart. |
+| A kubeconfig setting for an orchestrator that is not in the cluster. | v1 | The flag `--kubeconfig`. For a warren that is not a pod, the flag `--ingress-cidrs` is also necessary (`isolation.md`, section 6). |
+| Deployment as a subchart of the Open WebUI Helm chart, with a key that the chart makes. | Won't do | Warren has its own Helm chart. The chart makes no key. Not in the code at this time. Refer to `specs/02-helm-chart-and-image.md`. |
 
 ## 6. Instance scopes
 
@@ -73,7 +78,7 @@ The warren word for an instance is "sandbox".
 | User scope: one instance for each user. | v1 | |
 | Chat scope: one instance for each saved chat. A temporary chat cannot use it. | v1 | |
 | Model scope: one instance for each model. All users of the model share it. | v1 | Only possible with an orchestrator connection. Refer to `protocol.md`, section 9.2. |
-| The scope cannot change while instances exist. | v1 | Warren does not prevent the change. After a change, warren stops the pods of the previous scope and keeps their volumes. Refer to `policies.md`, section 11. |
+| The scope cannot change while instances exist. | v1 | For a policy of the file, warren does not prevent the change. After a change, warren stops the pods of the previous scope and keeps their volumes. Refer to `policies.md`, section 11. For a template of a user, warren will refuse the change (`specs/06-writable-templates.md`). |
 | Per-automation scope. The documentation describes none. | Later | The warren specification puts it in a subsequent release. |
 
 ## 7. Lifecycle
@@ -86,12 +91,12 @@ The warren word for an instance is "sandbox".
 | Idle timeout. The orchestrator stops the instance and keeps the files. The environment default is "off". The Helm chart default is 30 minutes. | v1 | Warren has an idle timeout that an administrator can set. The default is "on". |
 | The activity time of an instance is the time of the last proxied request. | v1 | Warren also counts an open WebSocket as activity. The documentation does not define this case. |
 | Idle timeout for each template. | v1 | Field in a policy. A change applies also to the pods that operate. |
-| Maximum lifetime, for the orchestrator and for each template. The orchestrator stops the instance, also during use. | Later | |
-| Scheduled reset. The orchestrator clears the files at a set time, each week, each month, or on a cron schedule. An administrator sets it in the orchestrator interface. | Later | |
+| Maximum lifetime, for the orchestrator and for each template. The orchestrator stops the instance, also during use. The files stay. | v1 | Not in the code at this time. A flag and a policy key. Warren gives no notice to open connections before the stop. Refer to `specs/04-maximum-lifetime.md`. |
+| Scheduled reset. The orchestrator clears the files at one date and time, each week (`@weekly`), each month (`@monthly`), or on a cron schedule, with an optional time zone. It also refreshes the instances that are in use. An administrator sets it in the orchestrator interface. | v1 | Not in the code at this time. Different in warren: the schedule is a key of a policy. Each sandbox keeps an empty volume and stays in the instance list. Warren does a reset that it missed. Warren refuses a schedule with more than one time in each hour. Refer to `specs/05-scheduled-reset.md`. |
 | Instance operations: start, stop, restart, delete. | v1 | Warren implements the instance calls. Refer to `protocol.md`, section 9.5. |
 | Restart stops an instance and starts it again with the current template settings. | v1 | |
 | Instance operation: reset (clear the files and start again). | v1 | Warren deletes the pod and the volume, and makes a new, empty volume. The instance stays in the instance list. Warren does not start the instance again: the next request of a user does that. Open WebUI 0.13.4 has no control for this operation. |
-| A deleted instance keeps its volume on the operator backend. A deleted terminal removes its instances and files. | v1 | Different in warren: the delete operation for an instance removes the pod and the volume. The Open WebUI user interface tells the person that the delete removes the instance and its files. The stop operation keeps the volume. A template is part of the warren configuration, thus Open WebUI cannot delete it. When an administrator removes a policy from the file, warren keeps its volumes. Only an explicit cleanup operation deletes them. Refer to `policies.md`, section 11.1. |
+| A deleted instance keeps its volume on the operator backend. A deleted terminal removes its instances and files. | v1 | Different in warren: the delete operation for an instance removes the pod and the volume. The Open WebUI user interface tells the person that the delete removes the instance and its files. The stop operation keeps the volume. A template is part of the warren configuration, thus Open WebUI cannot delete it. When an administrator removes a policy from the file, warren keeps its volumes. Only an explicit cleanup operation deletes them. Refer to `policies.md`, section 11.1. For a template of a user, the delete will remove the sandboxes and their volumes (`specs/06-writable-templates.md`). |
 | A template change applies only to instances that start after the change. | v1 | Warren reads the policy file again with no restart. The idle time, the retention time, and the user list apply immediately. Refer to `policies.md`, section 11. |
 | Setup script that runs at each start of an instance. Open Terminal reads it from an environment variable. | v1 | Warren passes the variable. A setup script that needs root or a network download can fail in a restricted sandbox. |
 | A setting for the image pull policy. | v1 | |
@@ -126,7 +131,7 @@ The warren word for an instance is "sandbox".
 | Runtime class (gVisor or Kata). The documentation describes none. | v1 | Addition in warren. |
 | Changes to the security context and the pod template of an instance. | Won't do | Warren has a fixed restricted security context. A policy can set the runtime class, the node selector, the tolerations, the user ID, a user namespace, and the start command. Refer to `isolation.md`, section 2. |
 | Node selector and tolerations. In the documentation these are orchestrator settings, not template fields. | v1 | Keys of a policy, and of the `defaults` of the policy file. |
-| Users make and change templates in the Open WebUI user interface. | Later | In v1, an administrator defines policies in a YAML file or a ConfigMap. Warren shows each policy to Open WebUI as a read-only template. |
+| Users make and change templates in the Open WebUI user interface. A user needs the Write permission on the connection. A new template is private until a person shares it. | v1 | Not in the code at this time. At this time, an administrator defines policies in a YAML file or a ConfigMap, and warren shows each policy to Open WebUI as a read-only template. The owner decided on 2026-11-28 that warren gets templates that a user makes. The policies of the file stay read-only. Refer to `specs/06-writable-templates.md`. |
 
 The Open WebUI user interface accepts a decimal number for CPU, for example `0.5`. It accepts a size such as `512Mi` or `2Gi` for memory and storage (`protocol.md`, section 4.6).
 Warren must show values in these forms.
@@ -135,8 +140,8 @@ Warren must show values in these forms.
 
 | Feature in the documentation | Plan | Note |
 |---|---|---|
-| Maximum CPU, memory, and storage that a template can request. | Later | Not necessary while only an administrator defines policies. |
-| Image allowlist with glob patterns. | Later | Not necessary while only an administrator defines policies. |
+| Maximum CPU, memory, and storage that a template can request. | v1 | Not in the code at this time. The key `templates.limits` of the policy file. Refer to `specs/06-writable-templates.md`. |
+| Image allowlist with glob patterns. In the orchestrator, an empty list permits each image. | v1 | Not in the code at this time. Different in warren: an empty list permits no image. A template of a user can then use only the default image. Refer to `specs/06-writable-templates.md`. |
 | Restricted mode that applies restricted security settings. | v1 | Always on in warren. There is no setting to turn it off. |
 | In restricted mode, the orchestrator rejects a template that sets the in-container egress filter or package installation at start-up. | v1 | These Open Terminal functions need root or `NET_ADMIN`. Warren rejects a policy that sets them. |
 | Limit on the number of instances for each user. The documentation describes none. | v1 | Addition in warren. |
@@ -147,8 +152,8 @@ Warren must show values in these forms.
 |---|---|---|
 | The orchestrator passes the template variables to each instance. | v1 | |
 | The orchestrator removes the Open Terminal API key variable from a template. | v1 | |
-| The orchestrator adds variables that give the CPU and memory limits to the processes in the instance. | v1 | Open Terminal 0.18.1 does not read these variables. A system prompt or a tool can read them. |
-| A system prompt variable in the orchestrator environment becomes the default for all instances. | Later | An administrator can set the variable in each policy. |
+| The orchestrator adds variables that give the CPU and memory limits to the processes in the instance: `OPEN_TERMINAL_CPU_LIMIT`, `OPEN_TERMINAL_CPU_COUNT`, `OPEN_TERMINAL_MEMORY_LIMIT`, and `OPEN_TERMINAL_MEMORY_BYTES` (page `orchestration/environment-variables`). | v1 | Not in the code at this time. Open Terminal 0.18.1 does not read these variables. A system prompt or a tool can read them. Refer to `specs/03-limit-variables.md`. |
+| A system prompt variable in the orchestrator environment becomes the default for all instances. | v1 | The key `defaults.env` of the policy file gives a variable to all sandboxes. A policy can replace it (`policies.md`, section 4.1). |
 | The documentation warns that all users of a terminal can see its environment variables. | Not applicable | The warren documentation must give the same warning. A policy is not a place for secrets. |
 
 ## 12. Authentication and access
@@ -170,7 +175,7 @@ Warren must show values in these forms.
 | Feature in the documentation | Plan | Note |
 |---|---|---|
 | Web interface at `/` with template and instance views, and a setting to turn it off. | Later | The warren specification puts the administrator interface in a subsequent release. |
-| Template API. The documentation does not list its paths. | v1 | Read calls, status call, and instance calls. Templates are read-only. Warren uses only the client behaviour in `protocol.md`, section 4.6. |
+| Template API. The documentation does not list its paths. | v1 | Read calls, status call, and instance calls. At this time, templates are read-only. The write calls are planned (`specs/06-writable-templates.md`). Warren uses only the client behaviour in `protocol.md`, section 4.6. |
 | Instance list with state, and system information for each instance. | v1 | Open Terminal supplies the system information through the proxy. |
 
 ## 14. Network and isolation
@@ -208,6 +213,10 @@ Warren must show values in these forms.
 
 The documentation says that the current orchestrator needs Open WebUI 0.13.4 or later.
 Warren v1 has the same minimum: Open WebUI 0.13.4.
+
+No test with a real Open WebUI exists at this time. The test of `specs/01-end-to-end-test.md` must prove this version.
+The documentation of 2026-11-28 has names that `protocol.md` does not have for version 0.13.4, for example `MACHINE_CONNECTIONS` and `AIOHTTP_CLIENT_TIMEOUT_MACHINE`.
+A later version of Open WebUI possibly has new names. That test must find the version and its effect on the protocol.
 
 ## 18. Items that the documentation does not define
 

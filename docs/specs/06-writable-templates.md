@@ -325,8 +325,8 @@ Each phase is one pull request, and each one keeps R1.
 ## 12. Documentation
 
 - New document `docs/templates.md`: the template rules, the fields, and the warnings of section 9.
-- `protocol.md`, section 9.5: change decision 6, with the date and the name of the owner.
-- `feature-parity.md`: sections 9, 10, and 13. The rows about the user interface, the limits, the image allowlist, and the template API get the plan value "v1".
+- `protocol.md`, section 9.5: the paragraph about the change of decision 6 says that the code does not have the calls. Remove that sentence.
+- `feature-parity.md`: sections 6, 7, 9, 10, and 13. The rows about the user interface, the limits, the image allowlist, and the template API have the plan value "v1". Remove the words "Not in the code at this time" and "planned" from their notes.
 - `policies.md`: section 1 says that there are two types of policies. Section 12 gets the ConfigMap and the permission.
 - `threat-model.md`: section 9 of this document.
 

@@ -561,7 +561,11 @@ The owner of the project made these decisions on 2026-11-25. The rule for all de
 | 3 | Identity of the user | The headers that Open WebUI sets on its server: `X-User-Id` and the `X-Terminal-*` headers (section 6.1). |
 | 4 | Verification of a user token | Not in warren. The current protocol sends no user token on an orchestrator connection (section 9.1, item 9). |
 | 5 | Groups | Warren has no group data. An administrator gives a template to users and groups with the access grants of Open WebUI. |
-| 6 | Management API | Warren implements the template read calls, the status call, and the instance calls. Templates are read-only. An administrator defines them in the warren configuration. |
+| 6 | Management API | Warren implements the template read calls, the status call, and the instance calls. Templates are read-only. An administrator defines them in the warren configuration. The owner changed this decision on 2026-11-28. Refer to the paragraph below the table. |
+
+Change of decision 6: on 2026-11-28 the owner decided that a user must be able to make a terminal in Open WebUI.
+Warren will also implement the `POST`, `PATCH`, and `DELETE` calls of section 4.6 for templates that a user makes. The policies of the warren configuration stay read-only.
+The code does not have these calls at this time: they get the status 403. The design is in `specs/06-writable-templates.md`.
 
 Because the identity is in headers, warren must have these protections:
 

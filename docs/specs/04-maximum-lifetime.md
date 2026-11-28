@@ -4,7 +4,7 @@ Status: proposal. The owner of the project must approve it.
 
 ## 1. Purpose
 
-`feature-parity.md`, section 7, has this row with the plan value "Later":
+`feature-parity.md`, section 7, had this row with the plan value "Later" before the decisions of 2026-11-28:
 
 > Maximum lifetime, for the orchestrator and for each template. The orchestrator stops the instance, also during use.
 
@@ -102,7 +102,7 @@ Warren does not show the two values to Open WebUI in the first version. Specific
 | `internal/kube/reaper.go` | The function `maxLifetime` and the new case. |
 | `deploy/helm/warren` (specification 02) | The value `limits.maxLifetime`. |
 | `docs/policies.md` | Section 4: the key. Section 11: one row in the table of changes. Section 13: the reason `max_lifetime`. |
-| `docs/feature-parity.md`, section 7 | Change the plan value of the row to "v1". |
+| `docs/feature-parity.md`, section 7 | The row has the plan value "v1". Remove the words "Not in the code at this time" from the note of the row. |
 
 ## 5. Tests
 
