@@ -12,6 +12,8 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/coderpunch/warren/internal/backend"
+	"github.com/coderpunch/warren/internal/policy"
+	"github.com/coderpunch/warren/internal/scope"
 )
 
 // stopLease is a lease that has the stop signal when reason is not empty.
@@ -127,6 +129,35 @@ func TestStopCloseTable(t *testing.T) {
 		if code, text := stopClose(c.reason, true); code != c.watcher || text != c.text {
 			t.Errorf("reason %q, watcher: %d %q, want %d %q", c.reason, code, text, c.watcher, c.text)
 		}
+	}
+}
+
+// The stop reason no_policy has two causes: a policy that is not in the file,
+// and a policy with a different scope. A new connection gets the code and the
+// text of stopClose from the route check only for the first cause. For the
+// second cause, the policy exists, and the route is for the sandbox of the
+// new scope (docs/policies.md, section 10.2).
+func TestNoPolicyRouteCheckForEachCause(t *testing.T) {
+	id := scope.Identity{UserID: "alice", TemplateID: "chat-kept", ChatID: "c1"}
+	code, text := stopClose(backend.StopNoPolicy, false)
+	proxyWith := func(file string) *Proxy {
+		t.Helper()
+		set, err := policy.Parse([]byte(file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &Proxy{opts: Options{Policies: policy.NewStore(set)}}
+	}
+
+	removed := proxyWith("policies:\n  - {id: personal, name: Personal, scope: user, storage: {type: ephemeral}}\n")
+	if _, rerr := removed.resolveRoute(id, ""); rerr == nil || rerr.close != code || rerr.detail != text {
+		t.Errorf("removed policy: route error %+v, want the code %d and the text %q", rerr, code, text)
+	}
+
+	changed := proxyWith("policies:\n  - {id: chat-kept, name: Was for each chat, scope: user, storage: {type: ephemeral}}\n")
+	rt, rerr := changed.resolveRoute(id, "")
+	if rerr != nil || rt.ref.Kind != scope.KindUser || rt.ref.Value != "alice" {
+		t.Errorf("policy with a different scope: route %+v, route error %+v, want the sandbox of the user scope", rt.ref, rerr)
 	}
 }
 

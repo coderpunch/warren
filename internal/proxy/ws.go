@@ -515,7 +515,11 @@ func stopClose(reason string, watcher bool) (code int, text string) {
 		}
 		return closeNotFound, "The terminal stopped after its idle time"
 	case backend.StopNoPolicy:
-		// A new connection gets the same code and text from the route check.
+		// For a policy that is not in the file, a new connection gets the
+		// same code and text from the route check. For a policy with a
+		// different scope, a new connection is for the sandbox of the new
+		// scope, and it does not get this code (docs/policies.md,
+		// section 10.2).
 		return closeNotFound, "Template not found"
 	case backend.StopNetworkChanged, backend.StopVolumeGone, backend.StopExternal:
 		return websocket.CloseServiceRestart, "The terminal restarts"
