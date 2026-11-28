@@ -35,6 +35,16 @@ Not in scope:
 | Q5 | What is the default of `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER`? | Warren holds a tool call for a maximum of 50 seconds while a sandbox starts (`internal/proxy/proxy.go`, `startTimeout`). |
 | Q6 | Which instance `status` texts does Open WebUI show, and does it call the status route before each terminal opens? | Warren sends `running` or a different text. Only `running` is defined (`protocol.md`, section 4.6). |
 
+The public documentation gives a part of the answer to Q1 (`docs.openwebui.com/features/open-terminal/terminals/orchestration/creating-terminals`, read on 2026-11-28):
+
+- A new terminal is private until a person shares it.
+- A user with the Read permission on the connection sees only the terminals that a person shared with that user.
+- A user with the Write permission sees each terminal on the server.
+
+Thus a user with only the Read permission possibly does not see a warren policy until an administrator shares it. The documentation does not say if a person can share a terminal that Open WebUI did not make. Test cases E3 and E4 must show this first.
+
+The documentation of that date uses the word "machine" for a terminal, and the names `MACHINE_CONNECTIONS` and `AIOHTTP_CLIENT_TIMEOUT_MACHINE`. `protocol.md` has the names `TERMINAL_SERVER_CONNECTIONS` and `AIOHTTP_CLIENT_TIMEOUT_TERMINAL` for version 0.13.4. Refer to open item O4.
+
 Record each answer in `protocol.md` with the source file and the line, or with the test case that shows it.
 If the answer to Q1 or Q2 is "no", stop and tell the owner. Specification 06 then becomes the primary work.
 
@@ -189,6 +199,7 @@ Pin the Open WebUI image with its digest. Renovate must propose a new version, a
 | O1 | The routes of Open WebUI for the sign-up, the terminal list, the access grants, and the chat are not in `protocol.md`. Read them from the source code of Open WebUI, and record facts only. |
 | O2 | The names of the variables that point Open WebUI to a model server. |
 | O3 | Which published Open Terminal image has an agent program for case E40. |
+| O4 | The public documentation has new names for some settings (section 3). Find the Open WebUI version that has these names, and if that version changes the protocol. If it does, the owner decides which versions the test uses. |
 
 ## 10. Acceptance
 
