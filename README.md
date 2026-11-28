@@ -17,6 +17,7 @@ The Helm chart and the end-to-end test with Open WebUI are not complete.
 | [docs/policies.md](docs/policies.md) | The policy file, the storage of a sandbox, and the instance operations |
 | [docs/isolation.md](docs/isolation.md) | The security settings of a pod, the network policies, and the test of the network plugin |
 | [docs/threat-model.md](docs/threat-model.md) | The threats, the protections, and what stays open |
+| [docs/specs/](docs/specs/README.md) | Proposals for the work that is not complete |
 
 ## Tests
 
