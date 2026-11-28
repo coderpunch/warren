@@ -1016,6 +1016,78 @@ func TestStartWhenTheDeleteRequestOfWarrenFails(t *testing.T) {
 	}
 }
 
+// A restart operation that comes while the delete request of a different
+// caller is in the API server sends no request, and it waits for the end of
+// the pod. If Kubernetes then refuses that request, the pod continues, and no
+// event comes for it. The operation must see that the delete mark is gone. It
+// then sends its own delete request, and it starts the sandbox again. Before
+// this rule, the operation examined only the pod in the cache: it waited
+// until its context ended, and it stopped and started nothing.
+func TestRestartWhenTheDeleteRequestOfADifferentCallerFails(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	uid := e.m.pod(name).UID
+	in, refuse := e.refusePodDelete(name)
+	stopped := make(chan error, 1)
+	go func() { stopped <- e.m.Stop(context.Background(), req.Ref) }()
+	<-in
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	restarted := make(chan error, 1)
+	go func() { restarted <- e.m.Restart(ctx, req) }()
+	select {
+	case err := <-restarted:
+		t.Fatalf("Restart returned while the delete request was in the API server: error = %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	refuse()
+	if err := <-stopped; err == nil {
+		t.Fatal("Stop = nil, want the error of the API")
+	}
+	if err := <-restarted; err != nil {
+		t.Fatalf("Restart = %v after the delete request of the stop operation failed", err)
+	}
+	// The first delete request is that of the stop operation. The second
+	// one is that of the restart operation.
+	if n := e.podDeletes(name); n != 2 {
+		t.Errorf("pod delete requests = %d, want 2", n)
+	}
+	if n := e.creates(); n != 2 {
+		t.Errorf("pod create requests = %d, want 2", n)
+	}
+	e.newPod(name, uid)
+	if by := e.m.pod(name).Annotations[AnnotationCreatedBy]; by != "alice" {
+		t.Errorf("user of the new pod = %q, want alice", by)
+	}
+}
+
+// A restart operation sends the delete request for the pod. If the API server
+// has no such pod, the cache is late. The operation waits for the cache, and
+// it does not send the request again and again.
+func TestRestartWhenTheCacheIsLate(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	e.client.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), name)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := e.m.Restart(ctx, req); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Restart = %v, want the end of its context", err)
+	}
+	if n := e.podDeletes(name); n != 1 {
+		t.Errorf("pod delete requests = %d, want 1", n)
+	}
+	if n := e.creates(); n != 1 {
+		t.Errorf("pod create requests = %d, want 1", n)
+	}
+}
+
 // A start operation sends the delete request for a pod in a final phase. If
 // the API server has no such pod, the cache is late. The operation waits for
 // the cache, and it does not send the request again and again.

@@ -1657,12 +1657,22 @@ var notIdle time.Time
 // request fails, the signal stays: the WebSockets close, and the pod
 // continues.
 func (m *Manager) deletePod(ctx context.Context, pod *corev1.Pod, reason string, idleSince time.Time) error {
+	_, err := m.deletePodSent(ctx, pod, reason, idleSince)
+	return err
+}
+
+// deletePodSent is deletePod for a caller that then waits for the end of the
+// pod. sent is true when this call sent the delete request, also when the
+// request failed. sent is false when this call sent no request: a different
+// caller has the delete mark, or the idle stop found a use. If the request of
+// that different caller fails, the pod continues: refer to waitEnd.
+func (m *Manager) deletePodSent(ctx context.Context, pod *corev1.Pod, reason string, idleSince time.Time) (sent bool, err error) {
 	m.mu.Lock()
 	st := m.stateLocked(pod.Name)
 	used := !idleSince.IsZero() && (st.leases > 0 || st.lastActivity.After(idleSince))
 	if st.deleting == pod.UID || used {
 		m.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	st.deleting = pod.UID
 	m.stopLeasesLocked(st, pod.UID, reason)
@@ -1670,7 +1680,7 @@ func (m *Manager) deletePod(ctx context.Context, pod *corev1.Pod, reason string,
 
 	// Delete only the pod that warren examined, and not a new pod with the
 	// same name.
-	err := m.cfg.Client.CoreV1().Pods(m.cfg.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+	err = m.cfg.Client.CoreV1().Pods(m.cfg.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
 		Preconditions: &metav1.Preconditions{UID: &pod.UID},
 	})
 	if err != nil {
@@ -1685,15 +1695,15 @@ func (m *Manager) deletePod(ctx context.Context, pod *corev1.Pod, reason string,
 		}
 		m.mu.Unlock()
 		if apierrors.IsNotFound(err) {
-			return nil
+			return true, nil
 		}
 		m.cfg.Logger.Warn("cannot delete a sandbox", "sandbox", pod.Name, "reason", reason, "error", err.Error())
-		return err
+		return true, err
 	}
 	m.cfg.Metrics.Reap(reason)
 	m.cfg.Logger.Info("sandbox deleted", "log", "audit", "sandbox", pod.Name, "reason", reason,
 		"template", pod.Labels[LabelTemplate], "context", pod.Annotations[AnnotationContext])
-	return nil
+	return true, nil
 }
 
 // counts returns the number of ready sandboxes and of sandboxes that start.
@@ -1871,8 +1881,15 @@ func (m *Manager) startBy(ctx context.Context, req backend.Request, by string) e
 	if pod != nil {
 		if pod.DeletionTimestamp == nil && !deleteSent(pod, sent) {
 			// The pod is in a final phase, and nothing deletes it.
-			if err := m.deletePod(ctx, pod, "failed", notIdle); err != nil {
+			ours, err := m.deletePodSent(ctx, pod, "failed", notIdle)
+			if err != nil {
 				return fmt.Errorf("stop sandbox: %w", err)
+			}
+			if !ours {
+				// A different caller got the delete mark after this
+				// operation read it. Make the decision again: the operation
+				// then waits for the end of the pod with waitEnd.
+				return m.startBy(ctx, req, by)
 			}
 			// The API server accepted the request, or it has no such pod.
 			// In the two cases, the pod goes out of the cache.
@@ -1983,6 +2000,10 @@ func (m *Manager) waitGone(ctx context.Context, name string, uid types.UID) erro
 // Restart stops a sandbox, waits until its pod is gone, and starts it again.
 // The sandbox stays on the account of the user that started it.
 //
+// If a different caller has the delete mark of the pod, the operation sends no
+// delete request, and it waits for the end of the pod. If the request of that
+// caller fails, the pod continues. The operation then sends its own request.
+//
 // While the operation is in progress, only the operation starts the sandbox.
 // The clients of the WebSockets that the stop closed connect again in a short
 // time, and they wait in Acquire when the pod goes away. Without the mark,
@@ -2013,9 +2034,24 @@ func (m *Manager) Restart(ctx context.Context, req backend.Request) error {
 		// For the sandbox of a chat, a model, or a template, Open WebUI
 		// sends the ID of the manager (docs/protocol.md, section 4.6).
 		by = pod.Annotations[AnnotationCreatedBy]
-		if pod.DeletionTimestamp == nil {
-			if err := m.deletePod(ctx, pod, backend.StopAPI, notIdle); err != nil {
+		for pod.DeletionTimestamp == nil {
+			ours, err := m.deletePodSent(ctx, pod, backend.StopAPI, notIdle)
+			if err != nil {
 				return fmt.Errorf("stop sandbox: %w", err)
+			}
+			if ours {
+				// The API server accepted the request, or it has no such
+				// pod. In the two cases, the pod goes out of the cache.
+				break
+			}
+			// A different caller has the delete mark. If its request fails,
+			// the pod continues, and the operation sends its own request.
+			gone, err := m.waitEnd(ctx, name, pod.UID)
+			if err != nil {
+				return err
+			}
+			if gone {
+				break
 			}
 		}
 		if err := m.waitGone(ctx, name, pod.UID); err != nil {
