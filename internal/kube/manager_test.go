@@ -1064,6 +1064,50 @@ func TestRestartWhenTheDeleteRequestOfADifferentCallerFails(t *testing.T) {
 	}
 }
 
+// Kubernetes refuses each delete request for the pod. A restart operation
+// that waited for the request of a different caller sends its own request.
+// That request fails also: the operation gets the error, it starts nothing,
+// and the pod continues.
+func TestRestartWhenEachDeleteRequestFails(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	uid := e.m.pod(name).UID
+	e.client.PrependReactor("delete", "pods", forbidden)
+	// This reactor is before the reactor above in the sequence.
+	in, release := e.holdPodDelete(name)
+	stopped := make(chan error, 1)
+	go func() { stopped <- e.m.Stop(context.Background(), req.Ref) }()
+	<-in
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	restarted := make(chan error, 1)
+	go func() { restarted <- e.m.Restart(ctx, req) }()
+	select {
+	case err := <-restarted:
+		t.Fatalf("Restart returned while the delete request was in the API server: error = %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-stopped; err == nil {
+		t.Fatal("Stop = nil, want the error of the API")
+	}
+	if err := <-restarted; err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Restart = %v, want the error of the API", err)
+	}
+	if n := e.podDeletes(name); n != 2 {
+		t.Errorf("pod delete requests = %d, want 2", n)
+	}
+	if n := e.creates(); n != 1 {
+		t.Errorf("pod create requests = %d, want 1", n)
+	}
+	if p := e.m.pod(name); p == nil || p.UID != uid || p.DeletionTimestamp != nil {
+		t.Error("the old pod does not continue")
+	}
+}
+
 // A restart operation sends the delete request for the pod. If the API server
 // has no such pod, the cache is late. The operation waits for the cache, and
 // it does not send the request again and again.
@@ -1129,6 +1173,19 @@ func TestAcquireOfAFailedPodWhenTheDeleteRequestFails(t *testing.T) {
 		e.setStatus(name, func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed })
 		waitFor(t, "failed pod in the cache", func() bool { p := e.m.pod(name); return p != nil && podTerminal(p) })
 	}
+	// The cache has each pod before the handler of its event runs, and each
+	// handler wakes the requests that wait. A handler that runs after the
+	// start of the two requests gives each of them one more step and one more
+	// delete request. The handlers run in sequence. Thus wait for the handler
+	// of a later event: the pod of a third sandbox goes away, and only that
+	// handler gives the stop signal to the WebSocket lease on that pod.
+	last := userRef("carol")
+	l := e.acquire(socket(last))
+	e.endTermination(last.Ref.Name())
+	if reason := signal(t, l, "end of the pod of the third sandbox"); reason != backend.StopExternal {
+		t.Fatalf("stop reason of the third sandbox = %q, want %q", reason, backend.StopExternal)
+	}
+	l.Release()
 	e.client.PrependReactor("delete", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		if name := a.(k8stesting.DeleteAction).GetName(); name == late.Ref.Name() {
 			return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), name)
@@ -1151,8 +1208,9 @@ func TestAcquireOfAFailedPodWhenTheDeleteRequestFails(t *testing.T) {
 				req.UserID, wait, n, limit)
 		}
 	}
-	if n := e.creates(); n != 2 {
-		t.Errorf("pod create requests = %d, want 2", n)
+	// One pod for each of the three sandboxes: no request started a pod again.
+	if n := e.creates(); n != 3 {
+		t.Errorf("pod create requests = %d, want 3", n)
 	}
 }
 
