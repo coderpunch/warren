@@ -4,9 +4,11 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stesting "k8s.io/client-go/testing"
@@ -211,6 +213,108 @@ func TestActiveWritesOneTimeInTenSeconds(t *testing.T) {
 	lease.Active()  // 10 seconds after its last write
 	if got := e.lastUse(name); !got.Equal(e.clock.Now()) {
 		t.Errorf("time of the last use = %s, want the time of the call of the first lease, %s", got, e.clock.Now())
+	}
+}
+
+// steppedClock gives times as time.Now gives them: each time has a reading of
+// the wall clock and a reading of the monotonic clock. Advance moves the two
+// readings. back moves only the reading of the wall clock, as a step of the
+// system clock does.
+type steppedClock struct {
+	mu      sync.Mutex
+	base    time.Time
+	elapsed time.Duration
+	back    time.Duration
+}
+
+func (c *steppedClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return wallBack(c.base.Add(c.elapsed), c.back)
+}
+
+func (c *steppedClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.elapsed += d
+}
+
+// stepBack moves the wall clock back, and not the monotonic clock.
+func (c *steppedClock) stepBack(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.back += d
+}
+
+// wallBack returns a time from time.Now with its wall clock reading moved
+// back by a whole number of seconds. The monotonic clock reading does not
+// change. Only a step of the system clock gives such a time: the package time
+// has no function that makes one, and a test cannot move the system clock.
+// Thus this function writes the first word of the time.Time value through the
+// package unsafe. In a time with a monotonic reading, that word has the wall
+// seconds above its 30 bits of nanoseconds. This is the only use of unsafe in
+// the tests, and it depends on the layout of time.Time: each test that uses
+// the function must call wallBackOperates first.
+func wallBack(t time.Time, back time.Duration) time.Time {
+	*(*uint64)(unsafe.Pointer(&t)) -= uint64(back/time.Second) << 30
+	return t
+}
+
+// wallBackOperates makes sure, with the functions of the package time only,
+// that wallBack does its work with the Go release of this build. If a release
+// changes time.Time, the test stops here with a clear cause.
+func wallBackOperates(t *testing.T) {
+	t.Helper()
+	const back = 3 * time.Minute
+	now := time.Now()
+	stepped := wallBack(now, back)
+	if got := now.UnixNano() - stepped.UnixNano(); got != int64(back) {
+		t.Fatalf("wallBack does not operate with this Go release: it moved the wall clock by %s, want %s", time.Duration(got), back)
+	}
+	if d := stepped.Sub(now); d != 0 || !strings.Contains(stepped.String(), " m=") {
+		t.Fatalf("wallBack does not operate with this Go release: the monotonic clock moved by %s (time %s)", d, stepped)
+	}
+}
+
+// Active decides with the monotonic clock if 10 seconds went by, as the
+// reaper measures the idle time with the monotonic clock. A step of the wall
+// clock to an earlier time must not make Active ignore the messages for the
+// time of the step: the reaper would then stop a sandbox that a person uses.
+func TestStepOfTheWallClockDoesNotStopActivity(t *testing.T) {
+	wallBackOperates(t)
+	for name, back := range map[string]time.Duration{"no step": 0, "3 minutes back": 3 * time.Minute} {
+		t.Run(name, func(t *testing.T) {
+			clock := &steppedClock{base: time.Now()}
+			e := newTestEnv(t, func(c *Config) { c.Now = clock.Now })
+			req := templateRef("quick", "alice") // idle time of 2 minutes
+			sandbox := req.Ref.Name()
+			lease := e.acquire(socket(req))
+			defer lease.Release()
+
+			// The client sends one message each 5 seconds, for one minute.
+			for i := 0; i < 12; i++ {
+				clock.Advance(5 * time.Second)
+				lease.Active()
+			}
+			clock.stepBack(back)
+			// The messages continue for 3 minutes. The reaper runs each 30
+			// seconds.
+			for i := 1; i <= 36; i++ {
+				clock.Advance(5 * time.Second)
+				lease.Active()
+				if age := clock.Now().Sub(e.lastUse(sandbox)); age > activityInterval {
+					t.Fatalf("%s after the step, with one message each 5 seconds: the last use is %s old, want a maximum of %s",
+						time.Duration(i)*5*time.Second, age, activityInterval)
+				}
+				if i%6 == 0 {
+					e.m.Reap(context.Background())
+				}
+				if hasSignal(lease) || e.podDeletes(sandbox) != 0 {
+					t.Fatalf("%s after the step, with one message each 5 seconds: stop signal = %v (reason %q), delete requests = %d",
+						time.Duration(i)*5*time.Second, hasSignal(lease), lease.StopReason(), e.podDeletes(sandbox))
+				}
+			}
+		})
 	}
 }
 

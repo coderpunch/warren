@@ -905,7 +905,7 @@ func (m *Manager) tryAcquire(ctx context.Context, name string, req backend.Reque
 		// comes after this point and finds the lease.
 		l.uid, l.stopped = pod.UID, make(chan struct{})
 		l.hold = req.Hold
-		l.marked.Store(now.UnixNano())
+		l.marked.Store(int64(now.Sub(m.started)))
 		if st.sockets == nil {
 			st.sockets = map[*lease]struct{}{}
 		}
@@ -938,8 +938,11 @@ type lease struct {
 	// hold is true for a WebSocket whose open connection keeps the sandbox
 	// (backend.Request.Hold).
 	hold bool
-	// marked is the time, in nanoseconds, at which this lease wrote the
-	// activity time of its sandbox last: refer to Active.
+	// marked is the time at which this lease wrote the activity time of its
+	// sandbox last: refer to Active. It is not a clock time. It is the time
+	// after the start of warren, in nanoseconds, and thus a difference of two
+	// readings of the monotonic clock. A step of the system clock does not
+	// change it.
 	marked atomic.Int64
 }
 
@@ -976,8 +979,13 @@ func (l *lease) Active() {
 	if l.stopped == nil || l.hold {
 		return
 	}
+	// The interval uses the monotonic clock, as the idle time of the reaper
+	// does. With the system clock, a step to an earlier time would make this
+	// function ignore each message for the time of the step, and the reaper
+	// would stop a sandbox that a person uses.
 	now := l.m.now()
-	if now.UnixNano()-l.marked.Load() < int64(activityInterval) {
+	since := int64(now.Sub(l.m.started))
+	if since-l.marked.Load() < int64(activityInterval) {
 		return
 	}
 	l.m.mu.Lock()
@@ -989,7 +997,7 @@ func (l *lease) Active() {
 	if _, open := st.sockets[l]; !open {
 		return
 	}
-	l.marked.Store(now.UnixNano())
+	l.marked.Store(since)
 	// A different lease can have a later time: this call read the time
 	// before it had the lock.
 	if now.After(st.lastActivity) {
