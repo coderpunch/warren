@@ -1734,19 +1734,61 @@ func podStatus(pod *corev1.Pod) string {
 	return StatusStarting
 }
 
-// InstanceStatus returns the status of one sandbox.
+// deleteSent reports whether warren sent the delete request for a pod. The
+// cache gets the deletion time of a pod only with an event that comes after
+// the reply to that request. In the time between, the pod in the cache has no
+// sign of the stop, and only the record of the sandbox shows it. sent is the
+// delete mark of that record. A caller must read the mark before it reads the
+// pod from the cache: the mark goes away when the pod is not in the cache.
+func deleteSent(pod *corev1.Pod, sent types.UID) bool {
+	return sent != "" && pod.UID == sent
+}
+
+// deleteMark returns the UID of the pod of a sandbox for which warren sent
+// the delete request, or an empty value: refer to deleteSent.
+func (m *Manager) deleteMark(name string) types.UID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if st := m.sandboxes[name]; st != nil {
+		return st.deleting
+	}
+	return ""
+}
+
+// InstanceStatus returns the status of one sandbox. A pod for which warren
+// sent the delete request is a stopped sandbox, as a pod in deletion is. The
+// management API reads the status immediately after a stop operation.
 func (m *Manager) InstanceStatus(ref scope.Ref) string {
-	return podStatus(m.pod(ref.Name()))
+	name := ref.Name()
+	sent := m.deleteMark(name)
+	pod := m.pod(name)
+	if pod != nil && deleteSent(pod, sent) {
+		return StatusStopped
+	}
+	return podStatus(pod)
 }
 
 // Instances returns the sandboxes of one template. A sandbox that has a
 // volume and no pod is a stopped sandbox.
+//
+// The list has no entry for a pod in deletion, and none for a pod for which
+// warren sent the delete request (deleteSent). The sandbox of such a pod is in
+// the list only if it has a volume, as a stopped sandbox.
 func (m *Manager) Instances(templateID string) []Instance {
 	var out []Instance
 	seen := map[string]bool{}
+	// Read the delete marks before the pods.
+	sent := map[string]types.UID{}
+	m.mu.Lock()
+	for name, st := range m.sandboxes {
+		if st.deleting != "" {
+			sent[name] = st.deleting
+		}
+	}
+	m.mu.Unlock()
 	for _, obj := range m.informer.GetStore().List() {
 		pod := obj.(*corev1.Pod)
-		if pod.Labels[LabelTemplate] != templateID || pod.DeletionTimestamp != nil || m.orphan(pod.Labels) {
+		if pod.Labels[LabelTemplate] != templateID || pod.DeletionTimestamp != nil || deleteSent(pod, sent[pod.Name]) || m.orphan(pod.Labels) {
 			continue
 		}
 		seen[pod.Name] = true

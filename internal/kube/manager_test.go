@@ -780,6 +780,125 @@ func TestInstanceOperations(t *testing.T) {
 	}
 }
 
+// holdPodEvent makes the simulated API server accept each delete request for
+// the pod of a sandbox with no change of the pod. The request of warren is
+// then complete, and the cache does not have the deletion time of the pod: on
+// a cluster, the event with that time comes a short time after the reply.
+// The function that it returns sends the event: the pod gets its deletion
+// time. After that, the simulated API server handles a delete request for the
+// pod as usual, and endTermination removes the pod.
+func (e *testEnv) holdPodEvent(name string) (send func()) {
+	var sent atomic.Bool
+	e.client.PrependReactor("delete", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		return !sent.Load() && a.(k8stesting.DeleteAction).GetName() == name, nil, nil
+	})
+	return func() {
+		e.t.Helper()
+		sent.Store(true)
+		obj, err := e.client.Tracker().Get(podResource, testNamespace, name)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		pod := obj.(*corev1.Pod).DeepCopy()
+		now := metav1.NewTime(e.clock.Now())
+		pod.DeletionTimestamp = &now
+		if err := e.client.Tracker().Update(podResource, pod, testNamespace); err != nil {
+			e.t.Fatal(err)
+		}
+		e.inTermination(name)
+	}
+}
+
+// A stop operation sends the delete request for the pod. The cache gets the
+// deletion time of the pod only with a later event. In that time the sandbox
+// must have the status of a stopped sandbox: the management API reads the
+// status immediately after the operation, and it answered "running" for a
+// sandbox that it stopped.
+func TestStatusAfterTheDeleteRequestOfWarren(t *testing.T) {
+	cases := []struct {
+		name string
+		req  backend.Request
+		// listed tells if the sandbox is in the instance list after the stop.
+		// A stopped sandbox is in the list only if it has a volume.
+		listed bool
+	}{
+		{"sandbox with a volume", templateRef("kept", "alice"), true},
+		{"sandbox with no volume", userRef("alice"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			name := c.req.Ref.Name()
+			e.acquire(c.req).Release()
+			uid := e.m.pod(name).UID
+			// stopped examines the two readers of the status.
+			stopped := func(when string) {
+				t.Helper()
+				if s := e.m.InstanceStatus(c.req.Ref); s != StatusStopped {
+					t.Errorf("%s: status = %q, want %q", when, s, StatusStopped)
+				}
+				list := e.m.Instances(c.req.Ref.TemplateID)
+				switch {
+				case c.listed && (len(list) != 1 || list[0].ID != name || list[0].Status != StatusStopped):
+					t.Errorf("%s: instance list = %+v, want the sandbox with the status %q", when, list, StatusStopped)
+				case !c.listed && len(list) != 0:
+					t.Errorf("%s: instance list = %+v, want no instance", when, list)
+				}
+			}
+			if s := e.m.InstanceStatus(c.req.Ref); s != StatusRunning {
+				t.Fatalf("status before the stop = %q, want %q", s, StatusRunning)
+			}
+			if list := e.m.Instances(c.req.Ref.TemplateID); len(list) != 1 || list[0].Status != StatusRunning {
+				t.Fatalf("instance list before the stop = %+v, want one instance with the status %q", list, StatusRunning)
+			}
+
+			send := e.holdPodEvent(name)
+			if err := e.m.Stop(context.Background(), c.req.Ref); err != nil {
+				t.Fatal(err)
+			}
+			if p := e.m.pod(name); p == nil || p.UID != uid || p.DeletionTimestamp != nil || !podReady(p) {
+				t.Fatal("the test is wrong: the cache does not show the pod as it was before the delete request")
+			}
+			stopped("after the delete request, before its event")
+			send()
+			stopped("in the termination time")
+			e.endTermination(name)
+			waitFor(t, "end of the pod", func() bool { return e.m.pod(name) == nil })
+			stopped("after the end of the pod")
+
+			// The next pod of the sandbox does not have the status of the
+			// previous one.
+			e.acquire(c.req).Release()
+			if s := e.m.InstanceStatus(c.req.Ref); s != StatusRunning {
+				t.Errorf("status of the next pod = %q, want %q", s, StatusRunning)
+			}
+			if list := e.m.Instances(c.req.Ref.TemplateID); len(list) != 1 || list[0].Status != StatusRunning {
+				t.Errorf("instance list with the next pod = %+v, want one instance with the status %q", list, StatusRunning)
+			}
+		})
+	}
+
+	// Kubernetes refuses the delete request. The pod continues, thus the
+	// sandbox is not a stopped sandbox.
+	t.Run("delete request that fails", func(t *testing.T) {
+		e := newTestEnv(t, nil)
+		req := userRef("alice")
+		e.acquire(req).Release()
+		e.client.PrependReactor("delete", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			return forbidden(a)
+		})
+		if err := e.m.Stop(context.Background(), req.Ref); err == nil {
+			t.Fatal("Stop = nil, want the error of the API")
+		}
+		if s := e.m.InstanceStatus(req.Ref); s != StatusRunning {
+			t.Errorf("status = %q, want %q", s, StatusRunning)
+		}
+		if list := e.m.Instances("personal"); len(list) != 1 || list[0].Status != StatusRunning {
+			t.Errorf("instance list = %+v, want one instance with the status %q", list, StatusRunning)
+		}
+	})
+}
+
 func TestStartFailureIsReported(t *testing.T) {
 	e := newTestEnv(t, nil)
 	e.client.PrependReactor("create", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
