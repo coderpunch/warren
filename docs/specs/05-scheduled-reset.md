@@ -249,7 +249,7 @@ The file of a user is there before that time and is gone after it. A file that t
 | No. | Item |
 |---|---|
 | O1 | Decided on 2026-11-28: a scheduled reset is the reset operation. Each sandbox keeps an empty volume and stays in the instance list (section 4.3). |
-| O2 | Decision of the owner: the limit of one time in each hour (section 3.1). |
+| O2 | Decided on 2026-11-28: warren refuses a schedule that has more than one time in each hour (section 3.1). |
 | O3 | Answered on 2026-11-28: the public documentation gives the forms `@weekly`, `@monthly`, a cron expression, and one date and time. It does not give the day and the time of the two words. Section 3.1 uses their usual meaning in cron. |
 | O4 | Decided on 2026-11-28: warren does a reset that it missed, also when the reset is many days late (R6). There is no maximum delay. |
 

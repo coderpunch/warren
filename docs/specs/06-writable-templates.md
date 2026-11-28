@@ -10,6 +10,16 @@ It also moves a trust boundary. Refer to section 9.
 In the enterprise orchestrator, a user makes and changes a terminal in the Open WebUI user interface (`feature-parity.md`, section 9).
 In warren, only an administrator defines policies, in a file. The make, change, and delete calls of Open WebUI get the status 403 (`internal/api/api.go`, `readOnly`).
 
+The public documentation gives these facts (`docs.openwebui.com/features/open-terminal/terminals/orchestration/` and its page `creating-terminals`, read on 2026-11-28). The current documentation uses the word "machine" for a terminal.
+
+- The connection has two permissions. Read lets a user see and use the terminals that a person shared with that user. Write lets a user make and manage terminals on the server, and see each terminal on it.
+- A new terminal is private. The person who made it shares it with users and groups. An administrator can make it public.
+- The dialog has these fields: name, scope, start directory, setup script, image, CPU, memory, storage, network, and environment variables. An empty field uses the default of the server. The orchestrator examines the values against the maximums of the server.
+- The scope is locked while instances exist.
+- The delete of a terminal removes the terminal, its instances, and its files.
+- The server settings are the maximum CPU, memory, and storage, a list of image patterns, and named network profiles. An empty image list permits each image.
+- A terminal can have its own idle time, maximum lifetime, and reset schedule. An administrator sets them in the interface of the orchestrator, not in the dialog of Open WebUI.
+
 This work adds templates that Open WebUI makes with the management API. An administrator sets the limits for them in the policy file.
 The policies of the file stay. They stay read-only.
 
@@ -75,7 +85,7 @@ templates:
 | `maxTemplates` | `100` | The maximum number of user templates. |
 | `scopes` | `[user, chat, shared]` | The scopes that a user template can have. `model` is possible, and it is not in the default: Open WebUI does not examine each model ID (`protocol.md`, section 6.1). |
 | `limits.cpu`, `limits.memory`, `limits.storage` | The default limits of a policy (`policies.md`, section 6), and `1Gi` for storage | The maximum that a user template can request. |
-| `allowedImages` | Empty | Patterns for the images that a user template can set. Empty means that a user template cannot set an image. |
+| `allowedImages` | Empty | Patterns for the images that a user template can set. Empty means that a user template cannot set an image. This is different from the orchestrator, where an empty list permits each image. |
 | `networkProfiles` | `internet` and `none` | Names with network settings. A value has the keys of `network` (`policies.md`, section 14). |
 | `defaultNetworkProfile` | `internet` | The profile of a user template that sets none. It must be a name of `networkProfiles`. |
 | `base` | Empty | Settings that all user templates get and that a user cannot change. |
@@ -324,7 +334,7 @@ Each phase is one pull request, and each one keeps R1.
 
 | No. | Item |
 |---|---|
-| O1 | Decision of the owner: R10 deletes the volumes of a deleted template. The documentation of the orchestrator says that a deleted terminal removes its instances and files. For a file policy, warren has the opposite rule (`policies.md`, section 11.1), because a change of a file can be an error. |
+| O1 | Decision of the owner: R10 deletes the volumes of a deleted template. The public documentation says the same for the orchestrator: the delete of a terminal removes its instances and its files. For a file policy, warren has the opposite rule (`policies.md`, section 11.1), because a change of a file can be an error. |
 | O2 | Fact to get from the Open WebUI source code: the type of `cpu_limit` in the request (text or number), if the `PATCH` body has all fields or only the changed fields, and the status values for which the user interface shows the `detail`. Specification 01 gives these facts. |
 | O3 | Fact to get from specification 01, questions Q1 and Q2: how Open WebUI gives access to a template that it did not make. The answer can change the priority of this work. |
 | O4 | Decision of the owner: the default of `scopes`. This document leaves out `model`. |
