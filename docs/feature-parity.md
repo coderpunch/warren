@@ -214,7 +214,7 @@ Warren v1 has the same minimum: Open WebUI 0.13.4.
 
 Warren must make its own decision for each of these items. No public source gives the behaviour of the orchestrator.
 
-1. If an open WebSocket with no messages counts as activity for the idle timeout, which messages on a WebSocket are activity, and what an open WebSocket gets at the idle stop. In warren, the open WebSocket does not count. The messages of the client count, without the automatic messages (section 7).
+1. If an open WebSocket with no messages counts as activity for the idle timeout, which messages on a WebSocket are activity, and what an open WebSocket gets at the idle stop. In warren, the open WebSocket does not count. The messages of the client count, without the automatic messages. The WebSocket of an agent session is the exception: it counts while it is open (section 7).
 2. The maximum wait and the error reply for a request that arrives while a pod starts.
 3. The health route of the orchestrator.
 4. The format of the instance ID. The context ID has a defined form (section 4).

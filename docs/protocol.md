@@ -786,7 +786,7 @@ These are conclusions from the facts above. They are inputs to the design. They 
 
 ### 9.5 Decisions
 
-The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 7 to 11 are from 2026-11-27. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
+The owner of the project made the decisions 1 to 6 on 2026-11-25. The decisions 7 to 11 are from 2026-11-27. The owner asked for one part of each of the decisions 7, 8, 9, and 11, and the note for each decision gives that part. Each other part of these decisions, and all of decision 10, is a decision of warren. The owner must confirm these parts. The rule for all decisions: warren implements only the current protocol, and no older or optional protocol.
 
 | No. | Subject | Decision |
 |---|---|---|
@@ -813,13 +813,13 @@ Because the identity is in headers, warren must have these protections:
 
 Note: the management API paths contain the word `terminals`. The paths are part of the wire protocol and are not a brand name.
 
-Note for decision 7: the four names are not in the source code of Open WebUI v0.13.4. Their only source is the public documentation, in the repository `github.com/open-webui/docs` at the commit `ee47d77ed76357560568dd5a1b0898fd514e96d3` (2026-11-26):
+Note for decision 7: the owner of the project asked for the four variables by their names, and gave no form of a value. The four names are not in the source code of Open WebUI v0.13.4. Their only source is the public documentation, in the repository `github.com/open-webui/docs` at the commit `ee47d77ed76357560568dd5a1b0898fd514e96d3` (2026-11-26):
 
 - The page `docs/features/open-terminal/terminals/orchestration/environment-variables.md`, lines 45-54, gives the four names. It says that the orchestrator sets a variable for each CPU or memory field of a terminal that has a value.
 - The page says that the two `LIMIT` variables come from the fields, and that the orchestrator calculates the count and the number of bytes from the fields. It gives no form of a value, no example of a value, and no rule to round a number.
 - An earlier text of the same lines, at the commit `14a0f2f7bdbe5d59a4cf975d984bf6b43a178dba`, says that the variables come from the CPU limit and the memory limit of a policy, and that a user does not set them. It also gives no form of a value.
 
-Thus the forms of decision 7 are a decision of warren. Warren gives each policy the two limits, thus it always sets the four variables.
+Thus the forms of decision 7 are a decision of warren, with the rule to round the CPU count. The rule that a policy cannot set the variables is also a decision of warren. Warren gives each policy the two limits, thus it always sets the four variables.
 
 Note for decision 8: the owner of the project asked for the three rules of the table row, because the view of section 4.1.1 sends its request each 5 seconds. The details are decisions of warren:
 
@@ -835,14 +835,14 @@ Note for decision 8: the owner of the project asked for the three rules of the t
 
 Note for decision 9: the owner of the project asked for the close code 1012 at a stop, a restart, a reset, and a delete of the management API, so that the client connects again. Before this decision, warren closed no WebSocket because of a stop. The client got the close code that the sandbox sent when it stopped, or the code 1011 when the connection broke. A sandbox that stops usually sends the code 1012 with no text (`open-terminal-api.md`, section 4.3). The details are decisions of warren:
 
-- The table of `policies.md`, section 10.2, gives the close code and the reason text for each stop reason, and for each class of route (decision 10). The code is 4004 for a removed policy, because a new connection gets that code from the route check. It is 1012 for a removed network permission, for a volume that is gone, and for a pod that a different actor deletes: the sandbox can start again. It is 1011 for each other reason.
+- The table of `policies.md`, section 10.2, gives the close code and the reason text for each stop reason, and for each class of route (decision 10). The code is 4004 for the reason `no_policy`. For a removed policy, a new connection gets that code from the route check. For a policy with a different scope, the code is the same, but a new connection is for the sandbox of the new scope, and it does not get that code. The code is 1012 for a removed network permission, for a volume that is gone, and for a pod that a different actor deletes: the sandbox can start again. The code is 1011 for each other reason.
 - Warren also closes the WebSockets of a pod that a different actor deletes, for example a person with kubectl. Warren sees that in its pod cache.
 - Warren tells the WebSockets before it sends the delete request to Kubernetes. If the sandbox side closes first, and warren stopped the sandbox, the client gets the code of warren and not the code of the sandbox. If Kubernetes refuses the delete request, the WebSockets are closed, and the pod continues.
 - The sandbox side of the WebSocket gets the code 1001, as at a stop of the warren process.
 - Open WebUI does not send the reason text to the browser (section 4.2.1). The text is for other clients.
 - The audit record of the WebSocket has the code and the stop reason. The record for a stop of the warren process has the code 1012.
 - An HTTP request in progress gets no signal. A WebSocket that has no connection to its pod at the time of the stop gets the usual code for a connection that fails.
-- An open WebSocket is not a use of the sandbox (decision 11). Thus warren stops a sandbox for its idle time also while WebSockets are open, and they get the code for the idle time. That code is the only code that is different for the two classes of routes (decision 10).
+- An open WebSocket is not a use of the sandbox (decision 11). Thus warren stops a sandbox for its idle time also while WebSockets are open, and they get the code for the idle time. The WebSocket of an agent session is the exception: it keeps its sandbox while it is open. The code for the idle time is the only code that is different for the two classes of routes (decision 10).
 - The close code does not make a stop hold. After the code 1012, the clients connect again (section 4.2.3), and Open WebUI sends requests by itself after each instance operation (section 4.1.3). Each HTTP request, and each new WebSocket on a viewer route, starts the sandbox again. A new WebSocket on a watcher route does not (decision 10).
 - While a restart operation is in progress, only the operation starts the sandbox. A request in that time waits for the start of the operation. Without this rule, a client that connects again can send the start request before the operation. The sandbox then goes on the account of the user of that client, or that user gets the error of the sandbox limit. A request for the system information also waits in that time (decision 8).
 

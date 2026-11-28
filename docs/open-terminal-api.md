@@ -392,7 +392,7 @@ Results for warren:
 1. A key in the header of the upgrade request has no effect. To hide the key of a pod from the client, warren must replace the `token` value in the first message.
 2. Warren must send a correct close code to its client when the pod replies with status 403 to an upgrade request.
 3. The close code that a sandbox sends when it stops is not a reliable signal: it has no text, and it depends on the start command and on the signal. Warren closes the WebSockets of a sandbox itself before it stops the pod, with its own code and text (`policies.md`, section 10.2).
-4. A WebSocket can be open and silent with no end, and the ping frames of the two sides keep it open. Thus an open WebSocket is not proof that a person uses the sandbox. Warren counts only the messages of the client as a use, and not all of them (`policies.md`, section 10.4).
+4. A WebSocket can be open and silent with no end, and the ping frames of the two sides keep it open. Thus an open WebSocket is not proof that a person uses the sandbox. Warren counts only the messages of the client as a use, and not all of them. The WebSocket of an agent session is the exception: it is a use while it is open (`policies.md`, section 10.4).
 
 ## 5. Identity inputs
 

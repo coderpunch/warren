@@ -82,7 +82,7 @@ If the file is not valid, warren does not start.
 | `resources` | No | Refer to section 6 | Requests and limits for `cpu`, `memory`, and `ephemeral-storage`. |
 | `storage` | No | Refer to section 7 | The home directory of the sandbox. |
 | `env` | No | None | Environment variables. Refer to section 8. |
-| `idleTimeout` | No | The flag `--idle-timeout` | Warren stops a sandbox after this time with no use. `0` means never. Section 10.4 gives what is a use. An open WebSocket is not a use: only the messages of its client are. A request for the system information is not a use (section 10.1). |
+| `idleTimeout` | No | The flag `--idle-timeout` | Warren stops a sandbox after this time with no use. `0` means never. Section 10.4 gives what is a use. An open WebSocket is not a use: only the messages of its client are. The WebSocket of an agent session is the exception: it is a use while it is open. A request for the system information is not a use (section 10.1). |
 | `nodeSelector` | No | None | Node labels that the pod of the sandbox requires. |
 | `tolerations` | No | None | A list of tolerations with the keys `key`, `operator`, `value`, `effect`, and `tolerationSeconds`. |
 | `network` | No | Refer to section 14 | The connections that the sandbox can open. |
@@ -342,6 +342,8 @@ If the operation ends with no start, for example because warren has no capacity,
 Open WebUI 0.13.4 has no control for the reset operation. A client of the management API can send it.
 
 The instance list shows a sandbox that has a volume and no pod as stopped.
+A stop operation does not wait for the end of the pod. The pod has a termination time of 10 seconds. From the time at which warren sends the delete request for a pod, the status of the instance is `stopped`, also in that termination time. Thus the reply to a stop operation has the status `stopped`. In that time, the instance list shows the sandbox as stopped if it has a volume, and it does not show a sandbox that has no volume. This applies to each stop by warren, also to the idle stop.
+A start operation that comes in the termination time of the pod waits for the end of that pod, and then it starts the sandbox.
 A sandbox stays on the account of the user that started it first, also when a different person starts it again.
 If a manager starts a new sandbox of the scope `chat`, `model`, or `shared`, the sandbox is on the account of no user. It does not count for the limits of a user.
 A start or restart operation waits while warren deletes the volume of the sandbox.
@@ -400,7 +402,8 @@ What the clients of Open WebUI do with the code (`protocol.md`, sections 4.2.1 a
 - After the codes 1012 and 1011, each client connects again after 1 or 2 seconds. The desktop audio is the only exception. Open WebUI has no special rule for the code 1012.
 - A new connection on a viewer route is a usual request, and it starts the sandbox again. The interactive terminal and the desktop send an HTTP request before they connect again, and that request starts the sandbox. A new pod does not know the terminal session of the previous pod, thus the terminal tab then shows "Session no longer available" and the control "Start new terminal".
 - A new connection on a watcher route does not start the sandbox. It waits until a different request starts the sandbox (section 10.3).
-- After the code 4004, the clients in the browser do not connect again. The terminal tab shows "Session no longer available" and the control "Start new terminal". The desktop tab shows "Desktop access denied. Reopen this tab." The page does not show the cause, for example the idle time. A watcher or a process stream that got the code 4004 stays stopped until the user changes the chat or opens the tab again. A watcher gets that code from warren only for a removed policy.
+- After the code 4004, the clients in the browser do not connect again. The terminal tab shows "Session no longer available" and the control "Start new terminal". The desktop tab shows "Desktop access denied. Reopen this tab." The page does not show the cause, for example the idle time. A watcher or a process stream that got the code 4004 stays stopped until the user changes the chat or opens the tab again. A watcher gets that code from warren at a stop only for the reason `no_policy`: a removed policy, or a policy with a different scope.
+- After a change of the scope of a policy, the policy exists, thus a new connection does not get the code 4004. The next request starts the sandbox of the new scope, and the terminal operates in that sandbox. But the watchers of an open page got the code 4004, and they stay stopped until the user changes the chat or opens the tab again.
 
 The close code does not make a stop hold. Refer to section 10.
 
@@ -458,7 +461,7 @@ Warren stops a sandbox that had no use for its idle time (`idleTimeout`, section
 | The WebSocket of an agent session, `/agents/sessions/{id}/connect` | Yes, while it is open, and at its end (below). |
 | A watcher WebSocket that waits for a stopped sandbox | No (section 10.3). |
 
-The owner of the project asked for this rule. Before it, each open WebSocket was a use, and a page that a person forgot kept its sandbox with no end.
+The owner of the project asked for three parts of this table: a request for the system information is not a use, a message on a WebSocket is a use and the open WebSocket is not, and a keepalive ping of the client is not a use. Each other rule for a WebSocket in this section is a decision of warren, and the owner must confirm it: the direction of a message, the start and the end of a WebSocket, the `frameAck` and `ack` messages, the agent session, and the watcher (`protocol.md`, section 9.5, notes for decisions 10 and 11). Before these rules, each open WebSocket was a use, and a page that a person forgot kept its sandbox with no end.
 A message of the sandbox is not a use, because the output of a program is not proof that a person uses the sandbox. Examples are `top`, `tail -f`, and the audio of a desktop in a page that nobody looks at.
 
 **Automatic messages.** The clients of Open WebUI send three types of text message with no action of a person (`protocol.md`, section 4.2.4):
@@ -515,7 +518,9 @@ Times:
 - A program prints a query to the terminal, for example for the position of the cursor. Inference: the terminal of the browser answers with binary input, which is a use message. This is the behaviour of the terminal library of the browser, and no person examined it for warren.
 - An agent process keeps its chat turn open.
 
-With no client that has a connection, a sandbox cannot extend its idle time. The hard limits are the limits on the number of sandboxes. Warren has no maximum lifetime for a sandbox ([feature-parity.md](feature-parity.md), section 7).
+With no client that has a connection, a sandbox cannot cause a use. But warren applies the idle stop only to a sandbox that is ready. A program in a sandbox can make its pod not ready, with no client: for example, it makes the server of the sandbox not answer the health request of Kubernetes. Warren stops a pod that is not ready with the reason `not_ready`, after the time of the flag `--start-timeout` (default 10 minutes), and not after its idle time. That time starts again each time the pod changes from ready to not ready. Thus a sandbox with no client can operate for longer than its idle time.
+
+The hard limits are the limits on the number of sandboxes. Warren has no maximum lifetime for a sandbox ([feature-parity.md](feature-parity.md), section 7).
 
 More limits:
 
@@ -541,7 +546,7 @@ If the new file is not valid, warren writes an error to its log and continues wi
 | User list | Applies to the next request. A terminal that is open stays open. Refer to section 9. |
 | Storage type from persistent to ephemeral | New pods do not use the volume. The volume stays until its retention time, or until a person deletes the instance. |
 | You remove a policy | Each chat that uses the terminal gets an error. Warren stops the pods of the policy a maximum of 30 seconds after it reads the file, also a pod with an open terminal. An open WebSocket gets the close code 4004 (section 10.2). Warren keeps the volumes. |
-| The scope of a policy changes | Warren does the same as for a removed policy, for the pods and volumes of the previous scope. The retention time of the policy does not apply to the volumes of the previous scope. |
+| The scope of a policy changes | Warren does the same as for a removed policy, for the pods and volumes of the previous scope. An open WebSocket gets the close code 4004, also with the text `Template not found`. The retention time of the policy does not apply to the volumes of the previous scope. The policy exists, thus the next request is for a sandbox of the new scope, and it starts that sandbox as usual. Section 10.2 gives the result for an open page. |
 
 ### 11.1 Volumes of a removed policy
 
