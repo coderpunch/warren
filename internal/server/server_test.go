@@ -344,6 +344,9 @@ type mapBackend struct {
 	errors map[string]error
 	// leases has each lease that Acquire gave, in the sequence of the calls.
 	leases []*mapLease
+	// late makes each new lease hide its stop signal from the first call of
+	// Stopped: refer to mapLease.late.
+	late bool
 }
 
 type mapLease struct {
@@ -355,6 +358,14 @@ type mapLease struct {
 	reason  string
 	// active is the number of calls of Active.
 	active int
+	// late makes the first call of Stopped return a channel that never
+	// closes. The relay calls Stopped two times: first when it waits for the
+	// end of a side or for the signal, and then when it finds the cause of
+	// the end of the sandbox side. With late, the relay thus sees the end of
+	// the sandbox side first, and the lease has the signal at that time. asks
+	// is the number of calls of Stopped.
+	late bool
+	asks int
 }
 
 func (l *mapLease) Target() backend.Target { return l.target }
@@ -374,7 +385,23 @@ func (l *mapLease) activeCalls() int {
 	return l.active
 }
 
-func (l *mapLease) Stopped() <-chan struct{} { return l.stopped }
+func (l *mapLease) Stopped() <-chan struct{} {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	l.asks++
+	if l.late && l.asks == 1 {
+		return nil
+	}
+	return l.stopped
+}
+
+// stoppedCalls returns the number of calls of Stopped.
+func (l *mapLease) stoppedCalls() int {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	return l.asks
+}
+
 func (l *mapLease) StopReason() string {
 	l.m.mu.Lock()
 	defer l.m.mu.Unlock()
@@ -425,6 +452,7 @@ func (m *mapBackend) Acquire(ctx context.Context, req backend.Request) (backend.
 	}
 	l := &mapLease{m: m, target: t, stopped: make(chan struct{})}
 	m.mu.Lock()
+	l.late = m.late
 	m.open++
 	m.leases = append(m.leases, l)
 	m.mu.Unlock()

@@ -45,9 +45,13 @@ func (e *testEnv) waits(req backend.Request) <-chan acquireResult {
 func (e *testEnv) notReadyAtTheEnd(req backend.Request, what string) {
 	e.t.Helper()
 	const limit = 250 * time.Millisecond
+	// Read the time before the start of the context. The time limit of the
+	// context then cannot end before start + limit. In the opposite
+	// sequence, a pause between the two lines made the measured wait
+	// shorter than the limit.
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), limit)
 	defer cancel()
-	start := time.Now()
 	lease, err := e.m.Acquire(ctx, req)
 	if !errors.Is(err, backend.ErrNotReady) || lease != nil {
 		e.t.Errorf("%s: lease = %v, error = %v; want ErrNotReady at the end of the wait", what, lease != nil, err)

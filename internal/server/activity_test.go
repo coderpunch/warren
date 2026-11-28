@@ -112,6 +112,8 @@ func TestWebSocketActivity(t *testing.T) {
 		{"visible, then an activity that is not a boolean", []message{visible, {text, `{"type":"activity","active":"yes"}`, 1}, visibleAck}},
 		{"visible in 64 bytes", []message{{text, pad(64, `{"type":"activity","active":true}`), 1}, visibleAck}},
 		{"visible in 65 bytes", []message{{text, pad(65, `{"type":"activity","active":true}`), 1}, ack}},
+		// The first 64 bytes are a complete visibility message.
+		{"visible, then white space, 65 bytes", []message{{text, `{"type":"activity","active":true}` + strings.Repeat(" ", 32), 1}, ack}},
 		{"visible in binary data", []message{{binary, `{"type":"activity","active":true}`, 1}, ack}},
 	}
 	e := newEnv(t)

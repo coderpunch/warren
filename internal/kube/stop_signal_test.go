@@ -190,7 +190,9 @@ func TestStopTellsTheWebSocketLeases(t *testing.T) {
 }
 
 // Each stop by the reaper tells the WebSocket leases the reason that is in
-// the audit record and in the metrics.
+// the audit record and in the metrics. Only the idle stop waits for a lease
+// that keeps the sandbox (backend.Lease). Each other stop of the reaper
+// applies also to a sandbox with such a lease, and that lease gets the signal.
 func TestReaperStopsTellTheReason(t *testing.T) {
 	cases := []struct {
 		reason string
@@ -239,6 +241,19 @@ func TestReaperStopsTellTheReason(t *testing.T) {
 			waitFor(t, "condition in the cache", func() bool { return !podReady(e.m.pod(name)) })
 			e.clock.Advance(6 * time.Minute)
 		}},
+		{"start_error", userRef("alice"), func(t *testing.T, e *testEnv, req backend.Request) {
+			// The container of the pod stops again and again, for more than
+			// 2 minutes after the reaper saw that the first time.
+			name := req.Ref.Name()
+			e.setStatus(name, func(p *corev1.Pod) {
+				p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: containerName, State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+				}}}
+			})
+			waitFor(t, "container status in the cache", func() bool { return len(e.m.pod(name).Status.ContainerStatuses) == 1 })
+			e.m.Reap(context.Background())
+			e.clock.Advance(3 * time.Minute)
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.reason+" "+c.req.Ref.TemplateID, func(t *testing.T) {
@@ -247,15 +262,29 @@ func TestReaperStopsTellTheReason(t *testing.T) {
 			name := c.req.Ref.Name()
 			lease := e.acquire(socket(c.req))
 			defer lease.Release()
+			leases := map[string]backend.Lease{"WebSocket": lease}
+			if c.reason != backend.StopIdle {
+				// The sandbox also has a lease that keeps it: the open
+				// WebSocket of an agent session, and a request in progress.
+				agent := e.acquire(held(c.req))
+				defer agent.Release()
+				leases["agent WebSocket"] = agent
+				request := e.acquire(c.req)
+				defer request.Release()
+			}
 			// A run with no condition tells nothing.
 			e.m.Reap(context.Background())
-			if hasSignal(lease) {
-				t.Fatal("the lease has a stop signal before the condition")
+			for kind, l := range leases {
+				if hasSignal(l) {
+					t.Fatalf("the lease of the %s has a stop signal before the condition", kind)
+				}
 			}
 			c.change(t, e, c.req)
 			e.m.Reap(context.Background())
-			if reason := signal(t, lease, c.reason); reason != c.reason {
-				t.Errorf("stop reason = %q, want %q", reason, c.reason)
+			for kind, l := range leases {
+				if reason := signal(t, l, c.reason+", "+kind); reason != c.reason {
+					t.Errorf("stop reason of the %s = %q, want %q", kind, reason, c.reason)
+				}
 			}
 			if !strings.Contains(logs.String(), "sandbox="+name+" reason="+c.reason+" ") {
 				t.Errorf("the audit record does not have the reason %s: %s", c.reason, logs.String())

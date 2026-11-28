@@ -164,6 +164,10 @@ func TestActiveWritesOneTimeInTenSeconds(t *testing.T) {
 	e := newTestEnv(t, nil)
 	req := userRef("alice")
 	name := req.Ref.Name()
+	// The lease keeps the time of its last write as the time after the start
+	// of warren. Thus the lease must not start at the start of warren: a
+	// lease with no first write would then have the correct value.
+	e.clock.Advance(time.Hour)
 	lease := e.acquire(socket(req))
 	defer lease.Release()
 	start := e.clock.Now()
@@ -174,8 +178,10 @@ func TestActiveWritesOneTimeInTenSeconds(t *testing.T) {
 		// the start of the lease.
 		want time.Duration
 	}{
-		{0, 0},
+		// The first call comes after the start of the lease: the start is the
+		// first write.
 		{9 * time.Second, 0},
+		{0, 0},
 		{999 * time.Millisecond, 0},
 		// 10 seconds after the start of the lease.
 		{time.Millisecond, 10 * time.Second},
@@ -204,13 +210,17 @@ func TestActiveWritesOneTimeInTenSeconds(t *testing.T) {
 	defer second.Release()
 	opened := e.clock.Now()
 	lease.Active()
-	second.Active()
 	if got := e.lastUse(name); !got.Equal(opened) {
 		t.Errorf("time of the last use after the start of a second WebSocket = %s, want %s", got, opened)
 	}
 	e.clock.Advance(7 * time.Second)
-	second.Active() // 7 seconds after its start: no write
-	lease.Active()  // 10 seconds after its last write
+	// The first call of the second lease, 7 seconds after its start: no
+	// write.
+	second.Active()
+	if got := e.lastUse(name); !got.Equal(opened) {
+		t.Errorf("time of the last use 7 seconds after the start of the second WebSocket = %s, want %s", got, opened)
+	}
+	lease.Active() // 10 seconds after its last write
 	if got := e.lastUse(name); !got.Equal(e.clock.Now()) {
 		t.Errorf("time of the last use = %s, want the time of the call of the first lease, %s", got, e.clock.Now())
 	}
@@ -702,8 +712,9 @@ func TestHeldWebSocketKeepsTheSandbox(t *testing.T) {
 	waitFor(t, "stop of the idle sandbox", func() bool { return e.m.pod(name) == nil })
 }
 
-// Each stop that is not the idle stop applies also to a sandbox with an open
-// agent WebSocket, and its lease gets the stop signal.
+// A stop operation of the management API applies also to a sandbox with an
+// open agent WebSocket, and its lease gets the stop signal.
+// TestReaperStopsTellTheReason examines the stops of the reaper.
 func TestHeldWebSocketGetsTheStopSignal(t *testing.T) {
 	e := newTestEnv(t, nil)
 	req := userRef("alice")

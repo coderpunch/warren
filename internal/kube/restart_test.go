@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -184,9 +185,10 @@ func TestRestartStartsTheSandboxAndNotARequestThatWaits(t *testing.T) {
 	}
 }
 
-// Two restart operations for one sandbox can run at the same time. The mark
-// is a number: the end of the first operation must not remove the mark of the
-// second one.
+// Two restart operations for one sandbox can run at the same time. They send
+// one delete request and one start request, and no mark stays after them.
+// TestEndOfOneRestartKeepsTheMarkOfTheOther examines the time between the two
+// ends.
 func TestTwoRestartOperationsAtTheSameTime(t *testing.T) {
 	e := newTestEnv(t, nil)
 	req := userRef("alice")
@@ -226,6 +228,71 @@ func TestTwoRestartOperationsAtTheSameTime(t *testing.T) {
 		t.Errorf("mark after the two operations = %d (record exists: %v), want 0", n, ok)
 	}
 	e.acquire(req).Release()
+}
+
+// The mark of a restart is a number: the end of one operation must not remove
+// the mark of a second one. Here the first of two operations ends early,
+// because its client went away, while the second one waits for the end of the
+// pod. With no mark, a request in that time gets the reply of a sandbox with
+// no restart.
+func TestEndOfOneRestartKeepsTheMarkOfTheOther(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.terminationTime()
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	first := e.m.pod(name).UID
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ctxA, cancelA := context.WithCancel(ctx)
+	defer cancelA()
+	doneA := make(chan error, 1)
+	go func() { doneA <- e.m.Restart(ctxA, req) }()
+	e.inTermination(name)
+	doneB := make(chan error, 1)
+	go func() { doneB <- e.m.Restart(ctx, req) }()
+	waitFor(t, "mark of the second operation", func() bool { n, _ := e.restartCount(name); return n == 2 })
+
+	cancelA()
+	select {
+	case err := <-doneA:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("first Restart = %v, want the error of its context", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first operation did not end")
+	}
+	if n, ok := e.restartCount(name); !ok || n != 1 {
+		t.Errorf("mark after the end of the first operation = %d (record exists: %v), want 1", n, ok)
+	}
+	// The pod is in its termination time. With no mark, a passive request
+	// gets the reply of a stopped sandbox here.
+	res := e.acquireAsync(ctx, e.m, passive(req))
+	stillWaits(t, res, "pod in the termination time of the second restart")
+
+	e.endTermination(name)
+	select {
+	case err := <-doneB:
+		if err != nil {
+			t.Fatalf("second Restart = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second operation did not end")
+	}
+	e.newPod(name, first)
+	e.makeReady(name)
+	r := result(t, res, "passive request that waited for the restart")
+	if r.err != nil {
+		t.Fatalf("passive request that waited for the restart: %v, want a lease", r.err)
+	}
+	r.lease.Release()
+	if n := e.creates(); n != 2 {
+		t.Errorf("pod create requests = %d, want 2: one start and one restart", n)
+	}
+	if n, ok := e.restartCount(name); !ok || n != 0 {
+		t.Errorf("mark after the two operations = %d (record exists: %v), want 0", n, ok)
+	}
 }
 
 // A passive request during a restart waits for the new pod. The sandbox
@@ -270,6 +337,77 @@ func TestPassiveRequestDuringARestart(t *testing.T) {
 	// The passive request is not a use of the sandbox.
 	if got := e.leaseRecord(e.m, name); got.leases != 0 || !got.last.Equal(last) || !got.coldStart {
 		t.Errorf("record after the passive request = %+v, want no lease, the activity time %s, and no first lease", got, last)
+	}
+}
+
+// A passive request waits also in the first time of a restart: warren sent
+// the delete request, and the cache does not have the deletion time of the
+// pod. The pod in the cache is ready, but it is not a pod to use.
+func TestPassiveRequestAfterTheDeleteRequestOfARestart(t *testing.T) {
+	e := newTestEnv(t, nil)
+	req := userRef("alice")
+	name := req.Ref.Name()
+	e.acquire(req).Release()
+	first := e.m.pod(name).UID
+
+	send := e.holdPodEvent(name)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- e.m.Restart(ctx, req) }()
+	waitFor(t, "delete request of the restart", func() bool { return e.podDeletes(name) == 1 })
+	if p := e.m.pod(name); p == nil || p.UID != first || p.DeletionTimestamp != nil || !podReady(p) {
+		t.Fatal("the test is wrong: the cache does not show the pod as it was before the delete request")
+	}
+	// With no restart, a passive request gets the reply of a stopped sandbox
+	// here.
+	res := e.acquireAsync(ctx, e.m, passive(req))
+	stillWaits(t, res, "pod with the delete request of a restart")
+
+	send()
+	stillWaits(t, res, "pod in the termination time of a restart")
+	e.endTermination(name)
+	if err := <-done; err != nil {
+		t.Fatalf("Restart = %v", err)
+	}
+	e.newPod(name, first)
+	e.makeReady(name)
+	r := result(t, res, "new pod after the restart")
+	if r.err != nil {
+		t.Fatalf("passive request after the restart: %v, want a lease", r.err)
+	}
+	r.lease.Release()
+	if n := e.creates(); n != 2 {
+		t.Errorf("pod create requests = %d, want 2: the passive request started nothing", n)
+	}
+}
+
+// A passive request waits also when a restart operation finds a pod in a
+// final phase: the operation deletes that pod and starts the sandbox. With no
+// restart, the same request gets the reply of a stopped sandbox.
+func TestPassiveRequestForAFinalPodOfARestart(t *testing.T) {
+	for _, phase := range []corev1.PodPhase{corev1.PodFailed, corev1.PodSucceeded} {
+		t.Run(string(phase), func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			req := userRef("alice")
+			name := req.Ref.Name()
+			e.startNotReady(req)
+			e.setStatus(name, func(p *corev1.Pod) { p.Status.Phase = phase })
+			waitFor(t, "final phase in the cache", func() bool { p := e.m.pod(name); return p != nil && podTerminal(p) })
+
+			e.setRestarting(name, 1)
+			lease, err := e.m.tryAcquire(soon(t), name, passive(req))
+			if lease != nil || err != nil {
+				t.Errorf("with a restart: lease = %v, error = %v; want a wait", lease != nil, err)
+			}
+			e.setRestarting(name, 0)
+			if _, err := e.m.tryAcquire(soon(t), name, passive(req)); !errors.Is(err, backend.ErrStopped) {
+				t.Errorf("with no restart: error = %v, want ErrStopped", err)
+			}
+			if n := e.podDeletes(name); n != 0 {
+				t.Errorf("pod delete requests of the passive requests = %d, want 0", n)
+			}
+		})
 	}
 }
 

@@ -139,6 +139,10 @@ func TestSandboxStopClosesWebSockets(t *testing.T) {
 // and not the code of the sandbox. On a watcher route the two codes are the
 // same for the idle stop. The text and the audit record show which one the
 // client got.
+//
+// In this test the relay waits when the signal comes, thus it sees the signal
+// before the end of the sandbox side.
+// TestStopReasonWinsWhenTheSandboxSideEndsFirst examines the other sequence.
 func TestStopReasonWinsOverTheCloseOfTheSandbox(t *testing.T) {
 	for path, want := range map[string]int{"/api/terminals/abc12345": 4004, "/events": 1012} {
 		for _, end := range []string{"close-1012", "cut"} {
@@ -161,6 +165,45 @@ func TestStopReasonWinsOverTheCloseOfTheSandbox(t *testing.T) {
 				detail := fmt.Sprintf(`"detail":"closed by warren, code %d, reason idle"`, want)
 				waitFor(t, "audit record", func() bool { return strings.Contains(e.logs.String(), detail) })
 				waitFor(t, "end of the lease", func() bool { return e.resolver.openLeases() == 0 })
+			})
+		}
+	}
+}
+
+// The relay sees the end of the sandbox side before it sees the stop signal,
+// and the lease has the signal at that time. The stop by the backend is then
+// the cause of the end, and the client gets the code of warren: the result
+// does not depend on the sequence of the two events. This sequence occurs
+// when the two events come at almost the same time.
+func TestStopReasonWinsWhenTheSandboxSideEndsFirst(t *testing.T) {
+	for path, want := range map[string]int{"/api/terminals/abc12345": 4004, "/events": 1012} {
+		for _, end := range []string{"close-1012", "cut"} {
+			t.Run(path+" "+end, func(t *testing.T) {
+				e := newEnv(t)
+				// The relay does not see the signal while it waits for the end
+				// of a side.
+				e.resolver.mu.Lock()
+				e.resolver.late = true
+				e.resolver.mu.Unlock()
+				conn, lease := e.openSocket(t, path)
+				lease.stop(backend.StopIdle)
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(end)); err != nil {
+					t.Fatal(err)
+				}
+				code, text := closeMessage(t, conn)
+				if code != want || text != "The terminal stopped after its idle time" {
+					t.Errorf("close message = %d %q, want %d and the text of warren for the idle stop", code, text, want)
+				}
+				conn.Close()
+				detail := fmt.Sprintf(`"detail":"closed by warren, code %d, reason idle"`, want)
+				waitFor(t, "audit record", func() bool { return strings.Contains(e.logs.String(), detail) })
+				waitFor(t, "end of the lease", func() bool { return e.resolver.openLeases() == 0 })
+				// The lease hides the signal from the first call of Stopped
+				// only. With a different number of calls, this test does not
+				// examine the sequence that it names.
+				if n := lease.stoppedCalls(); n != 2 {
+					t.Errorf("the test is wrong: calls of Stopped = %d, want 2: one in the wait, and one for the cause", n)
+				}
 			})
 		}
 	}

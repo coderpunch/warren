@@ -400,6 +400,11 @@ func TestClientUse(t *testing.T) {
 		"visibility of 64 bytes":           {{text, pad(64, `{"type":"activity","active":true}`), 1}, {text, ack, 1}},
 		"visibility of 65 bytes":           {{text, pad(65, `{"type":"activity","active":true}`), 1}, {text, ack, 0}},
 		"visible, then hidden in 65 bytes": {visible, {text, pad(65, `{"type":"activity","active":false}`), 1}, {text, ack, 1}},
+		// The first 64 bytes of these messages are a complete visibility
+		// message. The size of the message decides, and not its first bytes.
+		"visibility, then white space, 65 bytes":         {{text, `{"type":"activity","active":true}` + strings.Repeat(" ", 32), 1}, {text, ack, 0}},
+		"visible, then hidden and white space, 65 bytes": {visible, {text, `{"type":"activity","active":false}` + strings.Repeat(" ", 31), 1}, {text, ack, 1}},
+		"visibility, then white space and other bytes":   {{text, `{"type":"activity","active":true}` + strings.Repeat(" ", 31) + "x", 1}, {text, ack, 0}},
 		// Binary data does not change the mark.
 		"binary visibility": {{binary, `{"type":"activity","active":true}`, 1}, {text, ack, 0}},
 	}
