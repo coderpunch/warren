@@ -1674,14 +1674,15 @@ func (m *Manager) deletePod(ctx context.Context, pod *corev1.Pod, reason string,
 		Preconditions: &metav1.Preconditions{UID: &pod.UID},
 	})
 	if err != nil {
-		// No delete event comes for this request.
+		// No delete event comes for this request. Do not wake the callers
+		// that wait: the caller that sent this request can be one of them,
+		// and it then sends the request again with no pause. Each caller
+		// reads the mark again after its poll interval.
 		m.mu.Lock()
 		if st := m.sandboxes[pod.Name]; st != nil && st.deleting == pod.UID {
 			st.deleting = ""
 			m.dropLocked(pod.Name)
 		}
-		// A caller that waits for the end of the pod reads the mark again.
-		m.wakeLocked()
 		m.mu.Unlock()
 		if apierrors.IsNotFound(err) {
 			return nil

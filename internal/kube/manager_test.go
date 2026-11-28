@@ -1016,32 +1016,6 @@ func TestStartWhenTheDeleteRequestOfWarrenFails(t *testing.T) {
 	}
 }
 
-// A delete request that fails changes the record of the sandbox, and no event
-// comes for it. Thus the request must wake the callers that wait for the end
-// of the pod. Without the signal, a caller sees the change only at the end of
-// its poll interval.
-func TestDeleteRequestThatFailsWakesTheCallers(t *testing.T) {
-	e := newTestEnv(t, nil)
-	req := userRef("alice")
-	name := req.Ref.Name()
-	e.acquire(req).Release()
-	in, refuse := e.refusePodDelete(name)
-	stopped := make(chan error, 1)
-	go func() { stopped <- e.m.Stop(context.Background(), req.Ref) }()
-	<-in
-	// A caller that starts to wait now has this channel.
-	wake := e.m.waiter()
-	refuse()
-	if err := <-stopped; err == nil {
-		t.Fatal("Stop = nil, want the error of the API")
-	}
-	select {
-	case <-wake:
-	default:
-		t.Error("the delete request that failed did not wake the callers that wait")
-	}
-}
-
 // A start operation sends the delete request for a pod in a final phase. If
 // the API server has no such pod, the cache is late. The operation waits for
 // the cache, and it does not send the request again and again.
@@ -1065,6 +1039,48 @@ func TestStartOfAFailedPodWhenTheCacheIsLate(t *testing.T) {
 	}
 	if n := e.creates(); n != 1 {
 		t.Errorf("pod create requests = %d, want 1", n)
+	}
+}
+
+// A request that waits in Acquire sends the delete request for a pod in a
+// final phase. If that request fails, the request waits for the poll interval
+// before the next step. The first sandbox of the test gets a refusal. The
+// second one gets the reply "not found": the cache is late. A delete request
+// that fails must not wake the callers that wait: the caller that sent it is
+// one of them, and it then sends the request again with no pause.
+func TestAcquireOfAFailedPodWhenTheDeleteRequestFails(t *testing.T) {
+	e := newTestEnv(t, nil)
+	refused, late := userRef("alice"), userRef("bob")
+	for _, req := range []backend.Request{refused, late} {
+		name := req.Ref.Name()
+		e.acquire(req).Release()
+		e.setStatus(name, func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed })
+		waitFor(t, "failed pod in the cache", func() bool { p := e.m.pod(name); return p != nil && podTerminal(p) })
+	}
+	e.client.PrependReactor("delete", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if name := a.(k8stesting.DeleteAction).GetName(); name == late.Ref.Name() {
+			return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), name)
+		}
+		return forbidden(a)
+	})
+	// The time of the wait has space for one poll interval. Each request
+	// sends one delete request at its start and one after that interval.
+	const wait = pollInterval + pollInterval/2
+	limit := int(wait/pollInterval) + 1
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	results := []<-chan acquireResult{e.acquireAsync(ctx, e.m, refused), e.acquireAsync(ctx, e.m, late)}
+	for i, req := range []backend.Request{refused, late} {
+		if r := <-results[i]; !errors.Is(r.err, backend.ErrNotReady) {
+			t.Errorf("Acquire for the sandbox of %s = %v, want ErrNotReady at the end of its context", req.UserID, r.err)
+		}
+		if n := e.podDeletes(req.Ref.Name()); n < 1 || n > limit {
+			t.Errorf("pod delete requests for the sandbox of %s in %s = %d, want 1 to %d: one for each poll interval",
+				req.UserID, wait, n, limit)
+		}
+	}
+	if n := e.creates(); n != 2 {
+		t.Errorf("pod create requests = %d, want 2", n)
 	}
 }
 
