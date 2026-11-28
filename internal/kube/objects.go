@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -210,7 +211,55 @@ func (m *Manager) buildVolume(name string, req backend.Request, pol policy.Polic
 
 // reservedVariables are the variables that warren sets. The policy file
 // cannot set them (internal/policy). This is a second protection.
-var reservedVariables = map[string]bool{keyVariable: true, "HOME": true, "OPEN_TERMINAL_ISOLATED": true, "OPEN_TERMINAL_MULTI_USER": true}
+var reservedVariables = map[string]bool{
+	keyVariable: true, "HOME": true, "OPEN_TERMINAL_ISOLATED": true, "OPEN_TERMINAL_MULTI_USER": true,
+	cpuLimitVariable: true, cpuCountVariable: true, memoryLimitVariable: true, memoryBytesVariable: true,
+}
+
+// The limit variables give the cpu limit and the memory limit of a sandbox
+// to the server in the sandbox (docs/policies.md, section 6.1).
+const (
+	cpuLimitVariable    = "OPEN_TERMINAL_CPU_LIMIT"
+	cpuCountVariable    = "OPEN_TERMINAL_CPU_COUNT"
+	memoryLimitVariable = "OPEN_TERMINAL_MEMORY_LIMIT"
+	memoryBytesVariable = "OPEN_TERMINAL_MEMORY_BYTES"
+)
+
+// limitVariables makes the limit variables from the limits of a container.
+// A limit that the list does not have gets no variables. The forms of the
+// values are a decision of warren (docs/protocol.md, section 9.5, decision 7):
+// the two LIMIT variables have the canonical form of a Kubernetes quantity,
+// for example 500m and 2Gi. CPU_COUNT and MEMORY_BYTES are whole decimal
+// numbers.
+func limitVariables(limits corev1.ResourceList) []corev1.EnvVar {
+	var env []corev1.EnvVar
+	if cpu, ok := limits[corev1.ResourceCPU]; ok {
+		// String writes to the quantity. The copy keeps the list unchanged.
+		cpu = cpu.DeepCopy()
+		// The count is the limit as a whole number of processors. A part of
+		// a processor counts as one processor, and the minimum is 1. A limit
+		// that is too large for the number type gets the maximum.
+		count := int64(math.MaxInt64)
+		if cpu.CmpInt64(math.MaxInt64) < 0 {
+			// Value rounds up to a whole number.
+			count = max(cpu.Value(), 1)
+		}
+		env = append(env,
+			corev1.EnvVar{Name: cpuLimitVariable, Value: cpu.String()},
+			corev1.EnvVar{Name: cpuCountVariable, Value: strconv.FormatInt(count, 10)},
+		)
+	}
+	if memory, ok := limits[corev1.ResourceMemory]; ok {
+		memory = memory.DeepCopy()
+		// The policy file accepts only a whole number of bytes, with a
+		// maximum of 1Ei (internal/policy). Thus the number is exact.
+		env = append(env,
+			corev1.EnvVar{Name: memoryLimitVariable, Value: memory.String()},
+			corev1.EnvVar{Name: memoryBytesVariable, Value: strconv.FormatInt(memory.Value(), 10)},
+		)
+	}
+	return env
+}
 
 func (m *Manager) buildPod(name, secretName string, req backend.Request, pol policy.Policy) *corev1.Pod {
 	no, yes := false, true
@@ -241,6 +290,7 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request, pol pol
 		annotations[AnnotationIdleTimeout] = pol.IdleTimeout.String()
 	}
 
+	resources := *pol.Resources.DeepCopy()
 	env := []corev1.EnvVar{
 		{Name: keyVariable, ValueFrom: &corev1.EnvVarSource{
 			SecretKeyRef: &corev1.SecretKeySelector{
@@ -257,6 +307,9 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request, pol pol
 		// One pod for each scope key gives the isolation.
 		{Name: "OPEN_TERMINAL_MULTI_USER", Value: "false"},
 	}
+	// The variables come from the limits that the container gets. Thus they
+	// always agree with the real limits of the pod.
+	env = append(env, limitVariables(resources.Limits)...)
 	names := make([]string, 0, len(pol.Env))
 	for n := range pol.Env {
 		if !reservedVariables[n] {
@@ -271,7 +324,6 @@ func (m *Manager) buildPod(name, secretName string, req backend.Request, pol pol
 		env = append(env, corev1.EnvVar{Name: n, Value: strings.ReplaceAll(pol.Env[n], "$", "$$")})
 	}
 
-	resources := *pol.Resources.DeepCopy()
 	home := corev1.Volume{Name: homeVolume}
 	if pol.Persistent() {
 		home.PersistentVolumeClaim = &corev1.PersistentVolumeClaimVolumeSource{ClaimName: name}

@@ -667,8 +667,9 @@ func TestShutdownClosesWebSockets(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Errorf("Shutdown = %v", err)
 	}
-	if !strings.Contains(e.logs.String(), "closed by warren") {
-		t.Errorf("no audit record for the WebSocket that warren closed:\n%s", e.logs.String())
+	// The audit record has the code that the client got.
+	if !strings.Contains(e.logs.String(), `"detail":"closed by warren, code 1012"`) {
+		t.Errorf("no audit record for the WebSocket that warren closed with the code 1012:\n%s", e.logs.String())
 	}
 	// No new WebSocket after the stop.
 	_, resp, err := e.dial("/events", "alice", nil)

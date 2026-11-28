@@ -51,7 +51,7 @@ func TestDeleteOfAPodThatIsGone(t *testing.T) {
 	}
 	waitFor(t, "pod gone from the cache", func() bool { return e.m.pod(name) == nil })
 	// The reaper has an old copy of the pod and sends its delete request.
-	if err := e.m.deletePod(context.Background(), old, "idle", false); err != nil {
+	if err := e.m.deletePod(context.Background(), old, "idle", notIdle); err != nil {
 		t.Fatalf("deletePod for a pod that is gone = %v", err)
 	}
 

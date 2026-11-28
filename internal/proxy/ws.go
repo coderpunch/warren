@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,32 @@ var (
 		`^/(events|execute|execute/[^/]+/status|api/terminals/[^/]+|desktop/stream|desktop/audio|agents/sessions/[^/]+/connect)$`)
 	headerRoutes = regexp.MustCompile(`^/browser/view/[^/]+/[^/]+/(ws|stream|vnc)$`)
 )
+
+// watcherRoutes are the WebSocket routes on which a client only watches a
+// sandbox: the events of files and ports, the process list, and the output of
+// one process. The browser client of Open WebUI opens them with no action of
+// a person, sends no data on them after the first messages, and connects
+// again with no limit after most close codes (docs/protocol.md, section
+// 4.2.3). Each other WebSocket route is a viewer route: a person or an agent
+// uses the sandbox through it.
+var watcherRoutes = regexp.MustCompile(`^/(events|execute|execute/[^/]+/status)$`)
+
+// watcherRoute reports whether a decoded request path is a watcher route. A
+// watcher does not begin a start of its sandbox, and it has its own close
+// code for the idle stop (docs/policies.md, section 10.3).
+func watcherRoute(path string) bool { return watcherRoutes.MatchString(path) }
+
+// holdRoutes is the WebSocket route of an agent session. Its only client is
+// the Open WebUI backend, which keeps it open for one chat turn of an agent
+// and sends no HTTP request to the sandbox in that time (docs/protocol.md,
+// section 4.7). No browser can open it, thus a forgotten page cannot keep it
+// open.
+var holdRoutes = regexp.MustCompile(`^/agents/sessions/[^/]+/connect$`)
+
+// holdRoute reports whether a decoded request path is the route of an agent
+// session. The open WebSocket on that route is a use of the sandbox, and the
+// idle stop waits for its end (docs/policies.md, section 10.4).
+func holdRoute(path string) bool { return holdRoutes.MatchString(path) }
 
 func classifyWS(path string) wsAuth {
 	switch {
@@ -223,7 +250,12 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 		}
 	}()
 
-	s := &session{proxy: p, client: conn}
+	// A watcher does not begin a start of its sandbox. It waits here until a
+	// different request or operation starts the sandbox, for the same maximum
+	// time. At the end of that time it gets the code 1013, as each WebSocket
+	// whose sandbox is not ready.
+	watcher := watcherRoute(r.URL.Path)
+	s := &session{proxy: p, client: conn, watcher: watcher}
 	// From this point only the client pump reads from the client. It finds
 	// a client that goes away, and it answers pings, while the sandbox
 	// starts.
@@ -240,7 +272,9 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 		<-clientDone
 	}
 
-	lease, err := p.opts.Backend.Acquire(ctx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID, WebSocket: true})
+	lease, err := p.opts.Backend.Acquire(ctx, backend.Request{
+		Ref: rt.ref, UserID: rt.id.UserID, WebSocket: true, NoStart: watcher, Hold: holdRoute(r.URL.Path),
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, backend.ErrCapacity):
@@ -264,6 +298,7 @@ func (p *Proxy) ServeWS(w http.ResponseWriter, r *http.Request, finished func())
 		return
 	}
 	defer lease.Release()
+	s.lease = lease
 	target := lease.Target()
 
 	up, code, err := p.dialSandbox(ctx, r, rt, target)
@@ -453,6 +488,73 @@ type closeInfo struct {
 	// writeFailed: a write to this side failed. The reader of this side
 	// can have the real close code.
 	writeFailed bool
+	// reason is the stop reason of the backend, when the backend stopped
+	// the sandbox. It is empty in all other conditions.
+	reason string
+}
+
+// stopClose gives the close code and the reason text that the client gets
+// when the backend stops the sandbox of a WebSocket (docs/policies.md,
+// section 10.2). The client of Open WebUI connects again after the codes
+// 1011 and 1012, and it does not connect again after a code from 4000 to
+// 4999 (docs/protocol.md, section 4.2.3). Open WebUI does not send the text
+// to the browser. The text is for other clients.
+//
+// The two classes of routes are different only for the idle stop. A viewer that
+// connects again starts the sandbox, thus it gets a code after which it
+// stops. A watcher that connects again starts nothing, and a watcher that
+// stopped stays stopped when the sandbox operates again. Thus a watcher gets
+// a code after which it connects again.
+func stopClose(reason string, watcher bool) (code int, text string) {
+	switch reason {
+	case backend.StopAPI:
+		return websocket.CloseServiceRestart, "An operation stopped or restarted the terminal"
+	case backend.StopIdle:
+		if watcher {
+			return websocket.CloseServiceRestart, "The terminal stopped after its idle time"
+		}
+		return closeNotFound, "The terminal stopped after its idle time"
+	case backend.StopNoPolicy:
+		// For a policy that is not in the file, a new connection gets the
+		// same code and text from the route check. For a policy with a
+		// different scope, a new connection is for the sandbox of the new
+		// scope, and it does not get this code (docs/policies.md,
+		// section 10.2).
+		return closeNotFound, "Template not found"
+	case backend.StopNetworkChanged, backend.StopVolumeGone, backend.StopExternal:
+		return websocket.CloseServiceRestart, "The terminal restarts"
+	}
+	return websocket.CloseInternalServerErr, "The terminal failed"
+}
+
+// backendStop returns the close data for a stop of the sandbox by the
+// backend, for a watcher route or for a viewer route. It reports false if
+// the lease does not have the stop signal.
+func backendStop(lease backend.Lease, watcher bool) (closeInfo, bool) {
+	select {
+	case <-lease.Stopped():
+	default:
+		return closeInfo{}, false
+	}
+	reason := lease.StopReason()
+	code, text := stopClose(reason, watcher)
+	return closeInfo{side: sideWarren, code: code, text: text, reason: reason}, true
+}
+
+// cause returns the close data for the end of a relay, from the data of the
+// side that stopped first. When the sandbox side stopped and the lease has
+// the stop signal, the stop by the backend is the cause: a sandbox that stops
+// sends its own close code, or it breaks the connection. The client then gets
+// the code of warren, thus the result does not depend on the sequence of the
+// two events.
+func (s *session) cause(first closeInfo) closeInfo {
+	if first.side != sideSandbox {
+		return first
+	}
+	if stop, ok := backendStop(s.lease, s.watcher); ok {
+		return stop
+	}
+	return first
 }
 
 // session is one WebSocket relay.
@@ -460,6 +562,11 @@ type session struct {
 	proxy   *Proxy
 	client  *websocket.Conn
 	sandbox *websocket.Conn
+	// lease is the lease on the sandbox. It is nil until the backend gives
+	// it.
+	lease backend.Lease
+	// watcher is true for a watcher route: refer to watcherRoute.
+	watcher bool
 	// closing is true after warren sent a close message. The copy loops
 	// then read and discard, until the reply to the close message comes.
 	closing atomic.Bool
@@ -507,16 +614,212 @@ func readFailure(src side, err error) closeInfo {
 	return info
 }
 
+// automaticBytes is the number of bytes at the start of a text message of a
+// client that warren examines to find the kind of the message.
+const automaticBytes = 64
+
+// The parts of the start of an automatic message, in their sequence, and the
+// three types of an automatic message with their quotation marks.
+var (
+	automaticStart = [][]byte{[]byte("{"), []byte(`"type"`), []byte(":")}
+	typePing       = []byte(`"ping"`)
+	typeAck        = []byte(`"ack"`)
+	typeFrameAck   = []byte(`"frameAck"`)
+)
+
+// messageKind is the result of the examination of one message of a client.
+type messageKind int
+
+const (
+	// kindUse is a message that is a use of the sandbox.
+	kindUse messageKind = iota
+	// kindPing and kindFrameAck are automatic messages that are never a use.
+	kindPing
+	kindFrameAck
+	// kindAck is an automatic message that is a use only while the client
+	// shows the terminal: refer to clientUse.
+	kindAck
+)
+
+// jsonSpace is the white space of JSON.
+const jsonSpace = " \t\n\r"
+
+// automaticKind examines the first bytes of a text message of a client. The
+// clients of Open WebUI send three types of message with no action of a
+// person: "ping" on a timer, "ack" after output of the sandbox that the
+// terminal wrote to the screen, and "frameAck" after each frame of a screen
+// stream (docs/protocol.md, section 4.2.4). Such a message is not proof that
+// a person uses the sandbox.
+//
+// A message is automatic if and only if head starts with these parts, in this
+// sequence: optional JSON white space, "{", optional white space, the bytes
+// "type" in quotation marks, optional white space, ":", optional white space,
+// and then exactly "ping", "ack", or "frameAck" in quotation marks. Each
+// other message is a use message.
+//
+// The caller gives a maximum of automaticBytes bytes. The size of the message
+// and all bytes after the type have no effect. That is necessary: a sandbox
+// controls a value that the client puts into an "ack" message, and thus the
+// size of that message (docs/protocol.md, section 4.2.4). A result "use" that
+// is wrong is what a sandbox can use to keep itself, thus the rule must not
+// depend on a value that a sandbox controls. A result "automatic" that is
+// wrong harms only the client that sent the message.
+//
+// The function is not a JSON decoder. A key with an escape sequence, and a
+// "type" member that is not the first member, give a use message.
+func automaticKind(head []byte) messageKind {
+	rest := head
+	for _, part := range automaticStart {
+		rest = bytes.TrimLeft(rest, jsonSpace)
+		if !bytes.HasPrefix(rest, part) {
+			return kindUse
+		}
+		rest = rest[len(part):]
+	}
+	rest = bytes.TrimLeft(rest, jsonSpace)
+	switch {
+	case bytes.HasPrefix(rest, typePing):
+		return kindPing
+	case bytes.HasPrefix(rest, typeAck):
+		return kindAck
+	case bytes.HasPrefix(rest, typeFrameAck):
+		return kindFrameAck
+	}
+	return kindUse
+}
+
+// visibility examines a complete text message of a client. The interactive
+// terminal of Open WebUI sends the message {"type":"activity","active":B}
+// when it becomes visible or hidden: B is true only while the page shows the
+// terminal tab and the document is not hidden (docs/protocol.md, section
+// 4.2.4). The function returns B, and true if the message is such a message:
+// a JSON object whose member "type" is the string "activity" and whose member
+// "active" is true or false. Open Terminal has the same condition
+// (docs/open-terminal-api.md, section 3.4).
+func visibility(msg []byte) (active, ok bool) {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(msg, &object) != nil {
+		return false, false
+	}
+	var typ string
+	if json.Unmarshal(object["type"], &typ) != nil || typ != "activity" {
+		return false, false
+	}
+	switch string(object["active"]) {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	}
+	return false, false
+}
+
+// clientUse finds the messages of the client of one relay that are a use of
+// the sandbox, and tells the lease about each one (backend.Lease.Active). An
+// open WebSocket is not a use of the sandbox: only these messages are
+// (docs/policies.md, section 10.4). The WebSocket of an agent session is the
+// exception: it keeps its sandbox while it is open, and its lease ignores
+// the call of Active (refer to holdRoute). The rules:
+//
+//   - A binary message is always a use message.
+//   - A text message is a use message unless it is automatic: refer to
+//     automaticKind.
+//   - An automatic "ping" or "frameAck" message is never a use.
+//   - An automatic "ack" message is a use only while visible is true. A
+//     terminal sends it after it wrote output to the screen. Thus output that
+//     a visible terminal shows is a use, and output in a hidden terminal is
+//     not.
+//   - A message of the sandbox is never a use. The copy loop of that
+//     direction has no clientUse.
+//
+// Only the copy loop of the client direction uses a clientUse, thus it needs
+// no lock. Warren relays each message with no change: the rules decide only
+// the call of Active.
+type clientUse struct {
+	lease backend.Lease
+	// visible is the last value that the client reported with a message of
+	// the type "activity". It is false until the first such message. No
+	// message of the sandbox can change it.
+	visible bool
+
+	// The data of the message in progress. head has the first bytes of a text
+	// message: one more than automaticBytes, to tell a message of exactly
+	// that size from a longer one.
+	head    [automaticBytes + 1]byte
+	size    int
+	decided bool
+}
+
+// start begins a new message of the client.
+func (u *clientUse) start(messageType int) {
+	u.size, u.decided = 0, false
+	if messageType != websocket.TextMessage {
+		// Terminal input and the data of a remote desktop are binary.
+		u.decided = true
+		u.lease.Active()
+	}
+}
+
+// data gets each part of the message, in sequence.
+func (u *clientUse) data(part []byte) {
+	if u.decided {
+		return
+	}
+	u.size += copy(u.head[u.size:], part)
+	if u.size > automaticBytes {
+		// The message is longer than the bytes that warren examines.
+		u.decide(false)
+	}
+}
+
+// end completes the message.
+func (u *clientUse) end() {
+	if !u.decided {
+		u.decide(true)
+	}
+}
+
+// decide makes the decision for a text message. complete is true if head has
+// the full message.
+func (u *clientUse) decide(complete bool) {
+	u.decided = true
+	head := u.head[:min(u.size, automaticBytes)]
+	switch automaticKind(head) {
+	case kindPing, kindFrameAck:
+		return
+	case kindAck:
+		if u.visible {
+			u.lease.Active()
+		}
+		return
+	}
+	if complete {
+		if active, ok := visibility(head); ok {
+			u.visible = active
+		}
+	}
+	u.lease.Active()
+}
+
 // copyMessages copies each message from src to dst as a stream. It does not
 // keep a message in memory, and it does not group messages: Open Terminal
 // closes a terminal when too much input waits
 // (docs/open-terminal-api.md, section 3.4). If reader is not nil, it is a
 // message of src that the caller started to read.
+//
+// In the direction from the client, it also tells the lease about each
+// message that is a use of the sandbox: refer to clientUse. The cost for one
+// message is a copy of its first bytes and one call of Active.
+//
+// After warren sent a close message, the function writes nothing: it reads
+// src and discards the data, until src answers the close message.
 func (s *session) copyMessages(dst, src *websocket.Conn, fromClient bool, mt int, reader io.Reader) closeInfo {
 	srcSide, dstSide := otherSide(fromClient)
-	writeFailure := closeInfo{side: dstSide, code: websocket.CloseAbnormalClosure, writeFailed: true}
-	timeout := s.proxy.opts.WriteTimeout
 	buf := make([]byte, 32<<10)
+	var use *clientUse
+	if fromClient {
+		use = &clientUse{lease: s.lease}
+	}
 	for {
 		if reader == nil {
 			var err error
@@ -525,47 +828,83 @@ func (s *session) copyMessages(dst, src *websocket.Conn, fromClient bool, mt int
 				return readFailure(srcSide, err)
 			}
 		}
-		if s.closing.Load() {
-			if _, err := io.Copy(io.Discard, reader); err != nil {
+		if !s.closing.Load() {
+			written, err := s.copyMessage(dst, mt, reader, use, buf)
+			if err != nil {
 				return readFailure(srcSide, err)
 			}
-			reader = nil
-			continue
-		}
-		// Each write has a time limit. If not, a peer that stops reading
-		// holds the relay, and nothing sees that the other peer went away.
-		_ = dst.SetWriteDeadline(time.Now().Add(timeout))
-		writer, err := dst.NextWriter(mt)
-		if err != nil {
-			return writeFailure
-		}
-		for {
-			n, rerr := reader.Read(buf)
-			if n > 0 {
-				_ = dst.SetWriteDeadline(time.Now().Add(timeout))
-				if _, werr := writer.Write(buf[:n]); werr != nil {
-					return writeFailure
-				}
+			if written {
+				reader = nil
+				continue
 			}
-			if rerr == io.EOF {
-				break
+			if !s.closing.Load() {
+				return closeInfo{side: dstSide, code: websocket.CloseAbnormalClosure, writeFailed: true}
 			}
-			if rerr != nil {
-				// Do not close the writer. A close sends the last frame,
-				// and the part would arrive as a complete message.
-				return readFailure(srcSide, rerr)
-			}
+			// Warren sent its close messages while this message was in the
+			// copy. After a close message, each write to that connection
+			// fails, thus the failure does not show that dst went away.
+			// Continue to read src. If this loop stopped, nothing would read
+			// src. The connection to a client would then close with data that
+			// nothing read, and the client can lose the close message and its
+			// code.
 		}
-		if err := writer.Close(); err != nil {
-			return writeFailure
+		if _, err := io.Copy(io.Discard, reader); err != nil {
+			return readFailure(srcSide, err)
 		}
 		reader = nil
 	}
 }
 
-// finish waits until one side of a relay stops. It then sends the close
-// code to the other side, waits for the reply, and closes the connections.
-// It returns a text for the audit record.
+// copyMessage copies one message from reader to dst. written is false if a
+// write to dst failed: reader can then have more data of the message. err is
+// an error of reader.
+func (s *session) copyMessage(dst *websocket.Conn, mt int, reader io.Reader, use *clientUse, buf []byte) (written bool, err error) {
+	timeout := s.proxy.opts.WriteTimeout
+	// Each write has a time limit. If not, a peer that stops reading holds
+	// the relay, and nothing sees that the other peer went away.
+	_ = dst.SetWriteDeadline(time.Now().Add(timeout))
+	writer, err := dst.NextWriter(mt)
+	if err != nil {
+		return false, nil
+	}
+	if use != nil {
+		use.start(mt)
+	}
+	for {
+		n, rerr := reader.Read(buf)
+		if n > 0 {
+			if use != nil {
+				use.data(buf[:n])
+			}
+			_ = dst.SetWriteDeadline(time.Now().Add(timeout))
+			if _, werr := writer.Write(buf[:n]); werr != nil {
+				return false, nil
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			// Do not close the writer. A close sends the last frame, and
+			// the part would arrive as a complete message.
+			return false, rerr
+		}
+	}
+	if use != nil {
+		use.end()
+	}
+	return writer.Close() == nil, nil
+}
+
+// finish waits until one side of a relay stops, until the backend stops the
+// sandbox, or until warren stops. It then sends the close code to the other
+// side, or to the two sides, waits for the reply, and closes the
+// connections. It returns a text for the audit record.
+//
+// When the backend stops the sandbox, the client gets the code of
+// stopClose, and the sandbox gets the code 1001. This is also the result when
+// the sandbox side ends first and the lease has the stop signal at that time:
+// refer to cause.
 func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 	var first closeInfo
 	clientRunning, sandboxRunning := true, true
@@ -582,8 +921,10 @@ func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 		take(info, true)
 	case info := <-sandboxDone:
 		take(info, false)
+	case <-s.lease.Stopped():
+		first, _ = backendStop(s.lease, s.watcher)
 	case <-s.proxy.closing:
-		first = closeInfo{side: sideWarren}
+		first = closeInfo{side: sideWarren, code: websocket.CloseServiceRestart, text: "The server restarts"}
 	}
 
 	// A failed write says only that a side is gone. The reader of that
@@ -605,6 +946,7 @@ func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 		}
 		timer.Stop()
 	}
+	first = s.cause(first)
 
 	s.closing.Store(true)
 	switch first.side {
@@ -613,7 +955,7 @@ func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 	case sideSandbox:
 		closeConn(s.client, sandboxCloseCode(first.code), first.text)
 	default:
-		closeConn(s.client, websocket.CloseServiceRestart, "The server restarts")
+		closeConn(s.client, first.code, first.text)
 		closeConn(s.sandbox, websocket.CloseGoingAway, "")
 	}
 
@@ -643,7 +985,11 @@ func (s *session) finish(clientDone, sandboxDone <-chan closeInfo) string {
 			clientRunning, sandboxRunning = false, false
 		}
 	}
-	return fmt.Sprintf("closed by %s, code %d", first.side, first.code)
+	detail := fmt.Sprintf("closed by %s, code %d", first.side, first.code)
+	if first.reason != "" {
+		detail += ", reason " + first.reason
+	}
+	return detail
 }
 
 // reserved reports whether a close code must not be in a close message.

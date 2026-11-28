@@ -38,9 +38,15 @@ type fakeTerminal struct {
 	requests []*http.Request
 	wsFirst  []string
 	wsClosed []int
+	// wsPings is the number of ping frames of the WebSocket protocol that
+	// the terminal got.
+	wsPings int
 	// openAPI is the document that the terminal sends. The default is
 	// hostileOpenAPI.
 	openAPI string
+	// beforeEnd, if not nil, runs before the terminal ends a WebSocket
+	// because of the text message "close-1012" or "cut".
+	beforeEnd func()
 }
 
 func (f *fakeTerminal) setOpenAPI(doc string) {
@@ -77,6 +83,17 @@ func (f *fakeTerminal) last() *http.Request {
 
 var fakeUpgrader = websocket.Upgrader{}
 
+// burstMessages is the number of messages that the terminal sends on a
+// WebSocket whose path contains "burst", immediately after the first
+// message. burstTexts are the text messages of each group of four.
+const burstMessages = 100
+
+var burstTexts = []string{
+	`{"type":"output","start":0,"end":21,"truncated":false}`,
+	`{"type":"activity","active":true}`,
+	`{"type":"resize","cols":80,"rows":24}`,
+}
+
 // hostileResponseHeaders change the state of a browser for a full origin,
 // or give instructions to a reverse proxy.
 var hostileResponseHeaders = []string{
@@ -109,6 +126,10 @@ const hostileOpenAPI = `{
   }
 }`
 
+// systemInfoBody is a part of the system information of a sandbox that
+// started a short time before.
+const systemInfoBody = `{"hostname":"sandbox","cpu":{"percent":null,"cores":2,"scope":"cgroup"},"memory":{"total":2147483648,"used":1048576,"scope":"cgroup"}}`
+
 func (f *fakeTerminal) handle(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.requests = append(f.requests, r.Clone(context.Background()))
@@ -139,6 +160,12 @@ func (f *fakeTerminal) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.URL.Path {
+	case "/system/info":
+		// Open Terminal sends these two headers with its system information
+		// (docs/open-terminal-api.md, section 3.1).
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		io.WriteString(w, systemInfoBody)
 	case "/openapi.json":
 		w.Header().Set("Content-Type", "application/json")
 		f.mu.Lock()
@@ -208,6 +235,12 @@ func (f *fakeTerminal) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	conn.SetPingHandler(func(data string) error {
+		f.mu.Lock()
+		f.wsPings++
+		f.mu.Unlock()
+		return conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(time.Second))
+	})
 	if !strings.HasPrefix(r.URL.Path, "/browser/view/") {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -241,6 +274,21 @@ func (f *fakeTerminal) handleWS(w http.ResponseWriter, r *http.Request) {
 		raw.Close()
 		return
 	}
+	if strings.Contains(r.URL.Path, "burst") {
+		// A sandbox that sends data with no message of the client: the
+		// output of a program, and text messages that have the form of the
+		// messages of a client.
+		for i := 0; i < burstMessages/4; i++ {
+			for _, text := range burstTexts {
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(text)); err != nil {
+					return
+				}
+			}
+			if err := conn.WriteMessage(websocket.BinaryMessage, []byte("output of a program\r\n")); err != nil {
+				return
+			}
+		}
+	}
 	if strings.Contains(r.URL.Path, "closeme") {
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(4004, "gone"), time.Now().Add(time.Second))
@@ -256,6 +304,25 @@ func (f *fakeTerminal) handleWS(w http.ResponseWriter, r *http.Request) {
 			f.mu.Lock()
 			f.wsClosed = append(f.wsClosed, code)
 			f.mu.Unlock()
+			return
+		}
+		if mt == websocket.TextMessage && (string(data) == "close-1012" || string(data) == "cut") {
+			f.mu.Lock()
+			beforeEnd := f.beforeEnd
+			f.mu.Unlock()
+			if beforeEnd != nil {
+				beforeEnd()
+			}
+			if string(data) == "cut" {
+				// A process that stops with no close message.
+				conn.NetConn().Close()
+				return
+			}
+			// The server of Open Terminal closes each WebSocket with this
+			// code, and with no text, when it stops
+			// (docs/open-terminal-api.md, section 4.3).
+			_ = conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseServiceRestart, ""), time.Now().Add(time.Second))
 			return
 		}
 		if err := conn.WriteMessage(mt, append([]byte("echo:"), data...)); err != nil {
@@ -275,19 +342,88 @@ type mapBackend struct {
 	block chan struct{}
 	// errors has the error that Acquire returns for a sandbox name.
 	errors map[string]error
+	// leases has each lease that Acquire gave, in the sequence of the calls.
+	leases []*mapLease
+	// late makes each new lease hide its stop signal from the first call of
+	// Stopped: refer to mapLease.late.
+	late bool
 }
 
 type mapLease struct {
 	m      *mapBackend
 	target backend.Target
+	// stopped closes when a test stops the sandbox of the lease. reason is
+	// the cause. The lock of the backend guards the two fields.
+	stopped chan struct{}
+	reason  string
+	// active is the number of calls of Active.
+	active int
+	// late makes the first call of Stopped return a channel that never
+	// closes. The relay calls Stopped two times: first when it waits for the
+	// end of a side or for the signal, and then when it finds the cause of
+	// the end of the sandbox side. With late, the relay thus sees the end of
+	// the sandbox side first, and the lease has the signal at that time. asks
+	// is the number of calls of Stopped.
+	late bool
+	asks int
 }
 
 func (l *mapLease) Target() backend.Target { return l.target }
+
+// Active counts each call. The limit of one write in an interval is in the
+// Kubernetes backend, and not in this lease.
+func (l *mapLease) Active() {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	l.active++
+}
+
+// activeCalls returns the number of calls of Active.
+func (l *mapLease) activeCalls() int {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	return l.active
+}
+
+func (l *mapLease) Stopped() <-chan struct{} {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	l.asks++
+	if l.late && l.asks == 1 {
+		return nil
+	}
+	return l.stopped
+}
+
+// stoppedCalls returns the number of calls of Stopped.
+func (l *mapLease) stoppedCalls() int {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	return l.asks
+}
+
+func (l *mapLease) StopReason() string {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	return l.reason
+}
 func (l *mapLease) Release() {
 	l.m.mu.Lock()
 	defer l.m.mu.Unlock()
 	l.m.open--
 	l.m.released++
+}
+
+// stop gives the lease the stop signal, as the backend does when it stops
+// the sandbox. A second call has no effect: the first reason stays.
+func (l *mapLease) stop(reason string) {
+	l.m.mu.Lock()
+	defer l.m.mu.Unlock()
+	if l.reason != "" {
+		return
+	}
+	l.reason = reason
+	close(l.stopped)
 }
 
 func (m *mapBackend) Acquire(ctx context.Context, req backend.Request) (backend.Lease, error) {
@@ -308,12 +444,37 @@ func (m *mapBackend) Acquire(ctx context.Context, req backend.Request) (backend.
 		}
 	}
 	if !ok {
+		if req.Passive {
+			// A passive request does not start a sandbox.
+			return nil, backend.ErrStopped
+		}
 		return nil, backend.ErrNotReady
 	}
+	l := &mapLease{m: m, target: t, stopped: make(chan struct{})}
 	m.mu.Lock()
+	l.late = m.late
 	m.open++
+	m.leases = append(m.leases, l)
 	m.mu.Unlock()
-	return &mapLease{m: m, target: t}, nil
+	return l, nil
+}
+
+// lastLease returns the lease of the last call that got one.
+func (m *mapBackend) lastLease(t *testing.T) *mapLease {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.leases) == 0 {
+		t.Fatal("the backend gave no lease")
+	}
+	return m.leases[len(m.leases)-1]
+}
+
+// releases returns the number of leases that ended.
+func (m *mapBackend) releases() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.released
 }
 
 func (m *mapBackend) callCount() int {
@@ -814,6 +975,14 @@ func (e *env) dial(path, user string, header http.Header) (*websocket.Conn, *htt
 
 func closeCode(t *testing.T, conn *websocket.Conn) int {
 	t.Helper()
+	code, _ := closeMessage(t, conn)
+	return code
+}
+
+// closeMessage reads until the close message and returns its code and its
+// reason text.
+func closeMessage(t *testing.T, conn *websocket.Conn) (int, string) {
+	t.Helper()
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	for {
 		_, _, err := conn.ReadMessage()
@@ -821,7 +990,7 @@ func closeCode(t *testing.T, conn *websocket.Conn) int {
 			continue
 		}
 		if ce, ok := err.(*websocket.CloseError); ok {
-			return ce.Code
+			return ce.Code, ce.Text
 		}
 		t.Fatalf("no close message: %v", err)
 	}

@@ -80,17 +80,18 @@ The warren word for an instance is "sandbox".
 
 | Feature in the documentation | Plan | Note |
 |---|---|---|
-| The orchestrator makes an instance on the first request and uses it again for subsequent requests. | v1 | |
+| The orchestrator makes an instance on the first request and uses it again for subsequent requests. | v1 | Two kinds of request do not make an instance in warren: a request for the system information (below), and a WebSocket on a route on which the browser only watches the instance. Such a WebSocket waits until a different request starts the instance. The documentation does not define these cases. Refer to `policies.md`, sections 10.1 and 10.3. |
 | On Kubernetes, the proxy starts after the pod is ready. | v1 | A readiness gate on the Open Terminal health route. |
 | A slow start shows in Open WebUI as a timeout message. The remedy is a larger Open WebUI timeout (default 60 seconds). | v1 | Warren holds the first request until the pod is ready or a deadline occurs. Open WebUI has shorter limits for some calls. Refer to `protocol.md`, section 9.4. |
 | Idle timeout. The orchestrator stops the instance and keeps the files. The environment default is "off". The Helm chart default is 30 minutes. | v1 | Warren has an idle timeout that an administrator can set. The default is "on". |
-| The activity time of an instance is the time of the last proxied request. | v1 | Warren also counts an open WebSocket as activity. The documentation does not define this case. |
+| The activity time of an instance is the time of the last proxied request. | v1 | In warren, an HTTP request is activity from its start to its end. An open WebSocket is not activity. The start of a WebSocket is activity, and each message of its client that is not an automatic message: the keepalive `ping` of the terminal, the `frameAck` of a screen view, and the `ack` of a terminal that is not visible. A message of the instance is not activity. Thus a page that a person forgot does not keep an instance. The WebSocket of an agent session is the exception: it is activity while it is open. At the idle stop, warren closes the open WebSockets with the close code 4004, or 1012 on a route on which the browser only watches the instance. The documentation does not define these cases. Refer to `policies.md`, section 10.4, also for the limits. A request for the system information is not activity in warren (next row). |
+| The user interface offers the system information only for an instance that runs. The view reads the data again each 5 seconds while it is open. | v1 | Warren sends the request for the system information only to a sandbox that operates. For a stopped sandbox, the reply is status 409, and the sandbox does not start. The request is not activity. Refer to `policies.md`, section 10.1. The documentation does not say what the orchestrator does with this request. A source comment of Open WebUI says that the orchestrator does not start an instance for it (`protocol.md`, section 4.1.1). |
 | Idle timeout for each template. | v1 | Field in a policy. A change applies also to the pods that operate. |
 | Maximum lifetime, for the orchestrator and for each template. The orchestrator stops the instance, also during use. | Later | |
 | Scheduled reset. The orchestrator clears the files at a set time, each week, each month, or on a cron schedule. An administrator sets it in the orchestrator interface. | Later | |
-| Instance operations: start, stop, restart, delete. | v1 | Warren implements the instance calls. Refer to `protocol.md`, section 9.5. |
-| Restart stops an instance and starts it again with the current template settings. | v1 | |
-| Instance operation: reset (clear the files and start again). | v1 | Warren deletes the pod and the volume, and makes a new, empty volume. The instance stays in the instance list. Warren does not start the instance again: the next request of a user does that. Open WebUI 0.13.4 has no control for this operation. |
+| Instance operations: start, stop, restart, delete. | v1 | Warren implements the instance calls. Refer to `protocol.md`, section 9.5. A stop, restart, reset, or delete closes the open WebSockets of the instance with the close code 1012, thus the clients connect again. The documentation gives no close code. A WebSocket that only watches the instance does not start it again when it connects. A stop or a delete does not keep the instance stopped while a page of Open WebUI has the terminal selected: Open WebUI sends requests by itself after each operation, and each request starts the instance. Refer to `policies.md`, sections 10 and 10.2. |
+| Restart stops an instance and starts it again with the current template settings. | v1 | While the restart is in progress, a request waits for the new pod and does not start the instance itself. |
+| Instance operation: reset (clear the files and start again). | v1 | Warren deletes the pod and the volume, and makes a new, empty volume. The instance stays in the instance list. Warren does not start the instance again: the next request of a user does that. Open WebUI sends such a request by itself when a page has the terminal selected (`policies.md`, section 10). Open WebUI 0.13.4 has no control for this operation. |
 | A deleted instance keeps its volume on the operator backend. A deleted terminal removes its instances and files. | v1 | Different in warren: the delete operation for an instance removes the pod and the volume. The Open WebUI user interface tells the person that the delete removes the instance and its files. The stop operation keeps the volume. A template is part of the warren configuration, thus Open WebUI cannot delete it. When an administrator removes a policy from the file, warren keeps its volumes. Only an explicit cleanup operation deletes them. Refer to `policies.md`, section 11.1. |
 | A template change applies only to instances that start after the change. | v1 | Warren reads the policy file again with no restart. The idle time, the retention time, and the user list apply immediately. Refer to `policies.md`, section 11. |
 | Setup script that runs at each start of an instance. Open Terminal reads it from an environment variable. | v1 | Warren passes the variable. A setup script that needs root or a network download can fail in a restricted sandbox. |
@@ -147,7 +148,7 @@ Warren must show values in these forms.
 |---|---|---|
 | The orchestrator passes the template variables to each instance. | v1 | |
 | The orchestrator removes the Open Terminal API key variable from a template. | v1 | |
-| The orchestrator adds variables that give the CPU and memory limits to the processes in the instance. | v1 | Open Terminal 0.18.1 does not read these variables. A system prompt or a tool can read them. |
+| The orchestrator adds variables that give the CPU and memory limits to the processes in the instance. The documentation says that a system prompt or a tool can read them. | v1 | Warren sets the four variables on each sandbox (`policies.md`, section 6.1). The documentation gives no form of the values, thus the forms are a decision of warren (`protocol.md`, section 9.5, decision 7). Open Terminal 0.18.1 does not read these variables, and it removes them from the environment of the programs that it starts (`open-terminal-api.md`, section 8.6). Thus, with Open Terminal 0.18.1, a shell, a command of a tool, and the system prompt do not get them. The documentation does not say how the orchestrator gives them to a system prompt or a tool. |
 | A system prompt variable in the orchestrator environment becomes the default for all instances. | Later | An administrator can set the variable in each policy. |
 | The documentation warns that all users of a terminal can see its environment variables. | Not applicable | The warren documentation must give the same warning. A policy is not a place for secrets. |
 
@@ -171,7 +172,7 @@ Warren must show values in these forms.
 |---|---|---|
 | Web interface at `/` with template and instance views, and a setting to turn it off. | Later | The warren specification puts the administrator interface in a subsequent release. |
 | Template API. The documentation does not list its paths. | v1 | Read calls, status call, and instance calls. Templates are read-only. Warren uses only the client behaviour in `protocol.md`, section 4.6. |
-| Instance list with state, and system information for each instance. | v1 | Open Terminal supplies the system information through the proxy. |
+| Instance list with state, and system information for each instance. | v1 | Open Terminal supplies the system information through the proxy. Warren sends the request only to a sandbox that operates (section 7). |
 
 ## 14. Network and isolation
 
@@ -213,10 +214,15 @@ Warren v1 has the same minimum: Open WebUI 0.13.4.
 
 Warren must make its own decision for each of these items. No public source gives the behaviour of the orchestrator.
 
-1. If an open WebSocket with no messages counts as activity for the idle timeout. Warren proposal: it counts.
+1. If an open WebSocket with no messages counts as activity for the idle timeout, which messages on a WebSocket are activity, and what an open WebSocket gets at the idle stop. In warren, the open WebSocket does not count. The messages of the client count, without the automatic messages. The WebSocket of an agent session is the exception: it counts while it is open (section 7).
 2. The maximum wait and the error reply for a request that arrives while a pod starts.
 3. The health route of the orchestrator.
 4. The format of the instance ID. The context ID has a defined form (section 4).
 5. The limits on the number of instances.
 6. The behaviour with more than one replica.
 7. The storage modes (section 8).
+8. The forms of the values of the four limit variables, and the rule to round the CPU count (section 11).
+9. If a request for the system information is activity, and the reply to that request for an instance that is stopped or that starts. A source comment of Open WebUI says only that the orchestrator does not start the instance (section 7).
+10. The close code that an open WebSocket gets when its instance stops (section 7).
+11. If a stop or a delete keeps the instance stopped against the requests that Open WebUI sends by itself after each instance operation (section 7).
+12. If a new WebSocket starts an instance that is stopped. In warren, a WebSocket on a route on which the browser only watches the instance does not start it (section 7).

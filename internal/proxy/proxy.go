@@ -296,15 +296,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	httpx.Error(w, rerr.status, rerr.detail)
 }
 
+// systemInfoPath is the path of the system information of a sandbox. Open
+// WebUI reads it again and again while a person has the system information
+// open (docs/protocol.md, section 4.1.1). A request for this exact path is a
+// passive request: it gets data only from a sandbox that operates, it never
+// starts a sandbox, and it is not a use of the sandbox. The query string has
+// no effect on this rule.
+const systemInfoPath = "/system/info"
+
 func (p *Proxy) serveRoute(w http.ResponseWriter, r *http.Request, rt route) {
 	fillInfo(r.Context(), rt)
 	if r.URL.Path == "/openapi.json" {
 		p.serveOpenAPI(w, r, rt)
 		return
 	}
+	passive := r.URL.Path == systemInfoPath
+	if passive && r.Method != http.MethodGet {
+		// Open Terminal has only the GET method on this path. Warren gives
+		// the reply itself, thus no method on this path starts a sandbox.
+		w.Header().Set("Allow", "GET")
+		httpx.Error(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
 
 	startCtx, cancel := context.WithTimeout(r.Context(), startTimeout)
-	lease, err := p.opts.Backend.Acquire(startCtx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID})
+	lease, err := p.opts.Backend.Acquire(startCtx, backend.Request{Ref: rt.ref, UserID: rt.id.UserID, Passive: passive})
 	cancel()
 	if err != nil {
 		p.acquireFailed(w, r, err)
@@ -329,6 +345,13 @@ func (p *Proxy) acquireFailed(w http.ResponseWriter, r *http.Request, err error)
 		p.opts.Metrics.ProxyError("not_ready")
 		w.Header().Set("Retry-After", "5")
 		httpx.Error(w, http.StatusServiceUnavailable, "The terminal is not ready. Try again in a short time.")
+	case errors.Is(err, backend.ErrStopped):
+		// Only a passive request gets this error. It is the correct reply
+		// for a sandbox that does not operate, and not a failure: no error
+		// metric and no warning in the log. Open WebUI shows the text to the
+		// user and stops its timer (docs/protocol.md, section 4.1.1).
+		info.Detail = "sandbox stopped"
+		httpx.Error(w, http.StatusConflict, "The terminal is stopped. It starts when you use it.")
 	case errors.Is(err, backend.ErrCapacity):
 		info.Detail = "sandbox capacity"
 		p.opts.Metrics.ProxyError("limit")

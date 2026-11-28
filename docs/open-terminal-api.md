@@ -88,6 +88,20 @@ Some routes exist only when a setting is on:
 | GET | `/system` | Bearer | No | System prompt for a model | `main.py:536-545` |
 | GET | `/info` | Bearer | Yes | Operator text | `main.py:548-558` |
 
+The route `/system/info`:
+
+- The route has only the GET method, and it is not in the OpenAPI document (`main.py:525`). The reply has the header `Cache-Control: no-store` (`main.py:533`).
+- The reply is a JSON object with these fields: `sampled_at`, `hostname`, `os`, `arch`, `environment`, `service_uptime_seconds`, `uptime_seconds`, `cpu`, `memory`, `network`, `processes`, `process_scope`, and `disk` (`open_terminal/utils/system.py:93-105`, `:198-203`). It has the field `setup` when the home directory has the record of a setup script (`main.py:530-532`).
+- One sample reads the processor times, the memory, the control group, the network interfaces, and all processes (`open_terminal/utils/system.py:89-181`). All callers share one sample, and the server makes a new sample when the last one is 2 seconds old (`open_terminal/utils/system.py:184-189`). Thus a caller that sends one request each 5 seconds causes a new sample each time.
+- The processor percentage, and the percentage of each process, is a difference between two samples. It is `null` in the first sample after the start of the server (`open_terminal/utils/system.py:116-119`, `:139-142`, `:170-171`).
+- The request changes no terminal session, no browser session, and no agent session. It can change one record only: if the header `X-Session-Id` names a session with a recorded working directory, the life of that record starts again (`main.py:408-416`, `:526-527`).
+- Section 8.6 gives the values that come from the control group.
+
+Results for warren:
+
+1. The route is a read of data. It gives no proof that a person uses the sandbox.
+2. Warren sends a request for this route only to a sandbox that operates, and the request is not activity (`protocol.md`, section 9.5, decision 8).
+
 ### 3.2 Command execution (7 routes)
 
 | Method | Path | Auth | Tool | Function | Proxy notes | Reference |
@@ -101,6 +115,18 @@ Some routes exist only when a setting is on:
 | WebSocket | `/execute/{process_id}/status` | First message | No | Output updates | Query `offset`, `tail`. If the server cannot find the process, it closes with code 4004. | `main.py:1791-1819` |
 
 If `OPEN_TERMINAL_EXECUTE_TIMEOUT` is set, a request without `wait` waits for that time. That time has no upper limit (`main.py:1879-1880`, `main.py:1932-1933`, `env.py:91-97`).
+
+Facts about the two WebSockets:
+
+- After the first message, the `/execute` WebSocket sends the process list immediately, also when the list is empty. It sends the list again only when the list changes (`main.py:1778-1786`).
+- After the first message, the `/execute/{process_id}/status` WebSocket sends one status object immediately, and one more for each change of the process (`main.py:1804-1817`). When the process is complete, the server closes the WebSocket with the code 1000 (`main.py:1740`, `:1757`, `:1815-1816`).
+- The server reads and discards each message of the client after the first message (`main.py:1733-1737`).
+
+Results for warren:
+
+1. A client only receives data on these two WebSockets.
+2. On the `/execute` WebSocket, the first message of the server comes immediately after a correct first message of the client. A client that gets no message did not get to a server. The client of Open WebUI has a special rule for that condition (`protocol.md`, section 4.2.3).
+3. Warren puts these two routes, and the `/events` route of section 3.12, into the class of the watcher routes (`policies.md`, section 10.3).
 
 ### 3.3 Files (19 routes)
 
@@ -144,11 +170,28 @@ Facts about the terminal WebSocket:
 
 - Terminal input and terminal output are binary messages. Control data is JSON text messages (`main.py:2681-2709`).
 - The session ID is the first 8 characters of a random UUID (`main.py:2232`). It has 32 bits. It is an identifier and not a secret.
+- The server keeps the sessions in the memory of its process (`main.py:2157`). Thus a new pod knows no session of the previous pod. For an unknown session ID, `GET /api/terminals/{session_id}` replies with status 404 and the body `{"error":"Session not found"}` (`main.py:2467-2472`).
 - If the session ID is unknown, the server closes with code 4004 before it accepts the WebSocket (`main.py:2532-2540`).
 - Test result: the client then gets HTTP status 403 with an empty body. The client does not see the code 4004.
 - After authentication, the server compares `X-User-Id` and the chat ID with the values of the session. If they are different, it closes with code 4004 (`main.py:2545-2550`).
 - A shell continues to operate when no viewer is connected (`main.py:2523-2527`).
 - The server closes with code 4000 when more than 64 input messages or more than 1 MiB of input wait in its queue (`main.py:2652`, `main.py:2675-2677`).
+
+The messages of the client on the terminal WebSocket, after the first message:
+
+- A binary message is input for the shell (`main.py:2668-2680`).
+- The server decodes each text message as JSON, and it reads four types: `ack`, `resize`, `activity`, and `chat` (`main.py:2681-2709`). It ignores each other text message, and each text message that is not JSON (`main.py:2710-2711`).
+- Thus the server ignores the message `{"type":"ping"}` that the client of Open WebUI sends on a timer (`protocol.md`, section 4.2.4). It sends no reply.
+- `activity` has the boolean value `active`: the client tells the server if it shows the terminal. The server ignores an `activity` message whose value is not a boolean (`main.py:2698-2699`). It keeps the value for each client, to find the shell that the user used last (`main.py:2398-2402`, `:2509-2511`).
+- `ack` has the whole number `cursor`: the client confirms the output that it wrote to the screen. The server reads it only with flow control. A `cursor` that is not a whole number in the range of the output closes the WebSocket with the code 4000 (`main.py:2684-2692`).
+
+The messages of the server on the terminal WebSocket:
+
+- Flow control is on when the first message has `resume` and `flow_control` (`main.py:2580`). The server then sends `{"type":"flow_control"}` one time (`main.py:2602-2603`), and it stops the output for a client that did not confirm 256 KiB (`main.py:2605-2607`).
+- With `resume`, the server sends a text message of the type `output` before each binary message of output. It has the whole numbers `start` and `end` (`main.py:2632-2638`).
+- With `process_info`, the server sends a text message of the type `process` when the program in the foreground of the shell changes (`main.py:2609-2620`).
+- The server sends a message only for one of these events. It sends no message on a timer.
+- The server has a pattern for binary input that the terminal program of the client sends by itself, and that a person did not type: reports of the cursor position and of the status, device attributes, and replies with colours (`main.py:2379-2384`, `:2668-2672`). Thus the output of a program in the shell can cause input messages of a client.
 
 ### 3.5 Notebooks (4 routes)
 
@@ -186,6 +229,14 @@ Refer to section 7.1 for the port proxy.
 | WebSocket | `/browser/view/{sid}/{token}/stream` | Path token | No | Screen stream and input | `open_terminal/browser/router.py:491-510` |
 | WebSocket | `/browser/view/{sid}/{token}/vnc` | Path token | No | VNC byte relay | `open_terminal/browser/router.py:491-510` |
 
+The browser sessions:
+
+- The server keeps the browser sessions in the memory of its process (`open_terminal/browser/router.py:72`). Thus a new pod does not know a session of the previous pod.
+- A request for a session that the server does not know gets the status 404 (`open_terminal/browser/router.py:130-137`).
+- Each request for a session records the time of the request (`open_terminal/browser/router.py:138`, `:146`). The server removes a session 24 hours after the last such time (`open_terminal/browser/router.py:74`, `:87-92`).
+- The body of `PATCH /browser/sessions/{sid}` has five fields, and each field is optional: `url`, `title`, `mode`, `active`, and `chat_id` (`open_terminal/browser/router.py:167-172`). With the body `{}`, the request only records the time.
+- `protocol.md`, section 4.1.2, gives the bodies that Open WebUI sends.
+
 ### 3.8 Desktop (5 routes)
 
 | Method | Path | Auth | Tool | Function | Reference |
@@ -196,6 +247,21 @@ Refer to section 7.1 for the port proxy.
 | WebSocket | `/desktop/stream` | First message | No | Display stream (binary) | `open_terminal/desktop/router.py:640-665` |
 | WebSocket | `/desktop/audio` | First message | No | Audio stream (binary) | `open_terminal/desktop/router.py:640-665` |
 
+Facts about the two WebSockets:
+
+- The desktop in a container is the "virtual" desktop. Its transport is `vnc`, unless the desktop environment is GNOME with no X session (`open_terminal/desktop/router.py:56-61`, `:108-109`, `:431-436`). The server starts the program `Xtigervnc` for it (`open_terminal/desktop/router.py:243-246`).
+- With the transport `vnc`, the `/desktop/stream` WebSocket is a relay of the bytes of the VNC protocol in the two directions. The server reads only binary messages of the client (`open_terminal/desktop/router.py:365-376`).
+- The transport `frames` is for a desktop of the host, and for a GNOME desktop on Wayland with no `x11vnc` program (`open_terminal/desktop/router.py:422-434`, `open_terminal/desktop/wayland.py:34`). On that transport, the client sends JSON text messages, also `frameAck` after each picture.
+- Only the full image has the desktop programs (`Dockerfile:64-67`). Without them, the server has no desktop (`open_terminal/desktop/router.py:93-105`).
+- `OPEN_TERMINAL_ENABLE_DESKTOP=false` turns the desktop routes off (`env.py:172-175`).
+- The `/desktop/audio` WebSocket sends audio data without a stop while it is open. The server reads and discards each message of the client (`open_terminal/desktop/audio.py:93-111`).
+- The Chrome view has the same two transports: `vnc` when Chrome has a display, and `frames` if not (`open_terminal/browser/chrome.py:629`). The `stream` and `vnc` WebSockets of the browser view are in `open_terminal/browser/router.py:491-510`.
+
+Results for warren:
+
+1. In each image that has a desktop, a client of the desktop sends only binary data of the VNC protocol. Warren cannot tell the input of a person from the other data of that protocol without a decoder for it. Warren has no such decoder: each binary message is a use of the sandbox (`policies.md`, section 10.4).
+2. The data of the `/desktop/audio` WebSocket come from the sandbox with no end. They are not a use of the sandbox.
+
 ### 3.9 Agents (5 routes)
 
 | Method | Path | Auth | Tool | Function | Reference |
@@ -205,6 +271,12 @@ Refer to section 7.1 for the port proxy.
 | GET | `/agents/sessions/{sid}` | Bearer | No | Session state | `open_terminal/agents/router.py:101-105` |
 | DELETE | `/agents/sessions/{sid}` | Bearer | No | Stop the agent | `open_terminal/agents/router.py:108-113` |
 | WebSocket | `/agents/sessions/{sid}/connect` | First message | No | JSON line relay to the agent. One message can have 16 MiB. | `open_terminal/agents/router.py:116-202` |
+
+Facts about the agent WebSocket:
+
+- The server keeps the agent sessions in the memory of its process (`open_terminal/agents/sessions.py:111`, `open_terminal/agents/router.py:25-32`). Thus a new pod knows no session of the previous pod.
+- After the first message, the client can send three types of JSON text message: `ack`, `input`, and `eof`. Each other type, also `ping`, closes the WebSocket with the code 4400 (`open_terminal/agents/router.py:136-164`, `:193-195`).
+- The server sends a message of the type `output` for each output of the agent process, and a message of the type `ack` for each `input` message (`open_terminal/agents/router.py:160`, `:166-187`). It sends no message on a timer.
 
 ### 3.10 Skills (2 routes)
 
@@ -240,6 +312,11 @@ The `fetch`, `pull`, and `push` actions use the network and can take a long time
 | WebSocket | `/events` | First message | File change and port change messages | `main.py:724-744` |
 
 After authentication, the client must send a `subscribe` message in a maximum of 10 seconds (`open_terminal/utils/events.py:142-161`).
+After that message, the server waits for more `subscribe` messages with no time limit (`open_terminal/utils/events.py:142`). Each message of the client that is not a `subscribe` message closes the WebSocket with the code 4000 (`open_terminal/utils/events.py:143-145`).
+The server sends `fs:ready` one time when its watch of the files operates, and `fs:change` after each change of the files. These messages have no file names (`open_terminal/utils/events.py:60-72`, `:100-108`, `:133-136`).
+The server collects the changes of 250 milliseconds into one `fs:change` message, and it keeps a maximum of one message that waits for each client (`open_terminal/utils/events.py:51`, `:69-72`, `:99`). Thus a program that changes files in the directory makes the server send `fs:change` messages again and again.
+The server sends no message on a timer.
+A client only receives data on this WebSocket after its `subscribe` message. Warren puts the route into the class of the watcher routes (`policies.md`, section 10.3).
 
 ### 3.13 MCP
 
@@ -298,10 +375,24 @@ Close codes for each WebSocket:
 | `/desktop/stream`, `/desktop/audio` | 4001 bad token, 4004 no audio, 1012 desktop closes, 1011 all other causes. A late or bad first message gives 1011. | `open_terminal/desktop/router.py:640-665` |
 | `/browser/view/.../ws`, `/stream`, `/vnc` | HTTP status 403 for a bad token. 4000 a different viewer took the stream. 4004 session closed. 1011 failure. | `open_terminal/browser/router.py:408-510` |
 
+What the WebSockets get when the server stops:
+
+- The server starts uvicorn with no WebSocket option (`cli.py:210-225`). It needs uvicorn 0.34.0 or later (`pyproject.toml:13`).
+- When uvicorn stops, it closes each open WebSocket with the code 1012 and with no reason text. This is in the source of the library, and not in the repository of Open Terminal: version 0.34.0, `uvicorn/protocols/websockets/websockets_impl.py:147-153`; version 0.54.0, `uvicorn/protocols/websockets/websockets_sansio_impl.py:185-192` and `uvicorn/protocols/websockets/wsproto_impl.py:214-220`.
+- Inference: Kubernetes sends the signal SIGTERM to the container when it deletes a pod. The start command of warren uses `tini`, which sends the signal to the server (`isolation.md`, section 2.1). The server then closes its WebSockets with the code 1012. No test on a cluster examined this.
+- A server that gets no signal, or that does not stop in the termination time of the pod, sends no close message. Its peer then sees a connection that broke.
+
+Frames of the WebSocket protocol:
+
+- The server sets no ping option of uvicorn (`cli.py:210-225`). Inference: the default values of the library apply. In version 0.54.0 they are a ping frame each 20 seconds on each WebSocket, and a close when no pong frame comes in 20 seconds (`uvicorn/config.py:209-210` of the library). No test on a pod examined this.
+- The peer of the server in a pod is warren. Warren answers a ping frame itself. A ping frame and a pong frame are not messages, and warren does not relay them.
+
 Results for warren:
 
 1. A key in the header of the upgrade request has no effect. To hide the key of a pod from the client, warren must replace the `token` value in the first message.
 2. Warren must send a correct close code to its client when the pod replies with status 403 to an upgrade request.
+3. The close code that a sandbox sends when it stops is not a reliable signal: it has no text, and it depends on the start command and on the signal. Warren closes the WebSockets of a sandbox itself before it stops the pod, with its own code and text (`policies.md`, section 10.2).
+4. A WebSocket can be open and silent with no end, and the ping frames of the two sides keep it open. Thus an open WebSocket is not proof that a person uses the sandbox. Warren counts only the messages of the client as a use, and not all of them. The WebSocket of an agent session is the exception: it is a use while it is open (`policies.md`, section 10.4).
 
 ## 5. Identity inputs
 
@@ -498,6 +589,48 @@ Result for warren: the pod must mount the volume at `$HOME` (`/home/user`). The 
 13. The browser starts with `--no-sandbox` in all images (`Dockerfile:95`).
 
 Items 4, 6, 7, and the `slim` entry point need a test on a cluster before the implementation selects the default image.
+
+### 8.6 Variables that the server gives to the programs that it starts
+
+The server makes the environment of each program that it starts with one function (`env.py:7-15`):
+
+- The function copies the environment of the server. It removes each variable whose name starts with `OPEN_TERMINAL_` (`env.py:9`).
+- One exception: if the setting `OPEN_TERMINAL_BROWSER_NO_SANDBOX` is on, the function adds that variable with the value `true` (`env.py:10-12`).
+- The function then adds the variables that the caller gives (`env.py:13-14`). `POST /execute` has the body field `env` for such variables (`main.py:260-263`, `:1857-1866`).
+- Version 0.14.3 added this rule (`CHANGELOG.md:448-455`).
+
+| Program | Reference |
+|---|---|
+| Shell of an interactive terminal | `main.py:2263`, `:2296` |
+| Command of `POST /execute` | `open_terminal/utils/runner.py:123`, `:198`, `:274` |
+| Setup script | `open_terminal/utils/setup.py:86` |
+| Notebook kernel | `open_terminal/utils/notebooks.py:188` |
+| Agent | `open_terminal/agents/sessions.py:130` |
+| `git` | `open_terminal/utils/git.py:29` |
+| Desktop | `open_terminal/desktop/native.py:174`, `open_terminal/desktop/router.py:152`, `open_terminal/desktop/portal.py:329`, `open_terminal/desktop/vnc.py:102`, `open_terminal/desktop/wayland.py:74` |
+| Browser in Chrome mode | `open_terminal/browser/chrome.py:259`, `:383` |
+
+The system prompt:
+
+- The template of `OPEN_TERMINAL_SYSTEM_PROMPT` has eight placeholders: `os`, `kernel`, `arch`, `hostname`, `user`, `shell`, `python_version`, and `home` (`main.py:89-99`).
+- The server does not change a placeholder with a different name (`main.py:102-109`). The template has no placeholder for an environment variable.
+- The server adds the text of `OPEN_TERMINAL_INFO` to the prompt that it generates. It does not add it to a template (`main.py:112-137`).
+
+The limits of the container:
+
+- The public documentation of the enterprise orchestrator names four variables for the limits of an instance: `OPEN_TERMINAL_CPU_LIMIT`, `OPEN_TERMINAL_CPU_COUNT`, `OPEN_TERMINAL_MEMORY_LIMIT`, and `OPEN_TERMINAL_MEMORY_BYTES` (`feature-parity.md`, section 11).
+- These four names are in no file of the repository at the commit of section 1. No code of the server reads them.
+- `GET /system/info` reads the limits from the control group of the process. It reads only a version 2 control group (`open_terminal/utils/system.py:51-82`).
+- With a memory limit, the reply gives the limit as the total memory. With a CPU limit, the reply gives the smaller value of the limit and the number of processors of the process. This value can be a fraction, for example `0.5`. The reply then gives the scope `cgroup` for the value (`open_terminal/utils/system.py:127-142`).
+- Version 0.17.4 added this function (`CHANGELOG.md:202-207`).
+
+Results for warren:
+
+1. A variable with the prefix `OPEN_TERMINAL_` stays in the environment of the server process. A shell of the user, a command of a tool, and an agent do not have it in their environment.
+2. Inference: a program in the pod operates as the same user as the server. Thus it can read the environment of the server process from the `/proc` file system. The function is not a protection for a secret (section 8.5, item 11).
+3. Warren sets the four limit variables (`policies.md`, section 6.1). With Open Terminal 0.18.1 they have a function only for an image whose server or start command reads them.
+4. The system prompt can give the limits to a model only when the policy has the numbers in the text of the prompt.
+5. `GET /system/info` is the source of the real limits in a sandbox.
 
 ## 9. Proxy requirements
 

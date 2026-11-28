@@ -10,6 +10,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/coderpunch/warren/internal/backend"
 )
 
 const (
@@ -145,7 +147,7 @@ func (m *Manager) Reap(ctx context.Context) {
 			// A previous version of warren made this pod. It has no network
 			// policy of its own, thus the policy of the namespace refuses
 			// all its connections, also the connections from warren.
-			if m.deletePod(ctx, pod, "no_network_policy", false) == nil {
+			if m.deletePod(ctx, pod, "no_network_policy", notIdle) == nil {
 				previous++
 			}
 			continue
@@ -157,7 +159,10 @@ func (m *Manager) Reap(ctx context.Context) {
 		if st != nil {
 			leases = st.leases
 			if leases > 0 {
-				// An open request or WebSocket is activity.
+				// An open request is a use of the sandbox, and an open
+				// WebSocket with the mark Hold. Each other open WebSocket
+				// is not: only its start and the messages of its client
+				// are (lease.Active). The number has no such WebSocket.
 				st.lastActivity = now
 			}
 		}
@@ -173,26 +178,30 @@ func (m *Manager) Reap(ctx context.Context) {
 		startError := m.startError(pod, now)
 		switch {
 		case podTerminal(pod):
-			_ = m.deletePod(ctx, pod, "failed", false)
+			_ = m.deletePod(ctx, pod, "failed", notIdle)
 		case m.lostVolume(pod, now):
 			// A different process or a person deleted the volume. All that
 			// the user writes now is lost. Stop the pod, thus the next
 			// start makes a new volume.
-			_ = m.deletePod(ctx, pod, "volume_gone", false)
+			_ = m.deletePod(ctx, pod, backend.StopVolumeGone, notIdle)
 		case m.orphan(pod.Labels):
 			// The policy of the pod is not in the file, or it has a
 			// different scope. No new request can get to the pod. An open
 			// terminal would keep the pod and its network connections, thus
 			// warren does not wait for the end of the connections: the
 			// removal of a policy must stop its sandboxes.
-			_ = m.deletePod(ctx, pod, "no_policy", false)
+			_ = m.deletePod(ctx, pod, backend.StopNoPolicy, notIdle)
 		case startError:
-			_ = m.deletePod(ctx, pod, "start_error", false)
+			_ = m.deletePod(ctx, pod, "start_error", notIdle)
 		case !podReady(pod) && now.Sub(notReadySince(pod)) > m.cfg.StartTimeout:
-			_ = m.deletePod(ctx, pod, "not_ready", false)
+			_ = m.deletePod(ctx, pod, "not_ready", notIdle)
 		case podReady(pod) && leases == 0 && m.idleTimeout(pod) > 0 && now.Sub(last) > m.idleTimeout(pod):
-			// deletePod looks at the leases again, together with its mark.
-			_ = m.deletePod(ctx, pod, "idle", true)
+			// The sandbox had no use for its idle time. Open WebSockets do
+			// not prevent the stop: deletePod gives them the stop signal.
+			// deletePod makes the decision again, together with its mark:
+			// a lease, or a message on a WebSocket, can come after the
+			// read of the time above.
+			_ = m.deletePod(ctx, pod, backend.StopIdle, last)
 		case persist:
 			m.persistActivity(ctx, pod, last)
 		}

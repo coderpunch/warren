@@ -791,13 +791,16 @@ func TestPolicySettingsAreInThePod(t *testing.T) {
 			t.Errorf("%s = %s, want %s", key, q.String(), w)
 		}
 	}
-	// The variables of warren come first. The variables of the policy
-	// follow in the sequence of their names.
+	// The variables of warren come first, and the four limit variables are
+	// the last of them. The variables of the policy follow in the sequence
+	// of their names.
 	var names []string
 	for _, v := range c.Env {
 		names = append(names, v.Name)
 	}
-	if got := strings.Join(names, ","); got != "OPEN_TERMINAL_API_KEY,HOME,OPEN_TERMINAL_ISOLATED,OPEN_TERMINAL_MULTI_USER,ALPHA,OPEN_TERMINAL_EXECUTE_TIMEOUT,ZED" {
+	if got := strings.Join(names, ","); got != "OPEN_TERMINAL_API_KEY,HOME,OPEN_TERMINAL_ISOLATED,OPEN_TERMINAL_MULTI_USER,"+
+		"OPEN_TERMINAL_CPU_LIMIT,OPEN_TERMINAL_CPU_COUNT,OPEN_TERMINAL_MEMORY_LIMIT,OPEN_TERMINAL_MEMORY_BYTES,"+
+		"ALPHA,OPEN_TERMINAL_EXECUTE_TIMEOUT,ZED" {
 		t.Errorf("variables = %s", got)
 	}
 	if pod.Spec.NodeSelector["pool"] != "sandboxes" || len(pod.Spec.Tolerations) != 1 || pod.Spec.Tolerations[0].Key != "dedicated" {
