@@ -1,6 +1,6 @@
 # Specification 06: templates that a user makes in Open WebUI
 
-Status: proposal. The owner of the project must approve it.
+Status: proposal. The owner decided on 2026-11-28 that warren gets this function. The design and the open items of section 13 need the approval of the owner.
 
 This work changes decision 6 of `protocol.md`, section 9.5: "Templates are read-only."
 It also moves a trust boundary. Refer to section 9.

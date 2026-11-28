@@ -19,7 +19,8 @@ The gaps come from a review of the code against [feature-parity.md](../feature-p
 | 06 | [06-writable-templates.md](06-writable-templates.md) | Templates that a user makes and changes in Open WebUI | Large | 01 |
 
 Do the work in the sequence of the numbers.
-Specification 01 gives facts that can change the design of specification 06. Do not start 06 before the open questions of 01 have answers.
+The owner decided on 2026-11-28 that users must be able to make terminals. Thus specification 06 is planned work, and not an option.
+Specification 01 gives facts that the design of specification 06 needs. Do not start 06 before the open questions of 01 have answers.
 
 ## 2. Gaps that have no specification
 
