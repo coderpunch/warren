@@ -804,10 +804,11 @@ func (u *clientUse) decide(complete bool) {
 // In the direction from the client, it also tells the lease about each
 // message that is a use of the sandbox: refer to clientUse. The cost for one
 // message is a copy of its first bytes and one call of Active.
+//
+// After warren sent a close message, the function writes nothing: it reads
+// src and discards the data, until src answers the close message.
 func (s *session) copyMessages(dst, src *websocket.Conn, fromClient bool, mt int, reader io.Reader) closeInfo {
 	srcSide, dstSide := otherSide(fromClient)
-	writeFailure := closeInfo{side: dstSide, code: websocket.CloseAbnormalClosure, writeFailed: true}
-	timeout := s.proxy.opts.WriteTimeout
 	buf := make([]byte, 32<<10)
 	var use *clientUse
 	if fromClient {
@@ -821,51 +822,72 @@ func (s *session) copyMessages(dst, src *websocket.Conn, fromClient bool, mt int
 				return readFailure(srcSide, err)
 			}
 		}
-		if s.closing.Load() {
-			if _, err := io.Copy(io.Discard, reader); err != nil {
+		if !s.closing.Load() {
+			written, err := s.copyMessage(dst, mt, reader, use, buf)
+			if err != nil {
 				return readFailure(srcSide, err)
 			}
-			reader = nil
-			continue
-		}
-		// Each write has a time limit. If not, a peer that stops reading
-		// holds the relay, and nothing sees that the other peer went away.
-		_ = dst.SetWriteDeadline(time.Now().Add(timeout))
-		writer, err := dst.NextWriter(mt)
-		if err != nil {
-			return writeFailure
-		}
-		if use != nil {
-			use.start(mt)
-		}
-		for {
-			n, rerr := reader.Read(buf)
-			if n > 0 {
-				if use != nil {
-					use.data(buf[:n])
-				}
-				_ = dst.SetWriteDeadline(time.Now().Add(timeout))
-				if _, werr := writer.Write(buf[:n]); werr != nil {
-					return writeFailure
-				}
+			if written {
+				reader = nil
+				continue
 			}
-			if rerr == io.EOF {
-				break
+			if !s.closing.Load() {
+				return closeInfo{side: dstSide, code: websocket.CloseAbnormalClosure, writeFailed: true}
 			}
-			if rerr != nil {
-				// Do not close the writer. A close sends the last frame,
-				// and the part would arrive as a complete message.
-				return readFailure(srcSide, rerr)
-			}
+			// Warren sent its close messages while this message was in the
+			// copy. After a close message, each write to that connection
+			// fails, thus the failure does not show that dst went away.
+			// Continue to read src. If this loop stopped, nothing would read
+			// src. The connection to a client would then close with data that
+			// nothing read, and the client can lose the close message and its
+			// code.
 		}
-		if use != nil {
-			use.end()
-		}
-		if err := writer.Close(); err != nil {
-			return writeFailure
+		if _, err := io.Copy(io.Discard, reader); err != nil {
+			return readFailure(srcSide, err)
 		}
 		reader = nil
 	}
+}
+
+// copyMessage copies one message from reader to dst. written is false if a
+// write to dst failed: reader can then have more data of the message. err is
+// an error of reader.
+func (s *session) copyMessage(dst *websocket.Conn, mt int, reader io.Reader, use *clientUse, buf []byte) (written bool, err error) {
+	timeout := s.proxy.opts.WriteTimeout
+	// Each write has a time limit. If not, a peer that stops reading holds
+	// the relay, and nothing sees that the other peer went away.
+	_ = dst.SetWriteDeadline(time.Now().Add(timeout))
+	writer, err := dst.NextWriter(mt)
+	if err != nil {
+		return false, nil
+	}
+	if use != nil {
+		use.start(mt)
+	}
+	for {
+		n, rerr := reader.Read(buf)
+		if n > 0 {
+			if use != nil {
+				use.data(buf[:n])
+			}
+			_ = dst.SetWriteDeadline(time.Now().Add(timeout))
+			if _, werr := writer.Write(buf[:n]); werr != nil {
+				return false, nil
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			// Do not close the writer. A close sends the last frame, and
+			// the part would arrive as a complete message.
+			return false, rerr
+		}
+	}
+	if use != nil {
+		use.end()
+	}
+	return writer.Close() == nil, nil
 }
 
 // finish waits until one side of a relay stops, until the backend stops the

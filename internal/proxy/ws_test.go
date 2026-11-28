@@ -2,8 +2,12 @@ package proxy
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -424,5 +428,125 @@ func TestClientUse(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// socketPair returns the two ends of one WebSocket connection: the end of the
+// server that accepted it, and the end of the peer that connected.
+func socketPair(t *testing.T) (accepted, connected *websocket.Conn) {
+	t.Helper()
+	conns := make(chan *websocket.Conn, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		conns <- conn
+	}))
+	t.Cleanup(srv.Close)
+	connected, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted = <-conns
+	t.Cleanup(func() {
+		_ = accepted.Close()
+		_ = connected.Close()
+	})
+	return accepted, connected
+}
+
+// hookReader runs a function one time, before its first read.
+type hookReader struct {
+	io.Reader
+	hook func()
+}
+
+func (h *hookReader) Read(p []byte) (int, error) {
+	if h.hook != nil {
+		h.hook()
+		h.hook = nil
+	}
+	return h.Reader.Read(p)
+}
+
+// Warren can send its close messages while the relay copies one message of
+// the client. After the close message to the sandbox, each write to the
+// sandbox fails. That failure must not stop the relay: it must continue to
+// read the client until the client answers the close message. If nothing
+// reads the client, the connection closes with data that nothing read, and
+// the client can lose the close message and its code.
+//
+// A write that fails before the close messages of warren shows a sandbox that
+// went away. That result does not change.
+func TestRelayReadsTheClientAfterTheCloseMessages(t *testing.T) {
+	cases := []struct {
+		name string
+		// size is the size of the message in the copy. A small message stays
+		// in the write buffer until its end, thus the end of the message
+		// fails. A large message fails at the write of a part.
+		size int
+		// closing is false for a sandbox connection that fails before warren
+		// sends its close messages.
+		closing bool
+		want    closeInfo
+	}{
+		{"small message", 5, true, closeInfo{side: sideClient, code: websocket.CloseNormalClosure}},
+		{"large message", 200 << 10, true, closeInfo{side: sideClient, code: websocket.CloseNormalClosure}},
+		{"small message, no close messages", 5, false, closeInfo{side: sideSandbox, code: websocket.CloseAbnormalClosure, writeFailed: true}},
+		{"large message, no close messages", 200 << 10, false, closeInfo{side: sideSandbox, code: websocket.CloseAbnormalClosure, writeFailed: true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			client, browser := socketPair(t)
+			// Warren connects to the sandbox, thus its end is the end that
+			// connected.
+			_, sandbox := socketPair(t)
+			p := &Proxy{}
+			p.opts.WriteTimeout = 5 * time.Second
+			lease := &countLease{}
+			s := &session{proxy: p, client: client, sandbox: sandbox, lease: lease}
+
+			// The client sends two messages, and then it answers the close
+			// message of warren.
+			sent := make(chan error, 1)
+			go func() {
+				err := browser.WriteMessage(websocket.BinaryMessage, make([]byte, c.size))
+				if err == nil {
+					err = browser.WriteMessage(websocket.BinaryMessage, []byte("more input"))
+				}
+				if err == nil {
+					err = browser.WriteControl(websocket.CloseMessage,
+						websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(5*time.Second))
+				}
+				sent <- err
+			}()
+			_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+			mt, reader, err := client.NextReader()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The relay examined the mark for this message, and it has the
+			// writer of the sandbox connection. The close message comes at
+			// this time.
+			stop := func() {
+				s.closing.Store(c.closing)
+				closeConn(sandbox, websocket.CloseGoingAway, "")
+			}
+			got := s.copyMessages(sandbox, client, true, mt, &hookReader{Reader: reader, hook: stop})
+			if got != c.want {
+				t.Errorf("end of the relay = %+v, want %+v", got, c.want)
+			}
+			if c.closing {
+				if err := <-sent; err != nil {
+					t.Errorf("the client could not send: %v", err)
+				}
+			}
+			// Only the message in the copy at the time of the stop is a use.
+			if lease.calls != 1 {
+				t.Errorf("calls of Active = %d, want 1", lease.calls)
+			}
+		})
 	}
 }
