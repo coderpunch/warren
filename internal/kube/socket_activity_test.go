@@ -712,6 +712,39 @@ func TestHeldWebSocketKeepsTheSandbox(t *testing.T) {
 	waitFor(t, "stop of the idle sandbox", func() bool { return e.m.pod(name) == nil })
 }
 
+// The WebSocket of an agent session can break in a turn. The Open WebUI
+// backend then connects again after 1 second (docs/protocol.md, section 4.7).
+// The new WebSocket keeps the sandbox again, with no time limit
+// (docs/policies.md, section 10.4).
+func TestAgentWebSocketThatConnectsAgainKeepsTheSandbox(t *testing.T) {
+	e := newTestEnv(t, nil)
+	alice := userRef("alice")
+	name := alice.Ref.Name()
+	first := e.acquire(held(alice))
+	e.clock.Advance(time.Hour)
+	e.m.Reap(context.Background())
+	first.Release() // the connection breaks
+	if got := e.leaseRecord(e.m, name); got.leases != 0 {
+		t.Fatalf("leases after the end of the first WebSocket = %d, want 0", got.leases)
+	}
+	e.clock.Advance(time.Second)
+	second := e.acquire(held(alice))
+	defer second.Release()
+	if got := e.leaseRecord(e.m, name); got.leases != 1 {
+		t.Fatalf("leases after the new connection = %d, want 1", got.leases)
+	}
+	for i := 0; i < 48; i++ {
+		e.clock.Advance(time.Hour)
+		e.m.Reap(context.Background())
+	}
+	if hasSignal(second) || e.podDeletes(name) != 0 {
+		t.Fatalf("the sandbox stopped with an open agent WebSocket: signal = %v, delete requests = %d", hasSignal(second), e.podDeletes(name))
+	}
+	if n := e.creates(); n != 1 {
+		t.Errorf("pod create requests = %d, want 1", n)
+	}
+}
+
 // A stop operation of the management API applies also to a sandbox with an
 // open agent WebSocket, and its lease gets the stop signal.
 // TestReaperStopsTellTheReason examines the stops of the reaper.

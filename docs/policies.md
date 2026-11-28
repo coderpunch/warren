@@ -494,7 +494,7 @@ A result "use" that is wrong is what a sandbox can use to keep itself. A result 
 
 - Warren does not stop the sandbox for its idle time while the WebSocket is open. The idle time starts at the end of the WebSocket.
 - Each other stop reason applies, and the WebSocket then gets the close code of section 10.2.
-- Open WebUI has no time limit for a turn. A turn that does not end keeps its sandbox until the user stops the turn, until Open WebUI stops, until the connection breaks, or until a person sends a stop operation.
+- Open WebUI has no time limit for a turn. A turn that does not end keeps its sandbox until the user stops the turn, until Open WebUI stops, or until a person sends a stop operation. A connection that breaks does not end the turn. After each close, the backend connects again after 1 second, and the new WebSocket keeps the sandbox again. The backend stops only when, at a close, it got no message on the WebSocket for more than 60 seconds. The sandbox sends these messages (`protocol.md`, section 4.7).
 
 **The idle stop with open WebSockets.** Warren closes each open WebSocket of the sandbox before it deletes the pod (section 10.2):
 
