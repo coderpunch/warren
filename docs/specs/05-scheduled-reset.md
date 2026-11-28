@@ -23,7 +23,7 @@ This work lets an administrator give a schedule to a policy. At each time of the
 |---|---|
 | R1 | A policy can have a schedule: one date and time, each week, each month, or a cron expression, with a time zone. |
 | R2 | At a time of the schedule, warren stops each sandbox of the policy and deletes its files. Open requests and open WebSockets do not prevent this. |
-| R3 | The next request of a user starts the sandbox again with an empty home directory. |
+| R3 | The sandbox stays in the instance list as a stopped instance. The next request of a user starts it again with an empty home directory. |
 | R4 | A schedule never deletes files that are newer than its last time. |
 | R5 | When an administrator adds or changes a schedule, no file goes away before the first time of the new schedule that comes after the change. |
 | R6 | If warren does not operate at a time of the schedule, it does the reset after its start. |
@@ -123,7 +123,7 @@ Rules. The reaper applies them at each run, for each volume and for each pod of 
 3. The object has a correct mark with the time `M`. Calculate `D = Prev(now)`. The object is due when `D` is after `M`.
 
 A new volume and a new pod get their mark a maximum of 30 seconds after warren makes them. Thus `M` is not before the time at which the object got its first file.
-After a reset, the old object is gone. The new object gets a new mark with a time after `D`. Thus one time of the schedule gives one reset (R4).
+After a reset, the old object is gone. The new volume, or the next pod, gets a new mark with a time after `D`. Thus one time of the schedule gives one reset (R4).
 After a change of the schedule, rule 2 writes a new mark. Thus R5 is true.
 After a time with no warren process, `D` is after `M` for each object that missed a reset. Thus R6 is true.
 
@@ -131,14 +131,22 @@ A second warren process can write the same mark at the same time, for example in
 
 ### 4.3 What a reset does
 
-For an object that is due, warren does the delete operation of the management API (`Manager.Delete`, which is `clear` with `keep` = `false`):
+For an object that is due, warren does the reset operation of the management API (`Manager.Reset`, which is `clear` with `keep` = `true`):
 
 - It stops the pod, if there is one.
-- It deletes the volume, if there is one.
-- The sandbox is then not in the instance list until its next start.
+- It deletes the volume, if there is one, and makes a new, empty volume with the settings of the policy.
+- The sandbox stays in the instance list as a stopped instance, and it stays on the account of the same user (`policies.md`, section 10).
+- Warren does not start the sandbox again. The next request of a user does that.
 
-Warren does not make a new, empty volume, as the reset operation of the management API does.
-Many sandboxes of a policy have no pod at the time of a schedule. A new volume for each of them would use storage for nothing, and the next time of the schedule would delete and make them again.
+A sandbox of a policy with ephemeral storage has no volume. Warren stops its pod, and nothing stays.
+
+If warren cannot make the new volume, the result is that of the delete operation, as `policies.md`, section 10, describes. Warren writes an error to its log.
+
+The retention time must continue to count for a sandbox that no person uses. The new volume has no annotation `unused-since`, and without a rule its retention time would start again at each reset.
+Thus, when the sandbox had no pod at the time of the reset, the new volume gets the `unused-since` value of the old volume.
+`emptyVolume` gets a parameter for this value. The reset operation of the management API does not use it.
+
+An installation with a schedule and no retention time keeps one empty volume for each sandbox that a user started one time. The documentation must say this, and must recommend a retention time together with a schedule.
 
 The reaper does not do the reset in its own run. One delete can wait 30 seconds for the end of a pod.
 
@@ -172,10 +180,11 @@ The name of the policy in Open WebUI must tell the users about the schedule. The
 |---|---|
 | Log record `sandbox deleted` (audit) | The reason `scheduled_reset` |
 | Log record `volume deleted` (audit) | The reason `schedule`, and the time `D` of the schedule |
+| Log record `volume created` (audit) | The reason `scheduled_reset` |
 | `warren_sandbox_reaps_total{reason="scheduled_reset"}` | Pods that a schedule stopped |
 | `warren_volume_deletes_total{reason="schedule"}` | Volumes that a schedule deleted |
 
-`Manager.Delete` writes the reason `api` at this time. Give `clear` a parameter for the reason.
+`clear` writes the reason `api` at this time. Give `clear` a parameter for the reason.
 
 ## 5. Changes
 
@@ -186,7 +195,7 @@ The name of the policy in Open WebUI must tell the users about the schedule. The
 | `internal/policy/decode.go` | The key `reset` with `schedule` and `timeZone`. |
 | `internal/kube/objects.go` | The constant `AnnotationResetSchedule`. |
 | `internal/kube/reaper.go` | The function `reapSchedules`, which `Reap` calls after `reapVolumes`. The queue and its workers. |
-| `internal/kube/manager.go` | A reason parameter for `clear`. The workers stop with the context of `Run`. |
+| `internal/kube/manager.go` | A reason parameter for `clear`. A parameter of `emptyVolume` for the `unused-since` value. The workers stop with the context of `Run`. |
 | `internal/metrics/metrics.go` | No change. The two metrics have a `reason` label. |
 | `docs/policies.md` | A new section "Scheduled reset". Section 4: the key. Section 11: one row. Section 13: the two reasons. |
 | `docs/feature-parity.md`, section 7 | Change the plan value of the row to "v1". Note the difference: the schedule is in the policy file, and not in an interface. |
@@ -216,8 +225,10 @@ All tests use the simulated clock.
 | Test | What it shows |
 |---|---|
 | A volume with no mark gets a mark and stays. | Rule 2 |
-| After the next time of the schedule, the volume and its pod go away. | R2, R3 |
-| A new volume of the same sandbox stays until the next time of the schedule. | R4 |
+| After the next time of the schedule, the pod goes away, and the sandbox has a new, empty volume with a different UID and a new mark. The instance list shows the sandbox as stopped. | R2, R3 |
+| The new volume stays until the next time of the schedule. | R4 |
+| A sandbox with no pod: the new volume has the `unused-since` value of the old volume. With a retention time of 10 days and a schedule for each week, warren deletes the volume after 10 days. | Section 4.3 |
+| Kubernetes refuses the new volume: the sandbox is not in the instance list, and the log has an error. | Section 4.3 |
 | A schedule that an administrator adds does not delete a volume that is 1 year old before the first time of the schedule. | R5 |
 | A change of the schedule text writes a new mark. | R5 |
 | A new manager finds a mark from before a time of the schedule, and does the reset after the delete delay. | R6, R7, R8 |
@@ -237,7 +248,7 @@ The file of a user is there before that time and is gone after it. A file that t
 
 | No. | Item |
 |---|---|
-| O1 | Decision of the owner: section 4.3 uses the delete operation, and the sandbox leaves the instance list. The alternative is the reset operation, which keeps an empty volume for each sandbox. |
+| O1 | Decided on 2026-11-28: a scheduled reset is the reset operation. Each sandbox keeps an empty volume and stays in the instance list (section 4.3). |
 | O2 | Decision of the owner: the limit of one time in each hour (section 3.1). |
 | O3 | Answered on 2026-11-28: the public documentation gives the forms `@weekly`, `@monthly`, a cron expression, and one date and time. It does not give the day and the time of the two words. Section 3.1 uses their usual meaning in cron. |
 | O4 | Decision of the owner: after a long time with no warren process, R6 does a reset that can be many days late. The alternative is a maximum delay, after which warren waits for the next time of the schedule. |
